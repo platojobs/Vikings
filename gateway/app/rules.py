@@ -1,22 +1,43 @@
 """告警规则引擎：确定性阈值判定。
 
+阈值全部从 Settings 读取，便于通过环境变量调整，不再硬编码。
 规则与文案分离——本模块只负责「是否告警、告警级别、阈值」，
 文案生成交给 app/ai/diagnosis.py，便于单独测试与调整。
 """
 
 from typing import Dict, List
 
-# 阈值表（与 docs/contracts.md 第 5 节一致）
-# 结构：指标 -> 级别 -> (阈值, 比较方向)
-THRESHOLDS = {
-    "voltage": {"critical": (3.2, "lt"), "warning": (3.4, "lt")},
-    "temperature": {"critical": (75.0, "gt_high"), "warning": (60.0, "gt_low")},
-    "humidity": {"critical": (97.0, "gt"), "warning": (90.0, "gt")},
-    "rssi": {"critical": (-110, "lt"), "warning": (-100, "lt")},
-}
+from app.config import get_settings
 
-# 温度是双向指标（过热 / 过冷都异常），单独定义上下限
-TEMPERATURE_LOW = {"critical": -20.0, "warning": -10.0}
+
+def _thresholds() -> Dict:
+    """从配置动态取阈值，支持通过环境变量调整。"""
+    s = get_settings()
+    return {
+        "voltage": {
+            "warning": (s.threshold_voltage_warning, "lt"),
+            "critical": (s.threshold_voltage_critical, "lt"),
+        },
+        "temperature": {
+            "critical_high": (s.threshold_temperature_critical_high, "gt"),
+            "warning_high": (s.threshold_temperature_warning_high, "gt"),
+            "warning_low": (s.threshold_temperature_warning_low, "lt"),
+            "critical_low": (s.threshold_temperature_critical_low, "lt"),
+        },
+        "humidity": {
+            "warning": (s.threshold_humidity_warning, "gt"),
+            "critical": (s.threshold_humidity_critical, "gt"),
+        },
+        "rssi": {
+            "warning": (s.threshold_rssi_warning, "lt"),
+            "critical": (s.threshold_rssi_critical, "lt"),
+        },
+    }
+
+
+def thresholds_snapshot() -> Dict:
+    """对外暴露当前生效阈值，供 /api/rules/thresholds 接口返回。"""
+    return _thresholds()
 
 
 def evaluate(report) -> List[Dict]:
@@ -26,6 +47,7 @@ def evaluate(report) -> List[Dict]:
         {"metric": "voltage", "level": "critical", "value": 2.91, "threshold": 3.2}
     critical 优先，命中 critical 后不再叠加同指标 warning。
     """
+    t = _thresholds()
     hits: List[Dict] = []
 
     def add(metric: str, level: str, value: float, threshold: float):
@@ -33,34 +55,34 @@ def evaluate(report) -> List[Dict]:
 
     # ---- 电压 ----
     voltage = float(report.voltage)
-    if voltage < THRESHOLDS["voltage"]["critical"][0]:
-        add("voltage", "critical", voltage, THRESHOLDS["voltage"]["critical"][0])
-    elif voltage < THRESHOLDS["voltage"]["warning"][0]:
-        add("voltage", "warning", voltage, THRESHOLDS["voltage"]["warning"][0])
+    if voltage < t["voltage"]["critical"][0]:
+        add("voltage", "critical", voltage, t["voltage"]["critical"][0])
+    elif voltage < t["voltage"]["warning"][0]:
+        add("voltage", "warning", voltage, t["voltage"]["warning"][0])
 
     # ---- 温度（双向）----
     temperature = float(report.temperature)
-    if temperature > THRESHOLDS["temperature"]["critical"][0]:
-        add("temperature", "critical", temperature, THRESHOLDS["temperature"]["critical"][0])
-    elif temperature > THRESHOLDS["temperature"]["warning"][0]:
-        add("temperature", "warning", temperature, THRESHOLDS["temperature"]["warning"][0])
-    elif temperature < TEMPERATURE_LOW["critical"]:
-        add("temperature", "critical", temperature, TEMPERATURE_LOW["critical"])
-    elif temperature < TEMPERATURE_LOW["warning"]:
-        add("temperature", "warning", temperature, TEMPERATURE_LOW["warning"])
+    if temperature > t["temperature"]["critical_high"][0]:
+        add("temperature", "critical", temperature, t["temperature"]["critical_high"][0])
+    elif temperature > t["temperature"]["warning_high"][0]:
+        add("temperature", "warning", temperature, t["temperature"]["warning_high"][0])
+    elif temperature < t["temperature"]["critical_low"][0]:
+        add("temperature", "critical", temperature, t["temperature"]["critical_low"][0])
+    elif temperature < t["temperature"]["warning_low"][0]:
+        add("temperature", "warning", temperature, t["temperature"]["warning_low"][0])
 
     # ---- 湿度 ----
     humidity = float(report.humidity)
-    if humidity > THRESHOLDS["humidity"]["critical"][0]:
-        add("humidity", "critical", humidity, THRESHOLDS["humidity"]["critical"][0])
-    elif humidity > THRESHOLDS["humidity"]["warning"][0]:
-        add("humidity", "warning", humidity, THRESHOLDS["humidity"]["warning"][0])
+    if humidity > t["humidity"]["critical"][0]:
+        add("humidity", "critical", humidity, t["humidity"]["critical"][0])
+    elif humidity > t["humidity"]["warning"][0]:
+        add("humidity", "warning", humidity, t["humidity"]["warning"][0])
 
     # ---- 信号强度 ----
     rssi = int(report.rssi)
-    if rssi < THRESHOLDS["rssi"]["critical"][0]:
-        add("rssi", "critical", rssi, THRESHOLDS["rssi"]["critical"][0])
-    elif rssi < THRESHOLDS["rssi"]["warning"][0]:
-        add("rssi", "warning", rssi, THRESHOLDS["rssi"]["warning"][0])
+    if rssi < t["rssi"]["critical"][0]:
+        add("rssi", "critical", rssi, t["rssi"]["critical"][0])
+    elif rssi < t["rssi"]["warning"][0]:
+        add("rssi", "warning", rssi, t["rssi"]["warning"][0])
 
     return hits

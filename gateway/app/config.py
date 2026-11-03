@@ -44,6 +44,22 @@ class Settings(BaseSettings):
     # ---- 业务参数 ----
     alert_suppress_seconds: int = 300
     device_offline_timeout_seconds: int = 300
+    data_retention_days: int = 90
+    # 离线巡检与数据清理的执行周期（秒）
+    offline_sweep_interval_seconds: int = 60
+    data_purge_interval_seconds: int = 3600
+
+    # ---- 告警阈值（可在不重启的前提下通过 /api/rules/thresholds 查看，修改需改环境变量） ----
+    threshold_voltage_warning: float = 3.4
+    threshold_voltage_critical: float = 3.2
+    threshold_temperature_warning_high: float = 60.0
+    threshold_temperature_critical_high: float = 75.0
+    threshold_temperature_warning_low: float = -10.0
+    threshold_temperature_critical_low: float = -20.0
+    threshold_humidity_warning: float = 90.0
+    threshold_humidity_critical: float = 97.0
+    threshold_rssi_warning: float = -100
+    threshold_rssi_critical: float = -110
 
     # ---- 跨域 ----
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

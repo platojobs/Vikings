@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.database import dispose_engine, init_models
 from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
+from app.scheduler import BackgroundScheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,9 +40,14 @@ async def lifespan(app: FastAPI):
     app.state.mqtt = mqtt
     await mqtt.start()
 
+    # 后台定时任务：离线巡检（LWT 兜底）+ 时序数据保留清理
+    scheduler = BackgroundScheduler()
+    await scheduler.start()
+
     yield
 
-    logger.info("网关关闭，停止 MQTT 消费并释放连接池")
+    logger.info("网关关闭，停止 MQTT 消费与后台调度")
+    await scheduler.stop()
     await mqtt.stop()
     await dispose_engine()
 

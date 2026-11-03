@@ -3,7 +3,7 @@
  * 设备列表：状态筛选 + 关键字搜索 + 分页。
  * 点击任意行打开抽屉，展示详情、历史数据折线图与指令历史。
  */
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   fetchDeviceCommands,
   fetchDeviceDetail,
@@ -14,6 +14,7 @@ import { formatDateTime, formatMetric } from '@/utils/format'
 import { commandStateLabel, commandStateTagType } from '@/utils/labels'
 import DeviceStatusTag from '@/components/DeviceStatusTag.vue'
 import SensorChart from '@/components/SensorChart.vue'
+import { subscribe } from '@/services/mqtt'
 import type { CommandItem, Device, DeviceDetail, DeviceStatus, SensorRecord } from '@/types'
 
 const query = reactive<{ status: DeviceStatus | ''; keyword: string }>({
@@ -94,6 +95,46 @@ async function openDevice(row: Device): Promise<void> {
 }
 
 onMounted(loadDevices)
+
+// ==================== 实时状态刷新 ====================
+// 订阅 device/+/status，设备上下线时直接更新对应行，无需整页重拉。
+// 同步抽屉里详情对象的状态，保持抽屉与列表一致。
+function deviceIdFromTopic(topic: string): string {
+  const parts = topic.split('/')
+  return parts.length >= 2 ? parts[1] : ''
+}
+
+const unsubscribeStatus = subscribe('device/+/status', (payload, topic) => {
+  const deviceId = deviceIdFromTopic(topic)
+  if (!deviceId) return
+  const data = payload as { status?: DeviceStatus }
+  if (!data?.status) return
+
+  const row = devices.value.find((d) => d.device_id === deviceId)
+  if (row) {
+    row.status = data.status
+  }
+  if (detail.value?.device_id === deviceId) {
+    detail.value.status = data.status
+  }
+})
+
+// 订阅 device/+/sensor/report，更新最后上报时间
+const unsubscribeReport = subscribe('device/+/sensor/report', (payload, topic) => {
+  const deviceId = deviceIdFromTopic(topic)
+  if (!deviceId) return
+  const data = payload as { ts?: number }
+  if (!data?.ts) return
+  const row = devices.value.find((d) => d.device_id === deviceId)
+  if (row) {
+    row.last_report_at = new Date(data.ts).toISOString()
+  }
+})
+
+onUnmounted(() => {
+  unsubscribeStatus()
+  unsubscribeReport()
+})
 </script>
 
 <template>

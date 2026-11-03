@@ -56,7 +56,7 @@
 
 设计要点详见 [docs/architecture.md](docs/architecture.md)，接口契约详见 [docs/contracts.md](docs/contracts.md)。
 
-### 2.1 为什么这样设计（面试要点）
+### 2.1 为什么这样设计
 
 1. **不自己维护 TCP 连接**：设备长连接全部交给 Mosquitto。网关重启不会引发设备重连风暴，
    连接层与业务层可独立扩缩容。
@@ -306,3 +306,4 @@ docker compose -f infra/docker-compose.yml up -d
 | `v0.5.0-web` | Vue3 管理后台（实时看板/设备/历史/OTA） |
 | `v0.6.0-device` | Flutter 设备端间歇上线状态机与指令回执 |
 | `v1.0.0` | 全链路联调通过 + 完整文档 |
+| `v1.1.0` | 离线巡检定时任务、时序数据保留清理、告警阈值可配置、后端单测、GitHub Actions CI、前端实时状态刷新 |
