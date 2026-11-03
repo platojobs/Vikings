@@ -37,3 +37,55 @@ export function progressStatus(state: string): '' | 'success' | 'exception' {
   if (state === 'failed') return 'exception'
   return ''
 }
+
+// ==================== 告警 ====================
+
+export function alertLevelLabel(level: string): string {
+  return level === 'critical' ? '严重' : '警告'
+}
+
+export function alertLevelTagType(level: string): TagType {
+  return level === 'critical' ? 'danger' : 'warning'
+}
+
+export function alertStatusLabel(status: string): string {
+  return status === 'acked' ? '已确认' : '未处理'
+}
+
+/** 告警指标中文名 */
+export function alertMetricLabel(metric: string): string {
+  const labels: Record<string, string> = {
+    temperature: '温度',
+    humidity: '湿度',
+    voltage: '电压',
+    rssi: '信号强度',
+    battery: '电量',
+  }
+  return labels[metric] ?? metric
+}
+
+// ==================== 审计 ====================
+
+export function auditActionLabel(action: string): string {
+  const labels: Record<string, string> = {
+    login: '登录',
+    'command.create': '下发指令',
+    'ota.create': '创建 OTA 任务',
+    'alert.ack': '确认告警',
+    'threshold.update': '修改阈值',
+  }
+  return labels[action] ?? action
+}
+
+export function auditActionTagType(action: string): TagType {
+  switch (action) {
+    case 'login':
+      return 'info'
+    case 'alert.ack':
+      return 'warning'
+    case 'threshold.update':
+      return 'danger'
+    default:
+      return 'primary'
+  }
+}

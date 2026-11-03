@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AggregateChart: typeof import('./src/components/AggregateChart.vue')['default']
     AlertCard: typeof import('./src/components/AlertCard.vue')['default']
     DeviceStatusTag: typeof import('./src/components/DeviceStatusTag.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
@@ -42,6 +43,7 @@ declare module 'vue' {
     ElTable: typeof import('element-plus/es')['ElTable']
     ElTableColumn: typeof import('element-plus/es')['ElTableColumn']
     ElTag: typeof import('element-plus/es')['ElTag']
+    ElTooltip: typeof import('element-plus/es')['ElTooltip']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     SensorChart: typeof import('./src/components/SensorChart.vue')['default']

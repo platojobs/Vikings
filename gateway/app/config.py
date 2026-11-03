@@ -49,7 +49,12 @@ class Settings(BaseSettings):
     offline_sweep_interval_seconds: int = 60
     data_purge_interval_seconds: int = 3600
 
-    # ---- 告警阈值（可在不重启的前提下通过 /api/rules/thresholds 查看，修改需改环境变量） ----
+    # ---- 告警 Webhook 外推（空则关闭）----
+    # 产生 critical 告警时向该 URL POST JSON，可用于对接钉钉/飞书/企业微信机器人
+    alert_webhook_url: str = ""
+    alert_webhook_timeout_seconds: float = 5.0
+
+    # ---- 告警阈值（环境变量为初始值；在线修改走 /api/rules/thresholds，存入 rule_config 表） ----
     threshold_voltage_warning: float = 3.4
     threshold_voltage_critical: float = 3.2
     threshold_temperature_warning_high: float = 60.0

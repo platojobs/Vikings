@@ -146,16 +146,39 @@
 | GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`page`、`pageSize` |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit` |
+| GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
 | GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底） |
 
 ### 3.3 告警
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`、`page`、`pageSize` |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`page`、`pageSize` |
 | POST | `/api/alerts/{alertId}/ack` | 告警确认 |
+| GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today}` |
 
-### 3.4 指令 / OTA
+### 3.4 阈值在线配置
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/rules/thresholds` | 当前生效阈值（分组视图），每项标注 `source`：override=在线覆盖 / env=环境变量 |
+| PUT | `/api/rules/thresholds` | 在线更新，入参只传待改键（如 `{voltage_warning: 3.3}`），持久化到 `rule_config` 并即时生效，写入审计日志 |
+
+可配置键共 10 项：`voltage_warning/critical`、`temperature_warning_high/critical_high/warning_low/critical_low`、
+`humidity_warning/critical`、`rssi_warning/critical`，取值范围按物理意义校验（见网关 `ThresholdsUpdateRequest`）。
+
+### 3.5 审计日志
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `ota.create` / `alert.ack` / `threshold.update` |
+
+### 3.6 告警通知（Webhook）
+
+网关配置 `ALERT_WEBHOOK_URL` 后，critical 级告警生成时向该地址 POST 通知（钉钉 text 兼容格式 + 结构化 alert 字段），
+fire-and-forget，不阻塞告警主链路。
+
+### 3.7 指令 / OTA
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -165,7 +188,7 @@
 | GET | `/api/ota/tasks` | OTA 任务列表（含每台设备升级状态） |
 | GET | `/api/ota/tasks/{taskId}` | OTA 任务详情 |
 
-### 3.5 统计 / 健康
+### 3.8 统计 / 健康
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -247,6 +270,30 @@
 > 原需求「三张表足够」指核心业务三张表；OTA 管理页需要持久化任务与回执状态，
 > 因此额外增加 `device_command`、`ota_task` 两张支撑表，属于同一业务域，不引入额外技术栈。
 
+### `rule_config` 阈值在线配置表
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| key | varchar(64) PK | 配置键（与 Settings.threshold_* 属性同名） |
+| value | float | 阈值数值 |
+| updated_by | varchar(64) | 最后修改人 |
+| updated_at | timestamptz | 最后修改时间 |
+
+规则引擎读取顺序：`rule_config` 覆盖缓存 → 环境变量 → 代码默认值。网关启动时全量加载，
+PUT 接口更新后即时刷新进程内缓存，无需重启。
+
+### `audit_log` 审计日志表
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigserial PK | 自增 |
+| operator | varchar(64) | 操作人（登录用户名） |
+| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update |
+| target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config） |
+| target_id | varchar(64) | 目标标识 |
+| detail | jsonb | 动作上下文（如指令类型、阈值变更明细） |
+| created_at | timestamptz | 操作时间，索引 |
+
 ---
 
 ## 5. 阈值与 AI 诊断规则
@@ -262,3 +309,5 @@
 - 告警文案优先调用 LLM（OpenAI 兼容接口）生成；未配置 `LLM_API_KEY` 时走内置规则模板，
   保证离线环境可完整演示链路。
 - 同一设备同一指标 5 分钟内只告警一次（抑制抖动）。
+- 上表为环境变量默认值；运维侧可通过 `PUT /api/rules/thresholds` 在线调整，
+  覆盖值持久化于 `rule_config` 表并即时生效，重启后保留。

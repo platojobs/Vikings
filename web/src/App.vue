@@ -61,6 +61,8 @@ async function handleLogout(): Promise<void> {
           <el-menu-item index="/dashboard">实时仪表盘</el-menu-item>
           <el-menu-item index="/devices">设备管理</el-menu-item>
           <el-menu-item index="/history">历史查询</el-menu-item>
+          <el-menu-item index="/alerts">告警中心</el-menu-item>
+          <el-menu-item index="/audit">审计日志</el-menu-item>
           <el-menu-item index="/ota">OTA 管理</el-menu-item>
         </el-menu>
 

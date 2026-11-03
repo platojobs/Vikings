@@ -14,12 +14,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import alerts, auth, devices, ota, stats
+from app.api.routes import alerts, audit, auth, devices, ota, rules, stats
 from app.config import get_settings
-from app.database import dispose_engine, init_models
+from app.database import SessionFactory, dispose_engine, init_models
 from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
 from app.scheduler import BackgroundScheduler
+from app.services import rule_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,10 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     logger.info("网关启动，数据库: %s", settings.database_url)
     await init_models()
+
+    # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
+    async with SessionFactory() as session:
+        await rule_service.load_overrides(session)
 
     handler = MessageHandler()
     mqtt = MqttGatewayClient(handler)
@@ -73,6 +78,8 @@ app.include_router(devices.router)
 app.include_router(alerts.router)
 app.include_router(ota.router)
 app.include_router(stats.router)
+app.include_router(rules.router)
+app.include_router(audit.router)
 
 
 @app.exception_handler(HTTPException)

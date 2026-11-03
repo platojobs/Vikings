@@ -126,3 +126,39 @@ class OtaTask(Base):
     success: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RuleConfig(Base):
+    """告警阈值运行时覆盖表：优先级高于环境变量，在线修改立即生效。
+
+    key 与 Settings 的 threshold_* 字段同名，value 存 JSON 数字。
+    """
+
+    __tablename__ = "rule_config"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AuditLog(Base):
+    """操作审计日志：记录所有会改变系统状态的管理动作，便于追溯。"""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("idx_audit_created", "created_at"),
+        Index("idx_audit_action_created", "action", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    operator: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    detail: Mapped[Dict[str, Any]] = mapped_column(JSONPayload, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

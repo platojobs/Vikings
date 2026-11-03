@@ -2,6 +2,8 @@
 
 import { request } from '@/api/http'
 import type {
+  AggregateBucket,
+  AggregatePoint,
   CommandItem,
   CommandType,
   Device,
@@ -39,6 +41,20 @@ export function fetchDeviceRecords(
 /** 全局每台设备的最新一条数据，仪表盘首屏兜底 */
 export function fetchLatestRecords(): Promise<SensorRecord[]> {
   return request<SensorRecord[]>('/api/records/latest')
+}
+
+/** 按小时/天聚合设备时序数据，用于长周期趋势，避免拉全量明细 */
+export function fetchDeviceAggregate(
+  deviceId: string,
+  bucket: AggregateBucket,
+  query: DeviceRecordsQuery = {},
+): Promise<AggregatePoint[]> {
+  return request<AggregatePoint[]>(
+    `/api/devices/${encodeURIComponent(deviceId)}/records/aggregate`,
+    {
+      params: { bucket, start: query.start, end: query.end },
+    },
+  )
 }
 
 export function fetchDeviceCommands(

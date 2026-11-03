@@ -1,6 +1,8 @@
 """告警规则引擎：确定性阈值判定。
 
-阈值全部从 Settings 读取，便于通过环境变量调整，不再硬编码。
+阈值来源优先级：rule_config 表（在线修改） > 环境变量 > 默认值。
+在线修改通过 /api/rules/thresholds 写入后由 rule_service 刷新进程内覆盖缓存，
+规则判定每次实时读取缓存，无需重启即可生效。
 规则与文案分离——本模块只负责「是否告警、告警级别、阈值」，
 文案生成交给 app/ai/diagnosis.py，便于单独测试与调整。
 """
@@ -9,28 +11,56 @@ from typing import Dict, List
 
 from app.config import get_settings
 
+# 进程内阈值覆盖缓存：{settings 属性名: 数值}，由 rule_service 维护
+_OVERRIDES: Dict[str, float] = {}
+
+
+def set_overrides(overrides: Dict[str, float]) -> None:
+    """整体替换覆盖缓存（启动时从 rule_config 表加载）。"""
+    _OVERRIDES.clear()
+    _OVERRIDES.update(overrides)
+
+
+def patch_override(key: str, value: float) -> None:
+    """更新单个覆盖项（PUT 接口写入后调用）。"""
+    _OVERRIDES[key] = value
+
+
+def clear_override(key: str) -> None:
+    _OVERRIDES.pop(key, None)
+
+
+def overrides_snapshot() -> Dict[str, float]:
+    return dict(_OVERRIDES)
+
+
+def _get(attr: str):
+    """取阈值：覆盖缓存优先，其次环境变量配置。"""
+    if attr in _OVERRIDES:
+        return _OVERRIDES[attr]
+    return getattr(get_settings(), attr)
+
 
 def _thresholds() -> Dict:
-    """从配置动态取阈值，支持通过环境变量调整。"""
-    s = get_settings()
+    """组装当前生效阈值（覆盖 > 环境变量）。"""
     return {
         "voltage": {
-            "warning": (s.threshold_voltage_warning, "lt"),
-            "critical": (s.threshold_voltage_critical, "lt"),
+            "warning": (_get("threshold_voltage_warning"), "lt"),
+            "critical": (_get("threshold_voltage_critical"), "lt"),
         },
         "temperature": {
-            "critical_high": (s.threshold_temperature_critical_high, "gt"),
-            "warning_high": (s.threshold_temperature_warning_high, "gt"),
-            "warning_low": (s.threshold_temperature_warning_low, "lt"),
-            "critical_low": (s.threshold_temperature_critical_low, "lt"),
+            "critical_high": (_get("threshold_temperature_critical_high"), "gt"),
+            "warning_high": (_get("threshold_temperature_warning_high"), "gt"),
+            "warning_low": (_get("threshold_temperature_warning_low"), "lt"),
+            "critical_low": (_get("threshold_temperature_critical_low"), "lt"),
         },
         "humidity": {
-            "warning": (s.threshold_humidity_warning, "gt"),
-            "critical": (s.threshold_humidity_critical, "gt"),
+            "warning": (_get("threshold_humidity_warning"), "gt"),
+            "critical": (_get("threshold_humidity_critical"), "gt"),
         },
         "rssi": {
-            "warning": (s.threshold_rssi_warning, "lt"),
-            "critical": (s.threshold_rssi_critical, "lt"),
+            "warning": (_get("threshold_rssi_warning"), "lt"),
+            "critical": (_get("threshold_rssi_critical"), "lt"),
         },
     }
 

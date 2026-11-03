@@ -142,3 +142,18 @@ async def ack_alert(session: AsyncSession, alert_id: str) -> Optional[DeviceAler
 async def count_open_alerts(session: AsyncSession) -> int:
     stmt = select(func.count()).select_from(DeviceAlert).where(DeviceAlert.status == "open")
     return int((await session.execute(stmt)).scalar_one())
+
+
+async def alert_summary(session: AsyncSession) -> Dict:
+    """告警中心顶部统计：未处理数 / 未处理严重数 / 今日新增数。"""
+    open_stmt = select(func.count()).select_from(DeviceAlert).where(DeviceAlert.status == "open")
+    critical_stmt = open_stmt.where(DeviceAlert.level == "critical")
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_stmt = select(func.count()).select_from(DeviceAlert).where(
+        DeviceAlert.created_at >= today_start
+    )
+    return {
+        "open": int((await session.execute(open_stmt)).scalar_one()),
+        "critical_open": int((await session.execute(critical_stmt)).scalar_one()),
+        "today": int((await session.execute(today_stmt)).scalar_one()),
+    }

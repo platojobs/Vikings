@@ -4,6 +4,7 @@
 处理失败只记录日志，绝不阻塞后续消息（IoT 场景下丢一条可接受，卡死不可接受）。
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -12,7 +13,7 @@ from pydantic import ValidationError
 from app.database import SessionFactory
 from app.mqtt.client import MqttGatewayClient
 from app.schemas import CommandAckMessage, DeviceStatusMessage, SensorReportMessage
-from app.services import alert_service, command_service, device_service
+from app.services import alert_service, command_service, device_service, notify_service
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class MessageHandler:
         for alert in alert_payloads:
             if self._mqtt is not None:
                 await self._mqtt.publish_alert(alert)
+            # critical 告警异步外推 Webhook（fire-and-forget，不阻塞消费）
+            if alert.get("level") == "critical":
+                asyncio.create_task(notify_service.send_alert_webhook(alert))
 
     # ---------------- 上下线状态 ----------------
     async def _handle_status(self, device_id: str, payload: Dict[str, Any]) -> None:

@@ -4,7 +4,6 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
-from app.rules import thresholds_snapshot
 from app.schemas import ApiResponse, StatsOverviewOut
 from app.security import require_user
 from app.services import stats_service
@@ -34,9 +33,3 @@ async def health(request: Request):
             "messagesHandled": mqtt.message_count,
         },
     }
-
-
-@router.get("/rules/thresholds")
-async def get_thresholds(_: dict = Depends(require_user)):
-    """当前生效的告警阈值。修改阈值需调整环境变量并重启网关。"""
-    return ApiResponse(data=thresholds_snapshot())

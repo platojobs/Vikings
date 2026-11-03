@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_session
 from app.schemas import ApiResponse, OtaTaskCreateRequest, OtaTaskOut, PageOut
 from app.security import require_user
-from app.services import command_service
+from app.services import audit_service, command_service
 
 router = APIRouter(prefix="/api/ota", tags=["ota"])
 
@@ -31,6 +31,19 @@ async def create_task(
         description=body.description,
         operator=user.get("sub", "system"),
     )
+    await audit_service.log(
+        session,
+        operator=user.get("sub", "system"),
+        action=audit_service.ACTION_OTA_CREATE,
+        target_type="ota_task",
+        target_id=task.task_id,
+        detail={
+            "targetVersion": body.target_version,
+            "deviceCount": len(body.device_ids),
+            "deviceIds": body.device_ids[:20],
+        },
+    )
+    await session.commit()
     return ApiResponse(data=task)
 
 

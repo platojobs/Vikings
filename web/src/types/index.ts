@@ -127,6 +127,98 @@ export interface AlertListQuery {
   pageSize?: number
 }
 
+/** 告警统计卡片（GET /api/alerts/summary） */
+export interface AlertSummary {
+  open: number
+  critical_open: number
+  today: number
+}
+
+// ==================== 阈值在线配置 ====================
+
+/** 单项阈值的生效值与来源（override=在线覆盖 / env=环境变量） */
+export interface ThresholdEntry {
+  value: number
+  source: 'override' | 'env'
+}
+
+/** GET /api/rules/thresholds 的分组视图 */
+export interface ThresholdsView {
+  voltage: { warning: ThresholdEntry; critical: ThresholdEntry }
+  temperature: {
+    warning_high: ThresholdEntry
+    critical_high: ThresholdEntry
+    warning_low: ThresholdEntry
+    critical_low: ThresholdEntry
+  }
+  humidity: { warning: ThresholdEntry; critical: ThresholdEntry }
+  rssi: { warning: ThresholdEntry; critical: ThresholdEntry }
+}
+
+/** PUT /api/rules/thresholds 入参：只传需要修改的键 */
+export interface ThresholdsUpdateBody {
+  voltage_warning?: number
+  voltage_critical?: number
+  temperature_warning_high?: number
+  temperature_critical_high?: number
+  temperature_warning_low?: number
+  temperature_critical_low?: number
+  humidity_warning?: number
+  humidity_critical?: number
+  rssi_warning?: number
+  rssi_critical?: number
+}
+
+export interface ThresholdsUpdateResult {
+  updated: Record<string, number>
+  thresholds: ThresholdsView
+}
+
+// ==================== 审计日志 ====================
+
+export type AuditAction =
+  | 'login'
+  | 'command.create'
+  | 'ota.create'
+  | 'alert.ack'
+  | 'threshold.update'
+
+export interface AuditLog {
+  id: number
+  operator: string
+  action: string
+  target_type: string
+  target_id: string
+  detail: Record<string, unknown>
+  created_at: string
+}
+
+export interface AuditLogQuery {
+  operator?: string
+  action?: string
+  page?: number
+  pageSize?: number
+}
+
+// ==================== 数据聚合 ====================
+
+export type AggregateBucket = 'hour' | 'day'
+
+/** 时间桶聚合点（GET /api/devices/{id}/records/aggregate） */
+export interface AggregatePoint {
+  bucket_start: string
+  count: number
+  temperature_avg: number
+  temperature_min: number
+  temperature_max: number
+  humidity_avg: number
+  humidity_min: number
+  humidity_max: number
+  voltage_avg: number
+  voltage_min: number
+  voltage_max: number
+}
+
 // ==================== 指令 ====================
 
 export type CommandType = 'calibrate' | 'ota' | 'reboot' | 'config'

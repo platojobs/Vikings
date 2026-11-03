@@ -218,3 +218,67 @@ class PageOut(BaseModel, Generic[T]):
     total: int
     page: int
     page_size: int
+
+
+# ==================== 阈值在线配置 ====================
+
+
+class ThresholdsUpdateRequest(BaseModel):
+    """PUT /api/rules/thresholds 入参：只更新传入的键，缺省保持现状。
+
+    键名与 Settings.threshold_* 一一对应，取值范围按物理意义约束。
+    """
+
+    voltage_warning: Optional[float] = Field(default=None, ge=2.0, le=4.5)
+    voltage_critical: Optional[float] = Field(default=None, ge=2.0, le=4.5)
+    temperature_warning_high: Optional[float] = Field(default=None, ge=-40, le=85)
+    temperature_critical_high: Optional[float] = Field(default=None, ge=-40, le=85)
+    temperature_warning_low: Optional[float] = Field(default=None, ge=-40, le=85)
+    temperature_critical_low: Optional[float] = Field(default=None, ge=-40, le=85)
+    humidity_warning: Optional[float] = Field(default=None, ge=0, le=100)
+    humidity_critical: Optional[float] = Field(default=None, ge=0, le=100)
+    rssi_warning: Optional[float] = Field(default=None, ge=-150, le=0)
+    rssi_critical: Optional[float] = Field(default=None, ge=-150, le=0)
+
+
+# ==================== 审计日志 ====================
+
+
+class AuditLogOut(BaseModel):
+    id: int
+    operator: str
+    action: str
+    target_type: str
+    target_id: str
+    detail: Dict[str, Any]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ==================== 数据聚合 ====================
+
+
+class AggregatePoint(BaseModel):
+    """时间桶聚合结果：每个桶给出三指标的 avg/min/max。"""
+
+    bucket_start: datetime
+    count: int
+    temperature_avg: float
+    temperature_min: float
+    temperature_max: float
+    humidity_avg: float
+    humidity_min: float
+    humidity_max: float
+    voltage_avg: float
+    voltage_min: float
+    voltage_max: float
+
+
+# ==================== 告警统计 ====================
+
+
+class AlertSummaryOut(BaseModel):
+    open: int
+    critical_open: int
+    today: int

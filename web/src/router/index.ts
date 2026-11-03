@@ -29,6 +29,18 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '历史查询' },
   },
   {
+    path: '/alerts',
+    name: 'alerts',
+    component: () => import('@/views/AlertsView.vue'),
+    meta: { title: '告警中心' },
+  },
+  {
+    path: '/audit',
+    name: 'audit',
+    component: () => import('@/views/AuditView.vue'),
+    meta: { title: '审计日志' },
+  },
+  {
     path: '/ota',
     name: 'ota',
     component: () => import('@/views/OtaView.vue'),

@@ -1,14 +1,18 @@
 <script setup lang="ts">
 /**
- * 历史查询：选择设备 + 本地时间范围，调用 /api/devices/{id}/records。
+ * 历史查询：选择设备 + 本地时间范围，支持明细与按小时/按天聚合两种视图。
  * 时间以毫秒时间戳传给网关，避免字符串时区歧义。
  */
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { fetchDeviceRecords, fetchDevices } from '@/api/devices'
+import { fetchDeviceAggregate, fetchDeviceRecords, fetchDevices } from '@/api/devices'
 import SensorChart from '@/components/SensorChart.vue'
+import AggregateChart from '@/components/AggregateChart.vue'
 import { formatDateTime } from '@/utils/format'
-import type { Device, SensorRecord } from '@/types'
+import type { AggregateBucket, AggregatePoint, Device, SensorRecord } from '@/types'
+
+/** 视图模式：detail=明细，hour/day=聚合粒度 */
+type ViewMode = 'detail' | AggregateBucket
 
 /** 默认最近 6 小时 */
 function defaultRange(): [Date, Date] {
@@ -38,15 +42,21 @@ const shortcuts = [
 const devices = ref<Device[]>([])
 const deviceId = ref('')
 const range = ref<[Date, Date]>(defaultRange())
+const mode = ref<ViewMode>('detail')
 const records = ref<SensorRecord[]>([])
+const points = ref<AggregatePoint[]>([])
 const loading = ref(false)
 const devicesLoading = ref(false)
 
 const rangeLabel = computed(() => {
-  if (!records.value.length) return ''
-  const first = records.value[0]
-  const last = records.value[records.value.length - 1]
-  return `${formatDateTime(first.ts)} ~ ${formatDateTime(last.ts)}`
+  if (mode.value === 'detail') {
+    if (!records.value.length) return ''
+    const first = records.value[0]
+    const last = records.value[records.value.length - 1]
+    return `共 ${records.value.length} 条 · ${formatDateTime(first.ts)} ~ ${formatDateTime(last.ts)}`
+  }
+  if (!points.value.length) return ''
+  return `共 ${points.value.length} 个时间桶（按${mode.value === 'hour' ? '小时' : '天'}聚合）`
 })
 
 async function queryRecords(): Promise<void> {
@@ -66,16 +76,29 @@ async function queryRecords(): Promise<void> {
 
   loading.value = true
   try {
-    records.value = await fetchDeviceRecords(deviceId.value, {
-      start: start.getTime(),
-      end: end.getTime(),
-      limit: 1000,
-    })
+    if (mode.value === 'detail') {
+      records.value = await fetchDeviceRecords(deviceId.value, {
+        start: start.getTime(),
+        end: end.getTime(),
+        limit: 1000,
+      })
+    } else {
+      points.value = await fetchDeviceAggregate(deviceId.value, mode.value, {
+        start: start.getTime(),
+        end: end.getTime(),
+      })
+    }
   } catch {
     records.value = []
+    points.value = []
   } finally {
     loading.value = false
   }
+}
+
+/** 切换视图模式后重新查询 */
+function handleModeChange(): void {
+  if (deviceId.value) queryRecords()
 }
 
 async function loadDevices(): Promise<void> {
@@ -130,6 +153,13 @@ onMounted(loadDevices)
           end-placeholder="结束时间"
         />
 
+        <span class="filter-label">视图</span>
+        <el-radio-group v-model="mode" @change="handleModeChange">
+          <el-radio-button value="detail">明细</el-radio-button>
+          <el-radio-button value="hour">按小时</el-radio-button>
+          <el-radio-button value="day">按天</el-radio-button>
+        </el-radio-group>
+
         <el-button type="primary" :loading="loading" @click="queryRecords">查询</el-button>
       </div>
     </el-card>
@@ -137,20 +167,35 @@ onMounted(loadDevices)
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <span class="card-title">温度 / 湿度 / 电压历史曲线</span>
-          <span v-if="rangeLabel" class="range-hint">
-            共 {{ records.length }} 条 · {{ rangeLabel }}
+          <span class="card-title">
+            {{ mode === 'detail' ? '温度 / 湿度 / 电压历史曲线' : '温度 / 湿度 / 电压聚合趋势（均值）' }}
           </span>
+          <span v-if="rangeLabel" class="range-hint">{{ rangeLabel }}</span>
         </div>
       </template>
 
       <div v-loading="loading" class="chart-wrap">
-        <SensorChart v-if="records.length" :records="records" height="440px" />
-        <el-empty
-          v-else
-          description="暂无数据，请调整设备或时间范围后重新查询"
-          :image-size="100"
-        />
+        <template v-if="mode === 'detail'">
+          <SensorChart v-if="records.length" :records="records" height="440px" />
+          <el-empty
+            v-else
+            description="暂无数据，请调整设备或时间范围后重新查询"
+            :image-size="100"
+          />
+        </template>
+        <template v-else>
+          <AggregateChart
+            v-if="points.length"
+            :points="points"
+            :bucket="mode"
+            height="440px"
+          />
+          <el-empty
+            v-else
+            description="该时间范围内没有聚合数据，可尝试扩大范围"
+            :image-size="100"
+          />
+        </template>
       </div>
     </el-card>
   </div>

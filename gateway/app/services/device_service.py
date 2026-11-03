@@ -170,3 +170,65 @@ async def count_report_today(session: AsyncSession) -> int:
     today_start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
     stmt = select(func.count()).select_from(SensorRecord).where(SensorRecord.ts >= today_start)
     return int((await session.execute(stmt)).scalar_one())
+
+
+async def aggregate_records(
+    session: AsyncSession,
+    device_id: str,
+    bucket: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> List[dict]:
+    """按时间桶聚合时序数据：每桶输出三指标的 avg/min/max。
+
+    bucket: hour / day。分桶表达式按数据库方言切换：
+    PostgreSQL 用 date_trunc，SQLite 用 strftime（二者返回值都按字符串排序等价）。
+    """
+    from app.config import get_settings
+
+    if get_settings().is_sqlite:
+        fmt = "%Y-%m-%d %H:00:00" if bucket == "hour" else "%Y-%m-%d"
+        bucket_expr = func.strftime(fmt, SensorRecord.ts)
+    else:
+        bucket_expr = func.date_trunc(bucket, SensorRecord.ts)
+
+    stmt = select(
+        bucket_expr.label("bucket_start"),
+        func.count().label("count"),
+        func.avg(SensorRecord.temperature).label("temperature_avg"),
+        func.min(SensorRecord.temperature).label("temperature_min"),
+        func.max(SensorRecord.temperature).label("temperature_max"),
+        func.avg(SensorRecord.humidity).label("humidity_avg"),
+        func.min(SensorRecord.humidity).label("humidity_min"),
+        func.max(SensorRecord.humidity).label("humidity_max"),
+        func.avg(SensorRecord.voltage).label("voltage_avg"),
+        func.min(SensorRecord.voltage).label("voltage_min"),
+        func.max(SensorRecord.voltage).label("voltage_max"),
+    ).where(SensorRecord.device_id == device_id)
+
+    if start:
+        stmt = stmt.where(SensorRecord.ts >= start)
+    if end:
+        stmt = stmt.where(SensorRecord.ts <= end)
+
+    stmt = stmt.group_by(bucket_expr).order_by(bucket_expr)
+    rows = (await session.execute(stmt)).all()
+
+    result = []
+    for row in rows:
+        item = dict(row._mapping)
+        # SQLite strftime 返回字符串，PostgreSQL date_trunc 返回 datetime，统一转 datetime
+        bs = item["bucket_start"]
+        if isinstance(bs, str):
+            fmt = "%Y-%m-%d %H:%M:%S" if bucket == "hour" else "%Y-%m-%d"
+            item["bucket_start"] = datetime.strptime(bs, fmt).replace(tzinfo=timezone.utc)
+        for key in ("temperature_avg", "humidity_avg", "voltage_avg"):
+            item[key] = round(float(item[key]), 2)
+        for key in (
+            "temperature_min", "temperature_max",
+            "humidity_min", "humidity_max",
+            "voltage_min", "voltage_max",
+        ):
+            item[key] = float(item[key])
+        result.append(item)
+    return result
