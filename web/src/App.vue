@@ -3,6 +3,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { clearAuth, getStoredUser } from '@/utils/auth'
 import { onStatusChange } from '@/services/mqtt'
 
@@ -40,41 +41,43 @@ async function handleLogout(): Promise<void> {
 </script>
 
 <template>
-  <router-view v-if="isLogin" />
+  <el-config-provider :locale="zhCn">
+    <router-view v-if="isLogin" />
 
-  <el-container v-else class="app-layout">
-    <el-header class="app-header">
-      <div class="brand">
-        <span class="brand-logo">IoT</span>
-        <span class="brand-title">智能硬件全链路管理平台</span>
-      </div>
+    <el-container v-else class="app-layout">
+      <el-header class="app-header">
+        <div class="brand">
+          <span class="brand-logo">IoT</span>
+          <span class="brand-title">智能硬件全链路管理平台</span>
+        </div>
 
-      <el-menu
-        class="app-menu"
-        mode="horizontal"
-        :default-active="activeMenu"
-        :ellipsis="false"
-        router
-      >
-        <el-menu-item index="/dashboard">实时仪表盘</el-menu-item>
-        <el-menu-item index="/devices">设备管理</el-menu-item>
-        <el-menu-item index="/history">历史查询</el-menu-item>
-        <el-menu-item index="/ota">OTA 管理</el-menu-item>
-      </el-menu>
+        <el-menu
+          class="app-menu"
+          mode="horizontal"
+          :default-active="activeMenu"
+          :ellipsis="false"
+          router
+        >
+          <el-menu-item index="/dashboard">实时仪表盘</el-menu-item>
+          <el-menu-item index="/devices">设备管理</el-menu-item>
+          <el-menu-item index="/history">历史查询</el-menu-item>
+          <el-menu-item index="/ota">OTA 管理</el-menu-item>
+        </el-menu>
 
-      <div class="header-right">
-        <el-tag :type="mqttConnected ? 'success' : 'info'" effect="dark" size="small">
-          {{ mqttConnected ? 'MQTT 已连接' : 'MQTT 连接中' }}
-        </el-tag>
-        <span class="username">{{ username }}</span>
-        <el-button link class="logout-btn" @click="handleLogout">退出登录</el-button>
-      </div>
-    </el-header>
+        <div class="header-right">
+          <el-tag :type="mqttConnected ? 'success' : 'info'" effect="dark" size="small">
+            {{ mqttConnected ? 'MQTT 已连接' : 'MQTT 连接中' }}
+          </el-tag>
+          <span class="username">{{ username }}</span>
+          <el-button link class="logout-btn" @click="handleLogout">退出登录</el-button>
+        </div>
+      </el-header>
 
-    <el-main class="app-main">
-      <router-view />
-    </el-main>
-  </el-container>
+      <el-main class="app-main">
+        <router-view />
+      </el-main>
+    </el-container>
+  </el-config-provider>
 </template>
 
 <style scoped>

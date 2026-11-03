@@ -3,6 +3,7 @@
 import { request } from '@/api/http'
 import type {
   CommandItem,
+  CommandType,
   Device,
   DeviceDetail,
   DeviceListQuery,
@@ -46,5 +47,17 @@ export function fetchDeviceCommands(
 ): Promise<CommandItem[]> {
   return request<CommandItem[]>(`/api/devices/${encodeURIComponent(deviceId)}/commands`, {
     params: { limit },
+  })
+}
+
+/** 下发单条指令（calibrate / reboot / config），OTA 走专用任务接口。 */
+export function sendCommand(
+  deviceId: string,
+  type: CommandType,
+  payload: Record<string, unknown> = {},
+): Promise<CommandItem> {
+  return request<CommandItem>(`/api/devices/${encodeURIComponent(deviceId)}/commands`, {
+    method: 'POST',
+    body: { type, payload },
   })
 }

@@ -4,7 +4,7 @@
  * 容器尺寸变化（如抽屉展开）时通过 ResizeObserver 自动重绘。
  */
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '@/utils/echarts'
 import type { EChartsOption } from 'echarts'
 import type { SensorRecord } from '@/types'
 import { formatShortTime } from '@/utils/format'

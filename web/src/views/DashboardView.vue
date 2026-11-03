@@ -6,7 +6,7 @@
  * - 右侧实时告警：REST 拉取未确认告警 + 订阅 device/system/alert
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '@/utils/echarts'
 import type { EChartsOption } from 'echarts'
 import { fetchAlerts } from '@/api/alerts'
 import { fetchLatestRecords } from '@/api/devices'

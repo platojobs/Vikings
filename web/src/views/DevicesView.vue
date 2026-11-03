@@ -4,18 +4,28 @@
  * 点击任意行打开抽屉，展示详情、历史数据折线图与指令历史。
  */
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import {
   fetchDeviceCommands,
   fetchDeviceDetail,
   fetchDeviceRecords,
   fetchDevices,
+  sendCommand,
 } from '@/api/devices'
 import { formatDateTime, formatMetric } from '@/utils/format'
 import { commandStateLabel, commandStateTagType } from '@/utils/labels'
 import DeviceStatusTag from '@/components/DeviceStatusTag.vue'
 import SensorChart from '@/components/SensorChart.vue'
 import { subscribe } from '@/services/mqtt'
-import type { CommandItem, Device, DeviceDetail, DeviceStatus, SensorRecord } from '@/types'
+import type {
+  CommandAckMessage,
+  CommandItem,
+  CommandType,
+  Device,
+  DeviceDetail,
+  DeviceStatus,
+  SensorRecord,
+} from '@/types'
 
 const query = reactive<{ status: DeviceStatus | ''; keyword: string }>({
   status: '',
@@ -94,6 +104,104 @@ async function openDevice(row: Device): Promise<void> {
   }
 }
 
+// ==================== 指令下发面板 ====================
+
+const commandType = ref<CommandType>('config')
+const submittingCmd = ref(false)
+
+const calibrateForm = reactive({
+  temperatureOffset: 0,
+  humidityOffset: 0,
+})
+
+const configForm = reactive({
+  reportIntervalSec: 30,
+  sleepSec: 15,
+})
+
+/** 各指令类型的提交载荷构造 */
+function buildPayload(type: CommandType): Record<string, unknown> {
+  switch (type) {
+    case 'calibrate':
+      return {
+        temperatureOffset: Number(calibrateForm.temperatureOffset) || 0,
+        humidityOffset: Number(calibrateForm.humidityOffset) || 0,
+      }
+    case 'config':
+      return {
+        reportIntervalSec: Number(configForm.reportIntervalSec) || 30,
+        sleepSec: Number(configForm.sleepSec) || 15,
+      }
+    case 'reboot':
+      return {}
+    default:
+      return {}
+  }
+}
+
+async function handleSendCommand(): Promise<void> {
+  if (!detail.value) return
+  submittingCmd.value = true
+  try {
+    const cmd = await sendCommand(
+      detail.value.device_id,
+      commandType.value,
+      buildPayload(commandType.value),
+    )
+    // 新指令插入历史列表头部，等待 MQTT 回执推进状态
+    commands.value = [cmd, ...commands.value.filter((c) => c.cmd_id !== cmd.cmd_id)]
+    ElMessage.success(`指令已下发：${commandLabel(commandType.value)}`)
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    submittingCmd.value = false
+  }
+}
+
+function commandLabel(type: CommandType): string {
+  switch (type) {
+    case 'calibrate':
+      return '传感器校准'
+    case 'reboot':
+      return '设备重启'
+    case 'config':
+      return '运行参数配置'
+    default:
+      return type
+  }
+}
+
+// ==================== 历史数据 CSV 导出 ====================
+
+function exportCsv(): void {
+  if (!detail.value || historyRecords.value.length === 0) {
+    ElMessage.warning('暂无数据可导出')
+    return
+  }
+  const header = ['seq', 'ts', 'temperature', 'humidity', 'voltage', 'rssi', 'battery']
+  const rows = historyRecords.value.map((r) => [
+    r.seq,
+    new Date(r.ts).toISOString(),
+    r.temperature,
+    r.humidity,
+    r.voltage,
+    r.rssi,
+    r.battery,
+  ])
+  const csv = [header, ...rows]
+    .map((line) => line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+    .join('\n')
+  // 加 BOM 让 Excel 正确识别 UTF-8 中文
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${detail.value.device_id}_sensor_${Date.now()}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${historyRecords.value.length} 条数据`)
+}
+
 onMounted(loadDevices)
 
 // ==================== 实时状态刷新 ====================
@@ -131,9 +239,26 @@ const unsubscribeReport = subscribe('device/+/sensor/report', (payload, topic) =
   }
 })
 
+// 订阅 device/+/cmd/ack，实时推进抽屉里指令历史的状态与进度
+const unsubscribeAck = subscribe('device/+/cmd/ack', (payload) => {
+  const ack = payload as CommandAckMessage
+  if (!ack?.cmdId) return
+  const target = commands.value.find((c) => c.cmd_id === ack.cmdId)
+  if (!target) return
+  const rank = (s: string) => ({ issued: 0, received: 1, progress: 2, success: 3, failed: 3 }[s] ?? 0)
+  if (rank(ack.state) >= rank(target.state) || ack.state === 'failed') {
+    target.state = ack.state
+  }
+  if (typeof ack.progress === 'number') {
+    target.progress = Math.max(target.progress, ack.progress)
+  }
+  if (ack.message) target.message = ack.message
+})
+
 onUnmounted(() => {
   unsubscribeStatus()
   unsubscribeReport()
+  unsubscribeAck()
 })
 </script>
 
@@ -245,8 +370,101 @@ onUnmounted(() => {
 
         <section class="drawer-section">
           <div class="section-header">
+            <h3>下发指令</h3>
+            <span class="section-hint">网关落库后经 MQTT 推送给设备，设备在唤醒窗口内回执</span>
+          </div>
+          <el-radio-group v-model="commandType" class="cmd-type-group">
+            <el-radio-button label="config">运行参数</el-radio-button>
+            <el-radio-button label="calibrate">传感器校准</el-radio-button>
+            <el-radio-button label="reboot">设备重启</el-radio-button>
+          </el-radio-group>
+
+          <div v-if="commandType === 'calibrate'" class="cmd-form">
+            <el-row :gutter="12">
+              <el-col :span="12">
+                <el-form-item label="温度偏移 (℃)">
+                  <el-input-number
+                    v-model="calibrateForm.temperatureOffset"
+                    :step="0.1"
+                    :precision="1"
+                    controls-position="right"
+                    class="full-width"
+                  />
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="湿度偏移 (%RH)">
+                  <el-input-number
+                    v-model="calibrateForm.humidityOffset"
+                    :step="0.1"
+                    :precision="1"
+                    controls-position="right"
+                    class="full-width"
+                  />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </div>
+
+          <div v-else-if="commandType === 'config'" class="cmd-form">
+            <el-row :gutter="12">
+              <el-col :span="12">
+                <el-form-item label="上报间隔 (秒)">
+                  <el-input-number
+                    v-model="configForm.reportIntervalSec"
+                    :min="1"
+                    :max="3600"
+                    controls-position="right"
+                    class="full-width"
+                  />
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="休眠时长 (秒)">
+                  <el-input-number
+                    v-model="configForm.sleepSec"
+                    :min="1"
+                    :max="86400"
+                    controls-position="right"
+                    class="full-width"
+                  />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </div>
+
+          <div v-else class="cmd-form">
+            <el-alert
+              title="重启指令会重置设备上报序号 seq 并立即重新上线，OTA 进行中请勿重启。"
+              type="warning"
+              :closable="false"
+              show-icon
+            />
+          </div>
+
+          <el-button
+            type="primary"
+            :loading="submittingCmd"
+            :disabled="!detail"
+            @click="handleSendCommand"
+          >
+            下发{{ commandLabel(commandType) }}指令
+          </el-button>
+        </section>
+
+        <section class="drawer-section">
+          <div class="section-header">
             <h3>历史数据</h3>
-            <span class="section-hint">最近 {{ historyRecords.length }} 条</span>
+            <div class="section-actions">
+              <span class="section-hint">最近 {{ historyRecords.length }} 条</span>
+              <el-button
+                size="small"
+                :disabled="!historyRecords.length"
+                @click="exportCsv"
+              >
+                导出 CSV
+              </el-button>
+            </div>
           </div>
           <SensorChart v-if="historyRecords.length" :records="historyRecords" height="260px" />
           <el-empty v-else description="暂无历史数据" :image-size="70" />
@@ -347,6 +565,28 @@ onUnmounted(() => {
 .section-hint {
   font-size: 12px;
   color: #94a3b8;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.cmd-type-group {
+  margin-bottom: 16px;
+}
+
+.cmd-form {
+  margin-bottom: 16px;
+}
+
+.cmd-form :deep(.el-form-item) {
+  margin-bottom: 12px;
+}
+
+.full-width {
+  width: 100%;
 }
 
 @media (max-width: 768px) {
