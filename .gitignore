@@ -39,3 +39,4 @@ logs/
 *.db
 *.sqlite3
 data/
+.run/
