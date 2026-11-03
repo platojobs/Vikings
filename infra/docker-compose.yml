@@ -1,0 +1,45 @@
+# 基础设施编排：Mosquitto + PostgreSQL
+# 用法：docker compose -f infra/docker-compose.yml up -d
+# 说明：本文件只编排"无状态之外"的基础设施；网关与前端在本地以热更新方式运行，
+#       便于开发调试。生产部署请为 gateway / web 补 Dockerfile 并接入本编排。
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: iot-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"   # 设备侧 MQTT over TCP
+      - "9001:9001"   # 后台侧 MQTT over WebSocket
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/broker/uptime' -C 1 -W 3 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: iot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: iot
+      POSTGRES_PASSWORD: iot_pass
+      POSTGRES_DB: iot
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d iot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mosquitto-data:
+  postgres-data:
