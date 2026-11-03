@@ -1,0 +1,144 @@
+"""告警服务：规则判定 → AI 文案 → 落库 → 返回待发布的 MQTT 报文。"""
+
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ai.diagnosis import generate_alert_text
+from app.config import get_settings
+from app.models import DeviceAlert
+from app.rules import evaluate
+from app.schemas import SensorReportMessage
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+async def _recent_alert_exists(session: AsyncSession, device_id: str, metric: str) -> bool:
+    """告警抑制：同设备同指标在抑制窗口内已有告警则不再重复产生。
+
+    电池电压这类缓慢变化的指标，如果每分钟都刷一条告警会把看板淹没，
+    所以默认 5 分钟窗口内同类告警只保留第一条。
+    """
+    since = datetime.now(timezone.utc) - timedelta(seconds=settings.alert_suppress_seconds)
+    stmt = (
+        select(func.count())
+        .select_from(DeviceAlert)
+        .where(
+            DeviceAlert.device_id == device_id,
+            DeviceAlert.metric == metric,
+            DeviceAlert.created_at >= since,
+        )
+    )
+    return int((await session.execute(stmt)).scalar_one()) > 0
+
+
+async def handle_report_alerts(
+    session: AsyncSession, report: SensorReportMessage, device_name: str
+) -> List[Dict]:
+    """对一条上报执行完整告警链路，返回需要发布到 device/system/alert 的报文列表。"""
+    hits = evaluate(report)
+    if not hits:
+        return []
+
+    # 先剔除被抑制的指标，再并发生成文案（LLM 是网络 IO，串行会拖慢消费）
+    candidates = []
+    for hit in hits:
+        if await _recent_alert_exists(session, report.device_id, hit["metric"]):
+            logger.debug("告警被抑制: device=%s metric=%s", report.device_id, hit["metric"])
+            continue
+        candidates.append(hit)
+
+    if not candidates:
+        return []
+
+    texts = await asyncio.gather(
+        *(generate_alert_text(report.device_id, hit) for hit in candidates)
+    )
+
+    messages: List[Dict] = []
+    now = datetime.now(timezone.utc)
+    for hit, (text, ai_generated) in zip(candidates, texts):
+        alert = DeviceAlert(
+            alert_id="alt-" + uuid.uuid4().hex[:12],
+            device_id=report.device_id,
+            level=hit["level"],
+            metric=hit["metric"],
+            value=hit["value"],
+            threshold=hit["threshold"],
+            message=text,
+            ai_generated=ai_generated,
+            status="open",
+            created_at=now,
+        )
+        session.add(alert)
+        messages.append(
+            {
+                "alertId": alert.alert_id,
+                "deviceId": report.device_id,
+                "deviceName": device_name,
+                "level": alert.level,
+                "metric": alert.metric,
+                "value": float(alert.value),
+                "threshold": float(alert.threshold),
+                "message": alert.message,
+                "aiGenerated": alert.ai_generated,
+                "ts": int(now.timestamp() * 1000),
+            }
+        )
+        logger.warning(
+            "生成告警 device=%s metric=%s level=%s value=%s threshold=%s ai=%s",
+            report.device_id, hit["metric"], hit["level"], hit["value"], hit["threshold"], ai_generated,
+        )
+
+    await session.flush()
+    return messages
+
+
+async def list_alerts(
+    session: AsyncSession,
+    device_id: Optional[str],
+    level: Optional[str],
+    status: Optional[str],
+    page: int,
+    page_size: int,
+) -> Tuple[List[DeviceAlert], int]:
+    stmt = select(DeviceAlert)
+    count_stmt = select(func.count()).select_from(DeviceAlert)
+
+    if device_id:
+        stmt = stmt.where(DeviceAlert.device_id == device_id)
+        count_stmt = count_stmt.where(DeviceAlert.device_id == device_id)
+    if level:
+        stmt = stmt.where(DeviceAlert.level == level)
+        count_stmt = count_stmt.where(DeviceAlert.level == level)
+    if status:
+        stmt = stmt.where(DeviceAlert.status == status)
+        count_stmt = count_stmt.where(DeviceAlert.status == status)
+
+    stmt = stmt.order_by(DeviceAlert.created_at.desc())
+    stmt = stmt.offset((page - 1) * page_size).limit(page_size)
+
+    total = int((await session.execute(count_stmt)).scalar_one())
+    rows = list((await session.execute(stmt)).scalars().all())
+    return rows, total
+
+
+async def ack_alert(session: AsyncSession, alert_id: str) -> Optional[DeviceAlert]:
+    stmt = select(DeviceAlert).where(DeviceAlert.alert_id == alert_id)
+    alert = (await session.execute(stmt)).scalars().first()
+    if alert is None:
+        return None
+    alert.status = "acked"
+    await session.flush()
+    return alert
+
+
+async def count_open_alerts(session: AsyncSession) -> int:
+    stmt = select(func.count()).select_from(DeviceAlert).where(DeviceAlert.status == "open")
+    return int((await session.execute(stmt)).scalar_one())
