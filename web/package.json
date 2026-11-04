@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "echarts": "^5.5.1",
+    "echarts": "^6.1.0",
     "element-plus": "^2.9.2",
     "mqtt": "^5.10.3",
     "vue": "^3.5.13",
