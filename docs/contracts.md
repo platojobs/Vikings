@@ -226,9 +226,9 @@ fire-and-forget，不阻塞告警主链路。
 账号变更全部写入审计日志（`user.create` / `user.update` / `user.delete`），
 审计 detail 只记录变更项，不落口令明文。
 
-### 3.10 移动看板复用的只读接口（v1.7.0，无新增契约）
+### 3.10 移动看板复用的网关接口（v1.7.0 只读 / v1.9.0 写操作，无新增契约）
 
-device_app 的只读看板不新增、不修改任何网关端点，仅消费以下既有接口：
+device_app 的移动看板不新增、不修改任何网关端点，读写均消费以下既有接口：
 
 | 用途 | 接口 | 参数 / 说明 |
 | --- | --- | --- |
@@ -241,7 +241,8 @@ device_app 的只读看板不新增、不修改任何网关端点，仅消费以
 
 统一鉴权头 `Authorization: Bearer <token>`；token 由登录接口下发，与 Web 后台一致。
 看板对 `401` 的处理：清除本地 token 并回到登录页；`403` 提示无权访问；
-超时与网络错误展示可读文案。看板为只读，不调用任何写接口。
+超时与网络错误展示可读文案。v1.9.0 起额外调用 3.10.2 列出的两个写接口，
+写权限与 403 处理不复制 RBAC，直接沿用登录会话角色与网关响应。
 
 #### 3.10.1 移动看板实时订阅（v1.8.0）
 
@@ -259,8 +260,27 @@ v1.8.0 起看板增量数据改走 MQTT over WebSocket（默认 `ws://<网关主
 - 断线由客户端按 3s → 30s 指数退避自动重连，期间降级为 REST 轮询（15 秒）并提示「已切换轮询」，
   恢复连接后停止轮询；首屏与手动刷新仍走 3.10 的 REST 接口；
 - 看板切到后台或切换到设备模拟页时断开实时连接与轮询，回到看板后自动恢复；
-- 移动看板只订阅、不发布，因此不影响设备模拟器的 1883 链路；
+- 移动看板的实时层只订阅、不发布；写操作走 REST 落库后由网关发布到 `cmd` Topic，
+  因此不影响设备模拟器的 1883 链路；
 - 实时链路失败只影响界面状态条，不阻塞 REST 数据展示。
+
+#### 3.10.2 移动看板写操作（v1.9.0）
+
+写操作复用 3.3 / 3.7 的既有端点，角色要求与 Web 完全一致（operator + admin，viewer 返回 403）：
+
+| 操作 | 接口 | 入参 | 返回 | 角色 |
+| --- | --- | --- | --- | --- |
+| 指令下发 | `POST /api/devices/{deviceId}/commands` | `{type, payload}`；type ∈ `calibrate` / `ota` / `reboot` / `config` | `data: CommandOut`（`cmd_id` / `state` / `progress` / `message`） | operator / admin |
+| 告警确认 | `POST /api/alerts/{alertId}/ack` | 无 body | `data: AlertOut`（`status=acked`） | operator / admin |
+
+- 网关只校验 `type` 枚举与设备 / 告警是否存在，`payload` 的键值由客户端先行校验：
+  calibrate `{temperatureOffset, humidityOffset}`、config `{reportIntervalSec, sleepSec}`、
+  reboot `{}`、ota `{targetVersion, url?, size?}`；
+- 错误语义沿用统一 envelope：401 未登录、403 无权限、404 设备 / 告警不存在、
+  409 冲突（按服务端 `detail` 展示）、503 MQTT 下发失败；
+- 客户端不复制 RBAC，仅根据登录会话角色与 403 响应禁用写按钮；
+- 提交中禁用按钮防重复点击；告警确认成功即从本地「未处理」列表移除；
+  指令下发后展示 `CommandOut` 回执，并在设备详情刷新 `GET /api/devices/{id}/commands`。
 
 ---
 

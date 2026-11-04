@@ -3,20 +3,25 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../config/api_config.dart';
+import '../models/command_request.dart';
 import '../models/mobile_api_models.dart';
 import '../models/realtime_payload.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
+import '../widgets/command_dialog.dart';
 import '../widgets/online_badge.dart';
 import '../widgets/sensor_card.dart';
 import 'login_page.dart';
 
-/// 移动看板：手机端只读展示网关数据（设备、实时值、告警、指令回执）。
+/// 移动看板：手机端展示网关数据（设备、实时值、告警、指令回执），
+/// 并为 admin / operator 提供受限写操作（指令下发、告警确认）。
 ///
 /// 设计约束：
 /// - 首屏与手动刷新走既有 REST，实时增量走 MQTT over WebSocket（9001）；
+/// - 写操作严格复用网关既有端点，不复制 RBAC：角色以登录会话为准，
+///   服务端 403 时立即禁用写按钮并提示，不崩溃；
 /// - 网关与 Web 零改动，订阅 Topic 与后台看板一致；
 /// - 保留本地设备模拟器为默认入口，两套 MQTT 连接互不影响；
 /// - 未登录、后端不可达、token 失效、实时断线均给出可读提示，不白屏、不崩溃。
@@ -57,6 +62,12 @@ class _MobileBoardPageState extends State<MobileBoardPage>
 
   /// App 生命周期可见性（后台时断开实时）。
   bool _appVisible = true;
+
+  /// 服务端返回 403 后记录原因，直接禁用写操作，避免反复失败。
+  String? _writeBlockedReason;
+
+  /// 正在确认的告警 ID，用于防重复点击与按钮 loading。
+  String? _ackingAlertId;
 
   static const Duration _pollInterval = Duration(seconds: 15);
 
@@ -238,6 +249,179 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   bool _isOnline(DeviceSummary device) =>
       (_liveStatus[device.deviceId] ?? device.status) == 'online';
 
+  // ---------------- 写操作（指令 / 告警确认） ----------------
+
+  /// 写权限只认登录会话角色；服务端 403 后叠加本地禁用标记。
+  bool get _canWrite {
+    final session = _session;
+    return session != null &&
+        session.canIssueCommand &&
+        _writeBlockedReason == null;
+  }
+
+  String get _writeDisabledHint {
+    if (_writeBlockedReason != null) {
+      return _writeBlockedReason!;
+    }
+    final session = _session;
+    if (session == null) {
+      return '未登录，写操作不可用';
+    }
+    if (!session.canIssueCommand) {
+      return '当前账号为只读（${session.role}），指令下发与告警确认已禁用';
+    }
+    return '';
+  }
+
+  void _markWriteBlocked(String reason) {
+    if (!mounted) {
+      return;
+    }
+    setState(() => _writeBlockedReason = reason);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(reason)));
+  }
+
+  /// 打开指令下发弹窗；成功后刷新指令回执（由详情页自行处理）。
+  Future<CommandItem?> _openCommandDialog(DeviceSummary device) async {
+    if (!_canWrite) {
+      _markWriteBlocked(_writeDisabledHint);
+      return null;
+    }
+    final result = await showDialog<CommandItem>(
+      context: context,
+      builder: (dialogContext) => CommandDialog(
+        deviceId: device.deviceId,
+        deviceName: device.name,
+        onSubmit: (request) => _submitCommand(device, request),
+      ),
+    );
+    if (result != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('指令已下发：${result.cmdId}（${result.state}）')),
+      );
+    }
+    return result;
+  }
+
+  Future<CommandItem> _submitCommand(
+    DeviceSummary device,
+    CommandRequest request,
+  ) async {
+    final session = _session;
+    if (session == null) {
+      throw const ApiException(
+        ApiErrorKind.unauthorized,
+        '登录已失效，请重新登录',
+        statusCode: 401,
+      );
+    }
+    final client = ApiClient(baseUrl: _baseUrl);
+    try {
+      return await client.sendCommand(
+        token: session.token,
+        deviceId: device.deviceId,
+        type: request.type.wireName,
+        payload: request.payload,
+      );
+    } on ApiException catch (error) {
+      if (error.kind == ApiErrorKind.forbidden) {
+        _markWriteBlocked('服务端返回 403：当前账号无权下发指令');
+      } else if (error.kind == ApiErrorKind.unauthorized) {
+        await _handleExpired();
+      }
+      rethrow;
+    } finally {
+      client.close();
+    }
+  }
+
+  /// 告警二次确认：成功后立即从「未处理」列表移除。
+  Future<void> _confirmAck(AlertItem alert) async {
+    if (!_canWrite || _ackingAlertId != null) {
+      return;
+    }
+    final session = _session;
+    if (session == null) {
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('确认告警'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(alert.message, style: const TextStyle(fontSize: 14)),
+            const SizedBox(height: 10),
+            Text(
+              '设备：${alert.deviceId}\n'
+              '级别：${alert.level} · 指标：${alert.metric}\n'
+              '当前值 ${alert.value} / 阈值 ${alert.threshold}',
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              '确认后该告警将从「未处理」列表移除，并作为当前账号记入审计日志。',
+              style: TextStyle(fontSize: 12, color: Colors.black45),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('确认'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    setState(() => _ackingAlertId = alert.alertId);
+    final client = ApiClient(baseUrl: _baseUrl);
+    try {
+      await client.ackAlert(token: session.token, alertId: alert.alertId);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _alerts = _alerts
+            .where((item) => item.alertId != alert.alertId)
+            .toList(growable: false);
+      });
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('告警已确认')));
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      if (error.kind == ApiErrorKind.forbidden) {
+        _markWriteBlocked('服务端返回 403：当前账号无权确认告警');
+      } else if (error.kind == ApiErrorKind.unauthorized) {
+        await _handleExpired();
+      } else {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('确认失败：${error.userMessage}')));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('确认失败，请稍后重试')));
+      }
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() => _ackingAlertId = null);
+      }
+    }
+  }
+
   Future<void> _loadData({bool silent = false}) async {
     final session = _session;
     if (session == null) {
@@ -309,6 +493,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _alerts = const <AlertItem>[];
       _loading = false;
       _error = null;
+      _writeBlockedReason = null;
+      _ackingAlertId = null;
     });
   }
 
@@ -326,6 +512,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _readings = const <SensorReading>[];
       _alerts = const <AlertItem>[];
       _error = null;
+      _writeBlockedReason = null;
+      _ackingAlertId = null;
     });
   }
 
@@ -358,9 +546,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
               controller: realtimeController,
               decoration: InputDecoration(
                 labelText: '实时地址（可留空）',
-                hintText: fallback.isEmpty
-                    ? 'ws://192.168.1.8:9001'
-                    : fallback,
+                hintText: fallback.isEmpty ? 'ws://192.168.1.8:9001' : fallback,
                 border: const OutlineInputBorder(),
               ),
               keyboardType: TextInputType.url,
@@ -396,9 +582,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       return;
     }
     if (!ApiConfig.isValid(value.baseUrl)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('网关地址无效，未保存')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('网关地址无效，未保存')));
       return;
     }
     if (value.realtimeUrl.isNotEmpty &&
@@ -431,6 +616,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _notice = null;
       _error = null;
       _booting = false;
+      _writeBlockedReason = null;
+      _ackingAlertId = null;
     });
     _loadData();
     _syncRealtimeLifecycle();
@@ -485,6 +672,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
               _buildAccountBar(session),
               const SizedBox(height: 6),
               _buildRealtimeBar(),
+              if (_writeDisabledHint.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _buildWriteHint(_writeDisabledHint),
+              ],
               const SizedBox(height: 10),
               _buildSummary(),
               const SizedBox(height: 14),
@@ -504,7 +695,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
               const SizedBox(height: 18),
               const Center(
                 child: Text(
-                  '只读看板：指令下发与告警确认请使用 Web 管理后台',
+                  '写操作按登录角色开放：admin / operator 可下发指令与确认告警，viewer 只读',
+                  textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 12, color: Colors.black45),
                 ),
               ),
@@ -583,7 +775,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           RealtimeState.reconnecting => Colors.orange,
           _ => Colors.grey,
         };
-        final dot = state == RealtimeState.connecting ||
+        final dot =
+            state == RealtimeState.connecting ||
                 state == RealtimeState.reconnecting
             ? const SizedBox(
                 width: 10,
@@ -593,10 +786,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
             : Container(
                 width: 8,
                 height: 8,
-                decoration: BoxDecoration(
-                  color: color,
-                  shape: BoxShape.circle,
-                ),
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle),
               );
         final baseText = polling
             ? '${state.label} · 已切换轮询（每 15 秒）'
@@ -614,8 +804,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                 builder: (context, _) {
                   final failure = service.failure.value;
                   final attempts = service.attempts.value;
-                  final text = state == RealtimeState.reconnecting &&
-                          failure != null
+                  final text =
+                      state == RealtimeState.reconnecting && failure != null
                       ? '$failure${attempts > 0 ? '（第 $attempts 次）' : ''}'
                       : baseText;
                   return Text(
@@ -632,6 +822,29 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           ],
         );
       },
+    );
+  }
+
+  Widget _buildWriteHint(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.lock_outline, size: 15, color: Colors.orange),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(fontSize: 12, color: Colors.black87),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -807,6 +1020,26 @@ class _MobileBoardPageState extends State<MobileBoardPage>
             '${_formatTime(alert.createdAt)}',
             style: const TextStyle(fontSize: 12, color: Colors.black45),
           ),
+          const SizedBox(height: 2),
+          Align(
+            alignment: Alignment.centerRight,
+            child: _ackingAlertId == alert.alertId
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                    child: SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                : TextButton.icon(
+                    onPressed: _canWrite && _ackingAlertId == null
+                        ? () => _confirmAck(alert)
+                        : null,
+                    icon: const Icon(Icons.check_circle_outline, size: 16),
+                    label: const Text('确认告警'),
+                  ),
+          ),
         ],
       ),
     );
@@ -827,6 +1060,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         online: _isOnline(device),
         baseUrl: _baseUrl,
         token: session.token,
+        canWrite: _canWrite,
+        onIssueCommand: () => _openCommandDialog(device),
       ),
     );
   }
@@ -839,6 +1074,8 @@ class _DeviceDetailSheet extends StatefulWidget {
     required this.online,
     required this.baseUrl,
     required this.token,
+    required this.canWrite,
+    required this.onIssueCommand,
   });
 
   final DeviceSummary device;
@@ -846,6 +1083,12 @@ class _DeviceDetailSheet extends StatefulWidget {
   final bool online;
   final String baseUrl;
   final String token;
+
+  /// 当前会话是否可写（viewer 或服务端 403 后为 false）。
+  final bool canWrite;
+
+  /// 页面层统一处理指令弹窗、提交与 401/403，返回网关回执。
+  final Future<CommandItem?> Function() onIssueCommand;
 
   @override
   State<_DeviceDetailSheet> createState() => _DeviceDetailSheetState();
@@ -855,12 +1098,29 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
   List<CommandItem> _commands = const <CommandItem>[];
   List<SensorReading> _records = const <SensorReading>[];
   bool _loading = true;
+  bool _issuing = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
     _loadDetail();
+  }
+
+  /// 打开指令弹窗；成功后刷新回执列表，让新指令出现在顶部。
+  Future<void> _handleIssueCommand() async {
+    if (!widget.canWrite || _issuing) {
+      return;
+    }
+    setState(() => _issuing = true);
+    final result = await widget.onIssueCommand();
+    if (!mounted) {
+      return;
+    }
+    setState(() => _issuing = false);
+    if (result != null) {
+      await _loadDetail();
+    }
   }
 
   Future<void> _loadDetail() async {
@@ -923,12 +1183,35 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
               '${widget.device.deviceId} · FW ${widget.device.firmwareVersion}',
               style: const TextStyle(fontSize: 12, color: Colors.black45),
             ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: widget.canWrite && !_issuing
+                      ? _handleIssueCommand
+                      : null,
+                  icon: _issuing
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send, size: 16),
+                  label: Text(_issuing ? '提交中…' : '下发指令'),
+                ),
+                const SizedBox(width: 10),
+                if (!widget.canWrite)
+                  const Expanded(
+                    child: Text(
+                      '当前无写权限',
+                      style: TextStyle(fontSize: 12, color: Colors.black45),
+                    ),
+                  ),
+              ],
+            ),
             const SizedBox(height: 12),
             if (reading == null)
-              const Text(
-                '暂无上报数据',
-                style: TextStyle(color: Colors.black45),
-              )
+              const Text('暂无上报数据', style: TextStyle(color: Colors.black45))
             else
               Wrap(
                 spacing: 8,
@@ -1001,9 +1284,11 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
             else if (!_loading && _error == null)
               ..._commands.map(_buildCommandRow),
             const SizedBox(height: 12),
-            const Text(
-              '本页仅展示回执，不提供下发入口；校准 / 重启 / OTA 请在 Web 后台操作。',
-              style: TextStyle(fontSize: 12, color: Colors.black45),
+            Text(
+              widget.canWrite
+                  ? '写操作会作为当前账号记入审计日志；重启 / OTA 前请确认目标设备。'
+                  : '当前账号只读，仅展示数据与回执；如需下发指令请用 admin / operator 登录。',
+              style: const TextStyle(fontSize: 12, color: Colors.black45),
             ),
           ],
         ),

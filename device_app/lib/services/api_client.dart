@@ -32,15 +32,14 @@ class ApiClient {
       body: <String, dynamic>{'username': username, 'password': password},
     );
     if (data is! Map<String, dynamic>) {
-      throw const ApiException(
-        ApiErrorKind.invalidResponse,
-        '登录响应缺少 data',
-      );
+      throw const ApiException(ApiErrorKind.invalidResponse, '登录响应缺少 data');
     }
     final user = data['user'];
     return AuthSession(
       token: data['token']?.toString() ?? '',
-      username: user is Map ? user['username']?.toString() ?? username : username,
+      username: user is Map
+          ? user['username']?.toString() ?? username
+          : username,
       role: user is Map ? user['role']?.toString() ?? 'viewer' : 'viewer',
     );
   }
@@ -53,10 +52,7 @@ class ApiClient {
       query: <String, String>{'page': '1', 'pageSize': '100'},
     );
     if (data is! Map<String, dynamic>) {
-      throw const ApiException(
-        ApiErrorKind.invalidResponse,
-        '设备列表响应缺少 data',
-      );
+      throw const ApiException(ApiErrorKind.invalidResponse, '设备列表响应缺少 data');
     }
     return _mapList(data['items'], DeviceSummary.fromJson);
   }
@@ -91,10 +87,7 @@ class ApiClient {
       query: <String, String>{'status': 'open', 'page': '1', 'pageSize': '50'},
     );
     if (data is! Map<String, dynamic>) {
-      throw const ApiException(
-        ApiErrorKind.invalidResponse,
-        '告警响应缺少 data',
-      );
+      throw const ApiException(ApiErrorKind.invalidResponse, '告警响应缺少 data');
     }
     final items = data['items'];
     return _mapList(items, AlertItem.fromJson);
@@ -111,6 +104,39 @@ class ApiClient {
       query: <String, String>{'limit': '20'},
     );
     return _mapList(data, CommandItem.fromJson);
+  }
+
+  /// 下发单条指令，复用网关既有 `POST /api/devices/{id}/commands`。
+  ///
+  /// 网关仅校验 `type` 枚举，payload 的具体参数需由 CommandRequest 先行校验。
+  Future<CommandItem> sendCommand({
+    required String token,
+    required String deviceId,
+    required String type,
+    required Map<String, dynamic> payload,
+  }) async {
+    final data = await _send(
+      'POST',
+      '/api/devices/$deviceId/commands',
+      token: token,
+      body: <String, dynamic>{'type': type, 'payload': payload},
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '指令回执响应缺少 data');
+    }
+    return CommandItem.fromJson(data);
+  }
+
+  /// 确认告警，复用网关既有 `POST /api/alerts/{id}/ack`。
+  Future<AlertItem> ackAlert({
+    required String token,
+    required String alertId,
+  }) async {
+    final data = await _send('POST', '/api/alerts/$alertId/ack', token: token);
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '告警确认响应缺少 data');
+    }
+    return AlertItem.fromJson(data);
   }
 
   Future<dynamic> _send(
@@ -137,18 +163,12 @@ class ApiClient {
         response = await _client.get(uri, headers: headers).timeout(timeout);
       }
     } on TimeoutException {
-      throw const ApiException(
-        ApiErrorKind.timeout,
-        '网关响应超时，请检查网络后重试',
-      );
+      throw const ApiException(ApiErrorKind.timeout, '网关响应超时，请检查网络后重试');
     } on http.ClientException catch (error) {
       throw ApiException(ApiErrorKind.network, error.message);
     } catch (_) {
       // 覆盖 SocketException 等平台底层网络异常，统一收敛为可读提示
-      throw const ApiException(
-        ApiErrorKind.network,
-        '无法连接网关，请确认地址、后端进程与网络连通性',
-      );
+      throw const ApiException(ApiErrorKind.network, '无法连接网关，请确认地址、后端进程与网络连通性');
     }
     // 解码/业务异常只在传输成功后才产生，交给调用方按 ApiErrorKind 处理
     return _decode(response);
@@ -181,6 +201,13 @@ class ApiClient {
         statusCode: 403,
       );
     }
+    if (response.statusCode == 409) {
+      throw ApiException(
+        ApiErrorKind.conflict,
+        envelope?['detail']?.toString() ?? '操作冲突，请刷新后重试',
+        statusCode: 409,
+      );
+    }
     if (response.statusCode >= 400) {
       final detail =
           envelope?['detail']?.toString() ?? envelope?['message']?.toString();
@@ -191,10 +218,7 @@ class ApiClient {
       );
     }
     if (envelope == null) {
-      throw const ApiException(
-        ApiErrorKind.invalidResponse,
-        '网关返回数据格式异常',
-      );
+      throw const ApiException(ApiErrorKind.invalidResponse, '网关返回数据格式异常');
     }
     final code = envelope['code'];
     if (code is int && code != 0) {
@@ -208,10 +232,7 @@ class ApiClient {
 
   List<T> _mapList<T>(dynamic data, T Function(Map<String, dynamic>) parser) {
     if (data is! List) {
-      throw const ApiException(
-        ApiErrorKind.invalidResponse,
-        '网关返回的列表结构异常',
-      );
+      throw const ApiException(ApiErrorKind.invalidResponse, '网关返回的列表结构异常');
     }
     return data
         .whereType<Map>()
@@ -224,6 +245,7 @@ class ApiClient {
 enum ApiErrorKind {
   unauthorized,
   forbidden,
+  conflict,
   network,
   timeout,
   server,
@@ -240,6 +262,7 @@ class ApiException implements Exception {
   String get userMessage => switch (kind) {
     ApiErrorKind.unauthorized => '登录已失效，请重新登录',
     ApiErrorKind.forbidden => '当前账号无权访问该数据',
+    ApiErrorKind.conflict => message.isEmpty ? '操作冲突，请刷新后重试' : message,
     ApiErrorKind.network => '无法连接网关，请检查地址、后端进程与网络',
     ApiErrorKind.timeout => '网关响应超时，请稍后重试',
     ApiErrorKind.server => message.isEmpty ? '网关返回异常' : message,

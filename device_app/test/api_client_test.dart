@@ -16,7 +16,9 @@ http.Response _jsonResponse(Object body, [int statusCode = 200]) =>
     http.Response(
       jsonEncode(body),
       statusCode,
-      headers: <String, String>{'content-type': 'application/json; charset=utf-8'},
+      headers: <String, String>{
+        'content-type': 'application/json; charset=utf-8',
+      },
     );
 
 void main() {
@@ -116,9 +118,7 @@ void main() {
       baseUrl: 'http://api.example:8000',
       httpClient: MockClient(
         (_) async => http.Response.bytes(
-          utf8.encode(
-            jsonEncode(<String, dynamic>{'detail': '设备不存在'}),
-          ),
+          utf8.encode(jsonEncode(<String, dynamic>{'detail': '设备不存在'})),
           404,
           // 故意不带 content-type，模拟部分 FastAPI/代理响应
         ),
@@ -169,6 +169,86 @@ void main() {
     expect(captured.url.path, '/api/devices/dev-0001/records');
     expect(captured.url.queryParameters['limit'], '5');
     expect(captured.headers['Authorization'], 'Bearer token');
+  });
+
+  test('sendCommand 使用 POST 并携带 type/payload，解析回执', () async {
+    late http.Request captured;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return _jsonResponse(
+          _ok(<String, dynamic>{
+            'cmd_id': 'cmd-abc',
+            'device_id': 'dev-0001',
+            'type': 'calibrate',
+            'state': 'issued',
+            'progress': 0,
+            'message': '指令已下发，等待设备回执',
+            'operator': 'operator',
+            'created_at': '2026-11-04T02:00:00+00:00',
+          }),
+        );
+      }),
+    );
+
+    final command = await client.sendCommand(
+      token: 'token',
+      deviceId: 'dev-0001',
+      type: 'calibrate',
+      payload: <String, dynamic>{'temperatureOffset': 1.5, 'humidityOffset': 0},
+    );
+
+    expect(captured.method, 'POST');
+    expect(captured.url.path, '/api/devices/dev-0001/commands');
+    expect(captured.headers['Authorization'], 'Bearer token');
+    expect(jsonDecode(captured.body), <String, dynamic>{
+      'type': 'calibrate',
+      'payload': <String, dynamic>{
+        'temperatureOffset': 1.5,
+        'humidityOffset': 0,
+      },
+    });
+    expect(command.cmdId, 'cmd-abc');
+    expect(command.state, 'issued');
+  });
+
+  test('ackAlert 409 映射为 conflict 并保留服务端文案', () async {
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient(
+        (_) async => _jsonResponse(<String, String>{'detail': '告警已被处理'}, 409),
+      ),
+    );
+
+    await expectLater(
+      client.ackAlert(token: 'token', alertId: 'alert-001'),
+      throwsA(
+        isA<ApiException>()
+            .having((error) => error.kind, 'kind', ApiErrorKind.conflict)
+            .having((error) => error.message, 'message', '告警已被处理'),
+      ),
+    );
+  });
+
+  test('ackAlert 403 映射为 forbidden，供看板禁用写按钮', () async {
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient(
+        (_) async => _jsonResponse(<String, String>{'detail': '无操作权限'}, 403),
+      ),
+    );
+
+    await expectLater(
+      client.ackAlert(token: 'token', alertId: 'alert-001'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.forbidden,
+        ),
+      ),
+    );
   });
 
   test('设备列表按 envelope.data.items 解析，忽略非法条目', () async {
