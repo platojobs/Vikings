@@ -16,7 +16,7 @@ aiosqlite>=0.19        # SQLite 本地开箱即用驱动（零依赖启动）
 alembic>=1.13
 
 # 配置与校验
-pydantic>=2.6
+pydantic>=2.14.2
 pydantic-settings>=2.2
 
 # 可观测性：Prometheus 指标（/metrics）
