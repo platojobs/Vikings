@@ -133,11 +133,14 @@ async def bulk_create_devices(
 async def update_device(
     device_id: str,
     body: DeviceUpdateRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     user: dict = Depends(require_role(ROLE_OPERATOR)),
 ):
     changes = {key: value for key, value in body.model_dump().items() if value is not None}
-    device, err = await device_service.update_device(session, device_id, changes)
+    device, err, group_event = await device_service.update_device_with_group_event(
+        session, device_id, changes, user.get("sub", "system")
+    )
     if device is None:
         raise HTTPException(status_code=404, detail=err)
 
@@ -150,6 +153,12 @@ async def update_device(
         detail=changes,
     )
     await session.commit()
+
+    # 提交后再发布，订阅端回查 REST 时一定看到新分组；发布失败不影响编辑结果
+    if group_event is not None:
+        await device_service.publish_group_change(
+            request.app.state.mqtt.publish, group_event
+        )
     return ApiResponse(data=DeviceOut.model_validate(device))
 
 

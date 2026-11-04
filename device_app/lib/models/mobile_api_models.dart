@@ -90,12 +90,12 @@ class DeviceSummary {
 
   bool get online => status == 'online';
 
-  DeviceSummary copyWith({int? openAlertCount}) => DeviceSummary(
+  DeviceSummary copyWith({int? openAlertCount, String? groupName}) => DeviceSummary(
     deviceId: deviceId,
     name: name,
     model: model,
     firmwareVersion: firmwareVersion,
-    groupName: groupName,
+    groupName: groupName ?? this.groupName,
     status: status,
     lastReportAt: lastReportAt,
     lastOnlineAt: lastOnlineAt,

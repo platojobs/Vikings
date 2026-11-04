@@ -49,6 +49,7 @@ class MqttWebSocketTransport implements RealtimeTransport {
     required this.clientId,
     this.topics = const <String>[
       'device/system/alert',
+      'device/system/group',
       'device/+/sensor/report',
       'device/+/status',
     ],

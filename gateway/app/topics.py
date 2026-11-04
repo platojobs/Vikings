@@ -15,6 +15,7 @@ TOPIC_STATUS = "device/{device_id}/status"
 TOPIC_COMMAND = "device/{device_id}/cmd"
 TOPIC_COMMAND_ACK = "device/{device_id}/cmd/ack"
 TOPIC_SYSTEM_ALERT = "device/system/alert"
+TOPIC_SYSTEM_GROUP = "device/system/group"
 
 # ---- 业务枚举 ----
 DEVICE_STATUS_ONLINE = "online"

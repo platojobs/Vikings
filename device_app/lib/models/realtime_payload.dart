@@ -40,6 +40,25 @@ class StatusEvent extends RealtimeEvent {
   bool get online => status == 'online';
 }
 
+/// `device/system/group`：后台修改设备分组。
+class GroupChangedEvent extends RealtimeEvent {
+  const GroupChangedEvent({
+    required this.deviceId,
+    required this.groupName,
+    required this.previousGroupName,
+    required this.operator,
+  });
+
+  final String deviceId;
+
+  /// 变更后的分组名；空串表示「未分组」。
+  final String groupName;
+  final String previousGroupName;
+
+  /// 操作人，仅用于排障展示。
+  final String operator;
+}
+
 /// MQTT 报文解析器。
 ///
 /// 注意：MQTT 报文使用 camelCase（见 `docs/contracts.md` 第 2 节），
@@ -50,6 +69,7 @@ class RealtimeParser {
   const RealtimeParser();
 
   static const String alertTopic = 'device/system/alert';
+  static const String groupTopic = 'device/system/group';
 
   RealtimeEvent? parse(String topic, String payload) {
     if (payload.isEmpty) {
@@ -71,6 +91,9 @@ class RealtimeParser {
     final parts = topic.split('/');
     if (topic == alertTopic) {
       return _parseAlert(json);
+    }
+    if (topic == groupTopic) {
+      return _parseGroup(json);
     }
     if (parts.length == 4 && parts[0] == 'device' && parts[2] == 'sensor') {
       final deviceId = parts[1];
@@ -102,6 +125,21 @@ class RealtimeParser {
         status: 'open',
         createdAt: _time(json['ts']),
       ),
+    );
+  }
+
+  RealtimeEvent? _parseGroup(Map<String, dynamic> json) {
+    final deviceId = _str(json['deviceId']);
+    final groupName = json['groupName'];
+    // groupName 必须显式给出（空串代表未分组）；缺失或非字符串视为脏报文
+    if (deviceId.isEmpty || groupName is! String) {
+      return null;
+    }
+    return GroupChangedEvent(
+      deviceId: deviceId,
+      groupName: groupName,
+      previousGroupName: _str(json['previousGroupName']),
+      operator: _str(json['operator']),
     );
   }
 

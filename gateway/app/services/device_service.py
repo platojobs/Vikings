@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, DeviceAlert, SensorRecord
 from app.schemas import DeviceStatusMessage, SensorReportMessage
-from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE
+from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE, TOPIC_SYSTEM_GROUP
 
 logger = logging.getLogger(__name__)
 
@@ -196,20 +196,67 @@ async def bulk_create_devices(
     return created, skipped
 
 
-async def update_device(
+def group_change_payload(
+    device: Device,
+    previous_group_name: Optional[str],
+    operator: str,
+    ts: Optional[datetime] = None,
+) -> dict:
+    """分组变更实时事件报文（camelCase，与 docs/contracts.md 2.6 对应）。"""
+    stamp = ts or _now()
+    return {
+        "deviceId": device.device_id,
+        "groupName": device.group_name or "",
+        "previousGroupName": previous_group_name or "",
+        "operator": operator or "",
+        "ts": int(stamp.timestamp() * 1000),
+    }
+
+
+async def update_device_with_group_event(
     session: AsyncSession,
     device_id: str,
     changes: dict,
-) -> Tuple[Optional[Device], str]:
-    """编辑设备元数据：只覆盖传入的字段，状态不由后台直接修改。"""
+    operator: str = "",
+) -> Tuple[Optional[Device], str, Optional[dict]]:
+    """编辑设备，并在分组真正变化时返回待发布的事件报文。
+
+    第三项为 None 表示无需发布：设备不存在或 `group_name` 未传 / 未变化。
+    调用方必须在数据库提交成功后再发布，避免订阅端收到事件后回查 REST 仍读到旧值。
+    """
     device = await session.get(Device, device_id)
     if device is None:
-        return None, "设备不存在"
+        return None, "设备不存在", None
+
+    previous_group = device.group_name
     for key, value in changes.items():
         if value is not None:
             setattr(device, key, value)
     await session.flush()
-    return device, ""
+
+    event = None
+    new_group = changes.get("group_name")
+    if new_group is not None and new_group != previous_group:
+        event = group_change_payload(device, previous_group, operator)
+    return device, "", event
+
+
+async def publish_group_change(publisher, payload: dict) -> bool:
+    """发布分组变更事件；MQTT 不可用时只记录告警并返回 False。
+
+    REST 编辑语义在 v1.13.x 已确定（成功落库即返回 200），因此发布失败
+    不得改变接口结果，客户端在下次刷新时仍能从 REST 看到最新分组。
+    """
+    try:
+        await publisher(TOPIC_SYSTEM_GROUP, payload)
+    except Exception as exc:  # noqa: BLE001 - 发布失败不能影响 REST 主链路
+        logger.warning(
+            "分组变更事件发布失败 device=%s err=%s",
+            payload.get("deviceId"),
+            exc,
+        )
+        return False
+    return True
 
 
 async def delete_device(session: AsyncSession, device_id: str) -> Tuple[bool, str]:

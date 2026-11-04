@@ -135,6 +135,50 @@ void main() {
       expect(invalid, isNull);
     });
 
+    test('device/system/group 解析为分组变更事件', () {
+      final event = parser.parse(
+        'device/system/group',
+        jsonEncode(<String, dynamic>{
+          'deviceId': 'dev-0001',
+          'groupName': '二号车间',
+          'previousGroupName': '一号车间',
+          'operator': 'admin',
+          'ts': 1762243200000,
+        }),
+      );
+
+      expect(event, isA<GroupChangedEvent>());
+      final group = event as GroupChangedEvent;
+      expect(group.deviceId, 'dev-0001');
+      expect(group.groupName, '二号车间');
+      expect(group.previousGroupName, '一号车间');
+      expect(group.operator, 'admin');
+    });
+
+    test('分组事件缺 deviceId 或 groupName 类型不对时返回 null', () {
+      expect(
+        parser.parse(
+          'device/system/group',
+          jsonEncode(<String, dynamic>{'groupName': '一号车间'}),
+        ),
+        isNull,
+      );
+      expect(
+        parser.parse(
+          'device/system/group',
+          jsonEncode(<String, dynamic>{'deviceId': 'dev-1'}),
+        ),
+        isNull,
+      );
+      expect(
+        parser.parse(
+          'device/system/group',
+          jsonEncode(<String, dynamic>{'deviceId': 'dev-1', 'groupName': 1}),
+        ),
+        isNull,
+      );
+    });
+
     test('非 JSON、缺关键字段与无关 Topic 均返回 null', () {
       expect(parser.parse('device/system/alert', 'not-json'), isNull);
       expect(

@@ -96,6 +96,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   /// 顶部搜索框与状态筛选：只影响列表渲染，不影响实时事件落库。
   final TextEditingController _searchController = TextEditingController();
   Timer? _searchDebounce;
+
+  /// 分组变更后与服务端对账的防抖定时器（连续改组只拉一次）。
+  Timer? _groupSyncDebounce;
   String _keyword = '';
   _BoardStatusFilter _statusFilter = _BoardStatusFilter.all;
 
@@ -169,6 +172,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _searchDebounce?.cancel();
+    _groupSyncDebounce?.cancel();
     _searchController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
@@ -328,7 +332,44 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         _reportStream.add(reading);
       case StatusEvent(:final deviceId, :final status):
         setState(() => _liveStatus[deviceId] = status);
+      case GroupChangedEvent(:final deviceId, :final groupName):
+        _applyGroupChange(deviceId, groupName);
     }
+  }
+
+  /// 分组变更：先就地更新，保证改组设备立即体现在当前筛选结果中；
+  /// 再防抖重拉服务端快照，让分组 chips、`total` 与汇总卡回到 REST 真实口径。
+  ///
+  /// 取舍：chips 采用「重新拉取 `GET /api/devices/groups`」而非本地增减，
+  /// 因为分组可能被并发改名、旧分组可能恰好清空，本地增量容易与服务端不一致；
+  /// 分组变更是低频操作，一次整页刷新（与轮询兜底同样是第 1 页）可以接受。
+  void _applyGroupChange(String deviceId, String groupName) {
+    final index = _devices.indexWhere((device) => device.deviceId == deviceId);
+    if (index >= 0) {
+      setState(() {
+        final updated = _devices[index].copyWith(groupName: groupName);
+        if (_groupFilter.isEmpty || _deviceGroupName(updated) == _groupFilter) {
+          _devices = List<DeviceSummary>.of(_devices)..[index] = updated;
+        } else {
+          // 改组后已不属于当前筛选分组：立即移出，total 同步减一，
+          // 避免「筛选结果」与列表条数自相矛盾；随后由服务端刷新校正。
+          _devices = List<DeviceSummary>.of(_devices)..removeAt(index);
+          _deviceTotal = _deviceTotal > 0 ? _deviceTotal - 1 : 0;
+          _deviceHasMore = _devices.length < _deviceTotal;
+        }
+      });
+    }
+    _scheduleGroupSync();
+  }
+
+  /// 连续改组事件合并为一次刷新；刷新同时更新 chips、total 与汇总卡。
+  void _scheduleGroupSync() {
+    _groupSyncDebounce?.cancel();
+    _groupSyncDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (mounted) {
+        unawaited(_loadData(silent: true));
+      }
+    });
   }
 
   bool _isOnline(DeviceSummary device) =>

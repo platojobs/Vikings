@@ -14,6 +14,7 @@
 | 云端下发指令 | `device/{deviceId}/cmd` | 后台/网关 → 设备 | 1 | 否 |
 | 设备指令回执（含 OTA 进度） | `device/{deviceId}/cmd/ack` | 设备 → 网关/后台 | 1 | 否 |
 | 系统 AI 告警 | `device/system/alert` | 网关 → 后台 | 1 | 否 |
+| 设备分组变更 | `device/system/group` | 网关 → 后台 | 1 | 否 |
 
 设计说明：
 
@@ -119,6 +120,31 @@
 }
 ```
 
+### 2.6 设备分组变更 `device/system/group`（v1.14.0）
+
+```json
+{
+  "deviceId": "dev-0001",
+  "groupName": "二号车间",
+  "previousGroupName": "一号车间",
+  "operator": "admin",
+  "ts": 1762243200000
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| deviceId | string | 设备 ID |
+| groupName | string | 变更后的分组名；空串表示「未分组」 |
+| previousGroupName | string | 变更前的分组名；空串表示原为「未分组」 |
+| operator | string | 触发变更的账号 |
+| ts | int | 事件时间，毫秒级 Unix 时间 |
+
+- 仅在分组**真正变化**时发布；重复提交同一分组、只改名称等编辑不产生事件；
+- 网关在数据库提交成功后发布，订阅端收到事件后立即回查 REST 一定能读到新分组；
+- 发布为「最佳努力」：MQTT 不可用时只记录告警，`PATCH /api/devices/{deviceId}` 仍返回 200，
+  客户端在下次刷新时从 REST 看到新分组（与 v1.13.x 的编辑语义一致）。
+
 ---
 
 ## 3. REST API（Python 网关，前缀 `/api`）
@@ -185,6 +211,10 @@ v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹�
 不传 `group` 时行为不变；普通组名筛选语义不变。
 
 写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
+
+v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入口（后台没有批量改分组），
+分组变化时网关额外发布 2.6 的 `device/system/group` 事件；接口入参、响应与错误语义不变，
+事件仅在 MQTT 可用时产生，旧客户端不订阅该 Topic 即保持原有行为。
 
 ### 3.3 告警
 
@@ -276,6 +306,7 @@ v1.8.0 起看板增量数据改走 MQTT over WebSocket（默认 `ws://<网关主
 | 新告警 | `device/system/alert` | 报文见 2.5（camelCase），按 `alertId` 去重后插入头条 |
 | 设备上报 | `device/+/sensor/report` | 报文见 2.1，按 `deviceId` 覆盖最新值并标记在线 |
 | 设备上下线 | `device/+/status` | 报文见 2.2，优先级高于 REST 快照，LWT 遗嘱离线同样生效 |
+| 设备分组变更 | `device/system/group` | 报文见 2.6（v1.14.0）；就地更新已加载设备的分组名 |
 
 - 9001 为 Mosquitto 的 WebSocket 监听端口；移动端与浏览器一样无法直连 TCP 1883；
 - 实时地址可在看板设置中单独配置，留空则按网关主机推导为 `ws://<网关主机>:9001`；
@@ -346,6 +377,23 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 
 网关侧回归测试：`gateway/tests/test_device_service.py` 覆盖
 「不传 offset 与显式 offset=0 结果一致」与「offset 逐页向更早取数、越界返回空列表」。
+
+#### 3.10.5 设备分组变更实时化（v1.14.0）
+
+| 行为 | 契约 |
+| --- | --- |
+| 事件来源 | 后台 `PATCH /api/devices/{deviceId}` 改分组，网关提交后发布 `device/system/group`（报文见 2.6） |
+| 已加载设备 | 收到事件立即把该设备条目的 `group_name` 就地更新，不等待轮询 |
+| 分组筛选 | 改组后已不属于当前筛选分组时**立即移出列表**，`total` 同步减一；随后按服务端分页结果校正 |
+| 分组 chips | 事件后防抖 250ms 重拉 `GET /api/devices/groups`，chips 始终等于 REST 快照；不做本地增减（并发改名或整组清空时本地增量会与服务端不一致） |
+| 分页与汇总 | 对账刷新同时更新 `total` 与 `GET /api/stats/overview`；已加载多页时回到第 1 页重取（与轮询兜底一致），避免「列表缺一条但 total 未变」 |
+| 轮询降级 | 实时断开期间事件收不到，但下次轮询（15 秒）或手动刷新会用 REST 结果覆盖分组与 chips，不存在「永远看不到」 |
+| 未加载设备 | 改组后新进入当前筛选的设备不即时插入，由对账刷新/下次分页按服务端结果出现（与 3.10.3 的实时上报策略一致） |
+
+回归覆盖：`gateway/tests/test_device_group_event.py`（事件字段、设备不存在、分组未变化、发布失败降级）、
+`device_app/test/realtime_test.dart`（报文解析与脏报文）、
+`device_app/test/mobile_board_widget_test.dart`（移出当前筛选、chips 刷新）、
+`scripts/e2e/e2e_acceptance.py` 的 `group_change`（真实 Broker + WebSocket + REST 口径一致）。
 
 ---
 

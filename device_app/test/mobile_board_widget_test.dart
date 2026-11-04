@@ -144,7 +144,7 @@ class _FakeApiClient extends ApiClient {
     List<AlertItem>? alerts,
     List<SensorReading>? records,
     this.stats,
-  }) : devices = devices ?? const <DeviceSummary>[_device],
+  }) : devices = List<DeviceSummary>.of(devices ?? const <DeviceSummary>[_device]),
        readings = readings ?? const <SensorReading>[_reading],
        alerts = alerts ?? const <AlertItem>[_openAlert],
        records = records ?? const <SensorReading>[],
@@ -163,6 +163,7 @@ class _FakeApiClient extends ApiClient {
 
   int loginCalls = 0;
   int fetchCalls = 0;
+  int groupFetchCalls = 0;
   int sendCalls = 0;
   int ackCalls = 0;
 
@@ -275,8 +276,17 @@ class _FakeApiClient extends ApiClient {
     );
   }
 
+  /// 模拟后台改分组：先改服务端数据，再让看板通过实时事件/刷新看到结果。
+  void setDeviceGroup(String deviceId, String groupName) {
+    final index = devices.indexWhere((item) => item.deviceId == deviceId);
+    if (index >= 0) {
+      devices[index] = devices[index].copyWith(groupName: groupName);
+    }
+  }
+
   @override
   Future<List<DeviceGroup>> fetchGroups({required String token}) async {
+    groupFetchCalls += 1;
     final byName = <String, DeviceGroup>{};
     for (final device in devices) {
       final name = _groupNameOf(device);
@@ -1164,6 +1174,103 @@ void main() {
         .position
         .pixels;
     expect(positionAfter, greaterThan(positionBefore));
+  });
+
+  testWidgets('实时分组变更：改组后设备移出当前筛选，total 与服务端口径一致', (tester) async {
+    const production1 = DeviceSummary(
+      deviceId: 'dev-prod-1',
+      name: '一号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '生产组',
+      status: 'online',
+    );
+    const production2 = DeviceSummary(
+      deviceId: 'dev-prod-2',
+      name: '二号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '生产组',
+      status: 'online',
+    );
+    final api = _FakeApiClient(devices: const [production1, production2]);
+    final realtime = _FakeRealtimeService(RealtimeState.connected);
+    await _pumpBoard(
+      tester,
+      api: api,
+      session: _adminSession,
+      realtime: realtime,
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ChoiceChip, '生产组'));
+    await tester.pumpAndSettle();
+    expect(find.text('筛选结果：2 台 / 全部 2 台'), findsOneWidget);
+    final groupsBefore = api.groupFetchCalls;
+
+    // 后台把一号机改到仓储组：先更新服务端数据，再推送实时事件
+    api.setDeviceGroup('dev-prod-1', '仓储组');
+    realtime.emit(
+      const GroupChangedEvent(
+        deviceId: 'dev-prod-1',
+        groupName: '仓储组',
+        previousGroupName: '生产组',
+        operator: 'admin',
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    // 改组后已不属于「生产组」：立即移出列表，total 同步减一
+    expect(find.text('一号机'), findsNothing);
+    expect(find.text('二号机'), findsOneWidget);
+    expect(find.text('筛选结果：1 台 / 全部 2 台'), findsOneWidget);
+
+    // 防抖后重拉 REST：chips 出现新分组，已空的分组自然不会保留多余条目
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(api.groupFetchCalls, greaterThan(groupsBefore));
+    expect(find.widgetWithText(ChoiceChip, '仓储组'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, '生产组'), findsOneWidget);
+    expect(find.text('筛选结果：1 台 / 全部 2 台'), findsOneWidget);
+    expect(find.text('没有更多了'), findsOneWidget);
+  });
+
+  testWidgets('实时分组变更：列表就地更新分组名并刷新 chips', (tester) async {
+    final api = _FakeApiClient(devices: const [_device, _secondDevice]);
+    final realtime = _FakeRealtimeService(RealtimeState.connected);
+    await _pumpBoard(
+      tester,
+      api: api,
+      session: _adminSession,
+      realtime: realtime,
+    );
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(ChoiceChip, '默认分组'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, '巡检组'), findsNothing);
+
+    api.setDeviceGroup('dev-0001', '巡检组');
+    realtime.emit(
+      const GroupChangedEvent(
+        deviceId: 'dev-0001',
+        groupName: '巡检组',
+        previousGroupName: '默认分组',
+        operator: 'admin',
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    // 未筛选分组时设备仍在列表，仅就地更新分组名
+    expect(find.textContaining('dev-0001 · 巡检组'), findsOneWidget);
+    expect(find.text('一号机'), findsOneWidget);
+
+    // 服务端刷新后 chips 增加「巡检组」，默认分组仍有二号机
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(ChoiceChip, '巡检组'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, '默认分组'), findsOneWidget);
+    expect(find.textContaining('dev-0001 · 巡检组'), findsOneWidget);
   });
 }
 

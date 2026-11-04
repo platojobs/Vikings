@@ -275,6 +275,7 @@ http://192.168.1.8:5173
 | 设备列表与在线状态 | `GET /api/devices` | REST 首屏 + 手动下拉刷新 |
 | 每设备最新实时值 | `GET /api/records/latest`；`device/+/sensor/report` | REST 兜底 + 实时增量 |
 | 设备上下线 | `device/+/status` | 实时订阅（含 LWT 遗嘱离线） |
+| 设备分组变更 | `GET /api/devices/groups`；`device/system/group` | REST 兜底 + 实时就地更新并重拉分组概览 |
 | 未处理告警 | `GET /api/alerts?status=open`；`device/system/alert` | REST 兜底 + 实时插入 |
 | 单设备历史上报 | `GET /api/devices/{id}/records?limit=11&offset=N` | REST 分页（详情页，每页 10 条） |
 | 指令回执 | `GET /api/devices/{id}/commands` | REST（详情页，写完自动刷新） |
@@ -308,6 +309,17 @@ http://192.168.1.8:5173
 | 加载更早 | 滚动到页脚或点击「加载更早」，按 `offset=<已取条数>` 取下一页并接在列表末尾；加载中显示「正在加载更早数据…」，取完显示「没有更早数据」，首页即空显示「暂无历史上报」 |
 | 实时插入 | 该设备的新上报通过 MQTT 实时通道插到列表顶部；若用户已向下浏览，按插入行的实际高度补偿滚动偏移，正在看的历史数据不会被顶走；停留在顶部时不做补偿，新数据直接可见 |
 | 兼容 | `offset` 为可选增量参数，不传时网关行为与旧版完全一致（最近 `limit` 条、时间正序）；旧网关忽略该参数时详情页只显示首屏一页 |
+
+分组变更实时同步（v1.14.0）：
+
+| 能力 | 行为 |
+| --- | --- |
+| 触发 | Web 后台在设备管理页改分组（`PATCH /api/devices/{id}`）；后台没有批量改分组入口，批量导入只在创建时写分组、不产生变更事件 |
+| 事件 | 网关落库提交后向既有 MQTT 链路发布 `device/system/group`（`deviceId` / `groupName` / `previousGroupName` / `operator` / `ts`），仅在分组真正变化时发布，不新开通道 |
+| 就地更新 | 看板收到事件立即更新已加载设备的 `group_name`；当前筛选有分组且该设备已不属于该组时立即移出列表，`total` 同步减一 |
+| chips 与 total | 事件后 250ms 防抖重拉 `GET /api/devices/groups` 与当前分页/`/api/stats/overview`，chips、`total`、汇总卡统一以服务端口径为准（本地增量在并发改名 / 整组清空时可能失真） |
+| 降级 | 实时断开期间收不到事件，但 15 秒轮询或手动刷新会用 REST 结果覆盖分组与 chips，不会「永远看不到」；新进入当前筛选的设备在下次刷新/翻页出现 |
+| 兼容 | 事件 Topic 与报文为新增的可选能力：旧看板不订阅该 Topic，行为与 v1.13.x 完全一致；`PATCH` 入参、响应与错误语义不变，MQTT 不可用时编辑仍返回 200 |
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -402,6 +414,7 @@ http://192.168.1.8:5173
 | `device/{id}/cmd` | 云 → 设备 | 校准 / OTA / 重启 / 配置 |
 | `device/{id}/cmd/ack` | 设备 → 云 | 指令回执与 OTA 进度 |
 | `device/system/alert` | 网关 → 后台 | AI 告警消息 |
+| `device/system/group` | 网关 → 后台 | 设备分组变更（v1.14.0） |
 
 ### REST（前缀 `/api`，除登录与健康检查外均需 Bearer Token）
 
@@ -570,7 +583,7 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（21 项） | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（22 项） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
 结束后脚本自清理并由 `if: always()` 兜底；不依赖外部服务、不写生产数据。
@@ -582,8 +595,8 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | 层 | 命令 | 覆盖范围 |
 | --- | --- | --- |
 | 设备端单测 | `cd device_app && flutter test` | 实时报文解析与断线重连、token 迁移与安全存储、指令参数校验、REST 结果分类 |
-| 设备端 Widget 测试 | `cd device_app && flutter test test/mobile_board_widget_test.dart` | 登录进入看板、指令下发二次确认 / 取消 / 回执、告警确认移除、viewer 与 403 禁用、实时降级轮询、401 回登录 |
-| 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约 |
+| 设备端 Widget 测试 | `cd device_app && flutter test test/mobile_board_widget_test.dart` | 登录进入看板、指令下发二次确认 / 取消 / 回执、告警确认移除、viewer 与 403 禁用、实时降级轮询、401 回登录、分组变更移出当前筛选与 chips 刷新 |
+| 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约；分组变更事件字段与发布降级 |
 | Web 单元测试 | `cd web && npm run test` | 路由守卫：未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底 |
 | Web | `cd web && npm run build` | 生产构建回归 |
 
@@ -653,3 +666,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.12.0` | 移动看板新增分组切换与分组筛选（与搜索、状态、有告警、服务端分页组合生效，切组重置第 1 页）；空分组统一归入「未分组」，网关分组概览同步归并（[发布说明](docs/releases/v1.12.0.md)） |
 | `v1.13.0` | 移动看板设备详情「历史上报」分页（`limit+offset`，首屏一页、加载更早、三态文案、实时插入保持滚动位置）；网关 records 新增可选 `offset`（不传行为不变）；Web 路由全部懒加载 + `manualChunks` 拆分，入口主包 693.24 kB → 312.04 kB 且无体积告警（[发布说明](docs/releases/v1.13.0.md)） |
 | `v1.13.1` | Web 测试基建：vitest + jsdom 复用生产 Vite 配置，7 条路由守卫用例（未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底）接入 CI `web` 作业（[发布说明](docs/releases/v1.13.1.md)） |
+| `v1.14.0` | 设备分组变更实时化：网关在 `PATCH` 落库后发布 `device/system/group`，移动看板就地更新分组名、移出当前筛选并防抖重拉 chips / total / 汇总卡；E2E 增加真实 Broker 的分组变更验收（[发布说明](docs/releases/v1.14.0.md)） |

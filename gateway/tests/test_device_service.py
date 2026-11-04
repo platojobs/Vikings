@@ -37,11 +37,13 @@ def test_create_and_update_device(tmp_path):
         )
         assert duplicate is None and err == "设备 ID 已存在"
 
-        updated, err = await device_service.update_device(
+        updated, err, event = await device_service.update_device_with_group_event(
             session, "dev-a", {"name": "车间传感器 A", "group_name": "二号车间"}
         )
         assert updated.name == "车间传感器 A"
         assert updated.group_name == "二号车间"
+        # 既有编辑语义不变，同时分组变化会产生一条待发布事件
+        assert event is not None and event["groupName"] == "二号车间"
 
     _run(tmp_path, scenario)
 

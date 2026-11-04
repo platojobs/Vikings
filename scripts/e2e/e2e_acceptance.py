@@ -324,6 +324,7 @@ class WsCollector:
                 ("device/+/sensor/report", 1),
                 ("device/+/status", 1),
                 ("device/system/alert", 1),
+                ("device/system/group", 1),
                 ("device/+/cmd/ack", 1),
             ]
         )
@@ -632,6 +633,65 @@ def ack_alert(ctx: Context) -> str:
     return f"告警 {ctx.alert_id} 已 acked，open 列表不再返回，acked 列表可查"
 
 
+def verify_group_change(ctx: Context) -> str:
+    """改分组 → WS 收到 device/system/group → 设备详情与分组概览口径一致。"""
+    assert ctx.collector is not None
+    detail = api(ctx, "GET", f"/api/devices/{ctx.device_id}")
+    previous = detail.get("group_name") or ""
+    target = "E2E验收组"
+    if previous == target:
+        target = "E2E验收组2"
+
+    groups_before = api(ctx, "GET", "/api/devices/groups")
+    total_before = sum(int(item.get("total", 0)) for item in groups_before)
+
+    updated = api(
+        ctx,
+        "PATCH",
+        f"/api/devices/{ctx.device_id}",
+        json={"group_name": target},
+    )
+    if updated.get("group_name") != target:
+        raise RuntimeError(f"PATCH 后设备分组未更新：{updated.get('group_name')}")
+
+    item = ctx.collector.wait_message(
+        lambda m: m["topic"] == "device/system/group"
+        and m["payload"].get("deviceId") == ctx.device_id,
+        10,
+        "设备分组变更事件",
+    )
+    payload = item["payload"]
+    if payload.get("groupName") != target:
+        raise RuntimeError(f"事件 groupName 与 REST 不一致：{payload}")
+    if payload.get("previousGroupName") != previous:
+        raise RuntimeError(f"事件 previousGroupName 不符合预期：{payload}")
+    if payload.get("operator") != "admin":
+        raise RuntimeError(f"事件 operator 不符合预期：{payload}")
+    if not isinstance(payload.get("ts"), int):
+        raise RuntimeError(f"事件 ts 不是毫秒整数：{payload}")
+
+    detail_after = api(ctx, "GET", f"/api/devices/{ctx.device_id}")
+    if detail_after.get("group_name") != target:
+        raise RuntimeError(f"REST 设备详情分组不一致：{detail_after.get('group_name')}")
+
+    groups_after = api(ctx, "GET", "/api/devices/groups")
+    target_bucket = next(
+        (g for g in groups_after if g.get("group_name") == target), None
+    )
+    if target_bucket is None or int(target_bucket.get("total", 0)) < 1:
+        raise RuntimeError(f"分组概览未统计新分组：{groups_after}")
+    total_after = sum(int(g.get("total", 0)) for g in groups_after)
+    if total_after != total_before:
+        raise RuntimeError(
+            f"分组变更后设备总数不一致：{total_before} → {total_after}"
+        )
+    return (
+        f"分组 {previous or '未分组'} → {target}；WebSocket 收到 device/system/group "
+        f"（operator={payload.get('operator')}）；REST 设备详情与分组概览一致，"
+        f"总设备 {total_after} 台"
+    )
+
+
 def stop_simulator(ctx: Context) -> str:
     proc = ctx.simulator_proc
     if proc is None or proc.poll() is not None:
@@ -824,6 +884,7 @@ def main() -> int:
         rep.run("command_dispatch", lambda: dispatch_command(ctx))
         rep.run("command_ack", lambda: verify_command_ack(ctx))
         rep.run("alert_ack", lambda: ack_alert(ctx))
+        rep.run("group_change", lambda: verify_group_change(ctx))
         rep.run("stop_simulator", lambda: stop_simulator(ctx))
         rep.run("degrade_disconnect", lambda: degrade_disconnect(ctx))
         rep.run("degrade_polling_rest", lambda: degrade_polling_rest(ctx))
