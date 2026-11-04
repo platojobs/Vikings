@@ -6,13 +6,13 @@
 
 ## 总体结论
 
-**功能闭环和自动化测试已经达到「可演示、可验收」；P0-2（默认凭据与登录防护）已于 v1.16.0 完成，但离「别人拿到就能安全部署上线」仍有 2 个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）、Broker 匿名接入且无设备凭证。** 补齐剩余 P0 后即可交付；其余 P1 决定上线后的可运维性与口碑。
+**功能闭环和自动化测试已经达到「可演示、可验收」；P0-2（默认凭据与登录防护）已于 v1.16.0 完成，P0-3（Broker 鉴权与设备凭证）已于 v1.17.0 完成，但离「别人拿到就能安全部署上线」仍有 1 个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）。** 补齐 P0-1 后即可交付；其余 P1 决定上线后的可运维性与口碑。
 
 已确认做得好、不需要返工的部分：
 
 - 所有写操作都有审计：`grep audit_service.log(` 覆盖登录、设备、告警、指令、OTA、阈值、账号，动作常量集中在 `gateway/app/services/audit_service.py`；
 - 已有 `/api/health` 存活探针并暴露 Broker 连接状态（`gateway/app/api/routes/stats.py:22-35`）；
-- 自动化基线真实可跑：gateway `pytest` 67 条、Flutter 67 条、Web 7 条、真实 Broker E2E 23/23；
+- 自动化基线真实可跑：gateway `pytest` 86 条、Flutter 67 条、Web 7 条、真实 Broker E2E 25/25；
 - OTA 代码链路完整（任务创建 → 指令下发 → 模拟器进度回执），只是缺 E2E 覆盖（`gateway/app/api/routes/ota.py:14-47`、`scripts/simulate_device.py:111-116`）。
 
 ---
@@ -61,7 +61,7 @@
   - 新增 `gateway/tests/test_auth_protection.py` 11 条用例，gateway `pytest` 78 passed；
   - README 4.2.1 必改项、`docs/contracts.md` 429/口令/种子语义、`docs/releases/v1.16.0.md` 已同步。
 
-### P0-3 Broker 匿名接入，设备无凭证/无 ACL
+### P0-3 Broker 匿名接入，设备无凭证/无 ACL ✅ 已完成（v1.17.0）
 
 - **现状证据**
   - `infra/mosquitto/mosquitto.conf:7,12`：1883 与 9001 均 `allow_anonymous true`，注释自认「生产环境请关闭」。
@@ -75,8 +75,31 @@
   4. 开发环境保留匿名 profile，生产 profile 强制鉴权；contracts 与部署文档同步。
 - **预估工作量**：2~3 人日（含凭证生命周期与迁移）。
 - **依赖关系**：依赖 P0-1 的部署 profile 划分；与设备注册流程（当前仅元数据）一起改。
+- **完成证据（v1.17.0）**
+  - `infra/mosquitto/mosquitto.conf`：`per_listener_settings true`，1883 与 9001 均
+    `allow_anonymous false` + `password_file passwd` + 各自 `acl_file`；重载方式写入注释。
+  - 新增 `infra/mosquitto/acl.device`（网关跨设备读写 + 设备 `device/%u/#` 只读自己、
+    仅可写自己的 report/status/cmd/ack）与 `infra/mosquitto/acl.client`
+    （`web-console` / `mobile-console` 只有 read，无任何 write）。
+  - 新增 `gateway/app/mqtt/credentials.py`（PBKDF2-SHA512 哈希、0600 原子写）
+    与 `scripts/mqtt_credentials.py`（init / issue / rotate / revoke / show）。
+  - `Device` 新增 `mqtt_username`、`mqtt_credential_version`、`mqtt_credential_fingerprint`、
+    `mqtt_credential_issued_at`、`mqtt_credential_rotated_at`，只存元数据与指纹，不存明文；
+    `infra/postgres/init.sql` 与 `gateway/app/database.py` 同步补列。
+  - 新增 `POST /api/devices/{deviceId}/mqtt-credential`（operator+admin，签发/轮换，
+    口令只返回一次，写 `passwd` 后 SIGHUP/自定义命令重载）；
+    新增 `GET /api/auth/mqtt-credentials?client=web|mobile`（登录后下发只读凭证，未配置 503）。
+  - Web `web/src/services/mqtt.ts` 与移动端 `realtime_transport.dart` / `api_client.dart`
+    改为先取凭证再连接，取不到不匿名降级；设备模拟页与 `simulate_device.py` 支持口令，缺口令拒绝连接。
+  - `start_all.sh` 首次自动初始化凭证并注入网关环境变量；`infra/docker-compose.yml`
+    挂载整个配置目录并设置 `working_dir`；`passwd` / 状态文件已加入 `.gitignore`。
+  - 新增 `gateway/tests/test_mqtt_credentials.py`；生产安全 fixture 补 MQTT 凭证校验。
+  - E2E 增至 25 项并全部 PASS：匿名 1883/9001 CONNACK rc=135/135；跨设备订阅/发布收不到；
+    Web/移动端可订阅但发布被拒；轮换后旧凭证 rc=135、新凭证 rc=0。
+  - README「4.2.2 Broker 鉴权与凭证管理」、`docs/contracts.md` 1.1 鉴权矩阵与凭证接口、
+    `docs/releases/v1.17.0.md` 已同步。
 
-> P0 共 3 项，其中 P0-2 已在 v1.16.0 完成；剩余 P0-1 / P0-3。不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
+> P0 共 3 项，其中 P0-2 已在 v1.16.0 完成、P0-3 已在 v1.17.0 完成；剩余 P0-1。不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
 
 ---
 
@@ -153,7 +176,7 @@
 ### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证
 
 - **现状证据**
-  - 本地真实执行：gateway `pytest -q` 67 条、`flutter test` 67 条、`npm run test` 7 条、E2E 23/23 PASS。
+  - 本地真实执行：gateway `pytest -q` 86 条、`flutter test` 67 条、`npm run test` 7 条、E2E 25/25 PASS。
   - `scripts/e2e/e2e_acceptance.py` 覆盖上报/状态/告警/指令/分组/批量确认，但 `grep -n 'ota|OTA'` 无命中——OTA 未进 E2E。
   - 网关测试使用临时 SQLite（`gateway/tests/test_http_regression.py` 的 `sqlite+aiosqlite`），CI 无 PostgreSQL 作业。
   - 无「数据库不可用/磁盘满/网络超时」故障注入；无真机/真网络自动化（Widget 测试注入 fake）。
@@ -207,9 +230,9 @@
 
 **第一批（P0，串行启动、部分可并行）**
 
-1. P0-2 默认凭据与登录限流（1~2 天）：先定环境变量与 fail-fast 规则，风险最低、收益最大。
-2. P0-3 Broker 凭证/ACL（2~3 天）：与 P0-2 同期设计，依赖设备注册流程改造。
-3. P0-1 容器化 + 反代/HTTPS（2~3 天）：在 P0-2/P0-3 的 env 方案稳定后做集成，最后用云主机做一次从零部署验收。
+1. ~~P0-2 默认凭据与登录限流~~ ✅ v1.16.0。
+2. ~~P0-3 Broker 凭证/ACL~~ ✅ v1.17.0：双监听关闭匿名、设备凭证与轮换、客户端只读凭证、ACL 隔离与 E2E。
+3. P0-1 容器化 + 反代/HTTPS（2~3 天）：当前唯一剩余阻断项；在 P0-2/P0-3 的 env 与凭证方案稳定后做集成，最后用云主机做一次从零部署验收。
    - 三者可在同一迭代并行设计，但**合并验收必须串行**（先密钥/凭证，再部署）。
 
 **第二批（P1，可并行分组）**
@@ -224,7 +247,8 @@
 
 **建议版本切分**
 
-- `v1.16.0`：P0-2 + P0-3 + P1-1（安全与可观测性）；P0-2 已完成，P0-3/P1-1 待做；
-- `v1.17.0`：P0-1 + P1-3 + P1-6（可部署与可运维）；
-- `v1.18.0`：P1-2 + P1-4 + P1-5 + P1-7（数据、Web 对齐、发布工程与测试补强）；
+- `v1.16.0`：P0-2 默认凭据与登录防护 ✅ 已完成；
+- `v1.17.0`：P0-3 Broker 鉴权与设备凭证 ✅ 已完成；
+- `v1.18.0`：P0-1 + P1-1 + P1-3 + P1-6（可部署、可观测、迁移与运维手册）；
+- `v1.19.0`：P1-2 + P1-4 + P1-5 + P1-7（数据生命周期、Web 对齐、发布工程与测试补强）；
 - P2 项穿插或单独小版本。

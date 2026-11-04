@@ -123,8 +123,36 @@ class DeviceOut(BaseModel):
     last_online_at: Optional[datetime] = None
     # 仅 when withAlertCount=true 时填充；默认 None 保持既有返回结构不变
     open_alert_count: Optional[int] = None
+    # 凭证元数据（不包含口令）：供运维查看签发/轮换状态
+    mqtt_username: Optional[str] = None
+    mqtt_credential_version: int = 0
+    mqtt_credential_issued_at: Optional[datetime] = None
+    mqtt_credential_rotated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class MqttCredentialOut(BaseModel):
+    """设备凭证签发/轮换结果：口令只在此响应出现一次。"""
+
+    device_id: str
+    username: str
+    password: str
+    version: int
+    issued_at: datetime
+    rotated_at: datetime
+    reloaded: bool
+    reload_detail: str
+
+
+class MqttClientCredentialOut(BaseModel):
+    """登录后下发的只读客户端凭证；Web / 移动端使用独立主体。"""
+
+    client: str
+    username: str
+    password: str
+    read_only: bool = True
+    topics: List[str]
 
 
 # ==================== 设备注册与分组 ====================

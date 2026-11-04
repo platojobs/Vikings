@@ -24,6 +24,11 @@ def _secure_production_settings(**overrides) -> Settings:
         "admin_password": "StrongAdmin!2026",
         "database_url": "postgresql+asyncpg://iot:StrongDbPass2026@db:5432/iot",
         "seed_demo_users": None,
+        # v1.17.0：生产环境 Broker 禁止匿名，网关与客户端凭证必须显式配置
+        "mqtt_username": "iot-gateway",
+        "mqtt_password": "GatewayBrokerSecret!2026",
+        "mqtt_web_password": "WebBrokerSecret!2026",
+        "mqtt_mobile_password": "MobileBrokerSecret!2026",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -99,6 +104,28 @@ def test_development_seeds_demo_users_by_default(tmp_path):
     created, usernames = asyncio.run(_seed_users_and_read(tmp_path, cfg))
     assert usernames == ["admin", "operator", "viewer"]
     assert set(created) == {"admin", "operator", "viewer"}
+
+
+def test_production_rejects_missing_mqtt_credentials():
+    """Broker 禁止匿名后，生产环境缺 MQTT 凭证必须 fail-fast。"""
+    cfg = _secure_production_settings(
+        mqtt_password="",
+        mqtt_web_password="",
+        mqtt_mobile_password="",
+    )
+    with pytest.raises(RuntimeError) as exc:
+        cfg.validate_for_production()
+    message = str(exc.value)
+    assert "MQTT_PASSWORD" in message
+    assert "MQTT_WEB_PASSWORD" in message
+    assert "MQTT_MOBILE_PASSWORD" in message
+
+
+def test_production_requires_gateway_identity_name():
+    cfg = _secure_production_settings(mqtt_username="some-device")
+    with pytest.raises(RuntimeError) as exc:
+        cfg.validate_for_production()
+    assert "iot-gateway" in str(exc.value)
 
 
 class _LoginClient:

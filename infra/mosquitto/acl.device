@@ -1,0 +1,19 @@
+# 1883（设备 TCP）监听专用 ACL：
+# 网关是唯一跨设备主体；设备用户名等于 deviceId，只能操作自己的子树。
+# 设备不能写 cmd（云端指令只允许网关发布），不能碰 device/system/*。
+
+user iot-gateway
+topic read device/+/sensor/report
+topic read device/+/status
+topic read device/+/cmd/ack
+topic write device/+/cmd
+topic write device/system/alert
+topic write device/system/group
+topic readwrite gateway/status
+
+# 设备可读自己整棵子树（cmd / sensor/report / status / cmd/ack），便于自检与回读；
+# 仍然读不到其他设备（%u 只替换为当前连接用户名）。
+pattern read device/%u/#
+pattern write device/%u/sensor/report
+pattern write device/%u/status
+pattern write device/%u/cmd/ack

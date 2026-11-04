@@ -69,6 +69,9 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   AuthSession? _session;
   String _baseUrl = ApiConfig.defaultBaseUrl;
   String _realtimeUrlOverride = '';
+  String _mqttUsername = '';
+  String _mqttPassword = '';
+  bool _realtimeCredentialLoading = false;
 
   bool _booting = true;
   bool _loading = false;
@@ -118,8 +121,12 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         widget.realtimeServiceFactory ??
         (String url) => BoardRealtimeService(
           url: url,
-          transportFactory: (uri, clientId) =>
-              MqttWebSocketTransport(url: uri, clientId: clientId),
+          transportFactory: (uri, clientId) => MqttWebSocketTransport(
+            url: uri,
+            clientId: clientId,
+            username: _mqttUsername,
+            password: _mqttPassword,
+          ),
         );
     WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_onScroll);
@@ -413,8 +420,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       _stopPolling();
       return;
     }
-    if (_realtime == null) {
-      _startRealtime();
+    if (_realtime == null && !_realtimeCredentialLoading) {
+      unawaited(_startRealtime());
     }
   }
 
@@ -422,7 +429,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       ? _realtimeUrlOverride
       : ApiConfig.realtimeUrl(_baseUrl);
 
-  void _startRealtime() {
+  Future<void> _startRealtime() async {
     final session = _session;
     if (session == null) {
       return;
@@ -432,11 +439,55 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     if (url.isEmpty) {
       return;
     }
+
+    // 自定义注入的实时服务（测试/离线）由调用方负责凭证；默认实现必须
+    // 先从网关换取只读凭证，Broker 已关闭匿名，禁止匿名降级。
+    if (widget.realtimeServiceFactory == null) {
+      _realtimeCredentialLoading = true;
+      final credential = await _fetchRealtimeCredential(session);
+      _realtimeCredentialLoading = false;
+      if (!mounted || _session == null) {
+        return;
+      }
+      if (credential == null) {
+        _startPolling();
+        return;
+      }
+      _mqttUsername = credential.username;
+      _mqttPassword = credential.password;
+    }
+
+    if (_realtime != null) {
+      return;
+    }
     final service = _createRealtime(url);
     _realtime = service;
     _eventSub = service.events.listen(_onRealtimeEvent);
     service.state.addListener(_onRealtimeStateChanged);
     service.start();
+  }
+
+  /// 用登录 token 换取 9001 只读凭证；失败时返回 null 并提示，降级为 REST 轮询。
+  Future<MqttClientCredential?> _fetchRealtimeCredential(
+    AuthSession session,
+  ) async {
+    final api = _createApiClient(_baseUrl);
+    try {
+      return await api.fetchMqttCredentials(
+        token: session.token,
+        client: 'mobile',
+      );
+    } catch (error) {
+      if (!mounted) {
+        return null;
+      }
+      setState(() {
+        _notice = '实时凭证获取失败，已切换为 REST 轮询：$error';
+      });
+      return null;
+    } finally {
+      api.close();
+    }
   }
 
   void _stopRealtime() {

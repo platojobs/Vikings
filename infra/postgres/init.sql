@@ -15,6 +15,11 @@ CREATE TABLE IF NOT EXISTS device (
     status           varchar(16)  NOT NULL DEFAULT 'offline',
     last_report_at   timestamptz,
     last_online_at   timestamptz,
+    mqtt_username    varchar(64),
+    mqtt_credential_version integer NOT NULL DEFAULT 0,
+    mqtt_credential_fingerprint varchar(64),
+    mqtt_credential_issued_at timestamptz,
+    mqtt_credential_rotated_at timestamptz,
     created_at       timestamptz  NOT NULL DEFAULT now(),
     updated_at       timestamptz  NOT NULL DEFAULT now()
 );
@@ -22,6 +27,18 @@ CREATE TABLE IF NOT EXISTS device (
 COMMENT ON TABLE  device IS '设备元数据表：一个设备一行，状态由 Broker 的 retained/LWT 报文驱动';
 COMMENT ON COLUMN device.status IS 'online / offline，由 device/{id}/status 消息更新';
 COMMENT ON COLUMN device.group_name IS '设备分组：列表筛选与批量运维使用';
+COMMENT ON COLUMN device.mqtt_username IS 'MQTT 用户名，恒等于 device_id；Broker 口令文件保存 hash，本表不存明文';
+COMMENT ON COLUMN device.mqtt_credential_version IS '凭证轮换版本：每次签发/轮换 +1';
+COMMENT ON COLUMN device.mqtt_credential_fingerprint IS '口令 SHA-256 指纹，仅用于审计对账';
+COMMENT ON COLUMN device.mqtt_credential_issued_at IS '首次签发时间';
+COMMENT ON COLUMN device.mqtt_credential_rotated_at IS '最近轮换时间';
+
+-- 存量库升级（v1.17.0）：表已存在时补齐凭证列
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_username varchar(64);
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_version integer NOT NULL DEFAULT 0;
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_fingerprint varchar(64);
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_issued_at timestamptz;
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_rotated_at timestamptz;
 
 -- 灰度升级：老库补列（新建库时该列已存在，IF NOT EXISTS 保证幂等）
 ALTER TABLE device ADD COLUMN IF NOT EXISTS group_name varchar(64) NOT NULL DEFAULT '默认分组';

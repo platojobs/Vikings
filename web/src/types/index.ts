@@ -40,6 +40,15 @@ export interface LoginResult {
   user: UserInfo
 }
 
+/** 登录后换取的只读 MQTT 凭证（服务端 env 下发，不进构建产物） */
+export interface MqttCredential {
+  client: string
+  username: string
+  password: string
+  read_only: boolean
+  topics: string[]
+}
+
 // ==================== 账号与权限 ====================
 
 /** 角色：admin 全部权限 / operator 运维执行 / viewer 只读 */

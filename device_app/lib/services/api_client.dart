@@ -44,6 +44,23 @@ class ApiClient {
     );
   }
 
+  /// 登录后换取 9001 只读 MQTT 凭证；Broker 已关闭匿名，不得降级为匿名连接。
+  Future<MqttClientCredential> fetchMqttCredentials({
+    required String token,
+    String client = 'mobile',
+  }) async {
+    final data = await _send(
+      'GET',
+      '/api/auth/mqtt-credentials',
+      token: token,
+      query: <String, String>{'client': client},
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '凭证响应缺少 data');
+    }
+    return MqttClientCredential.fromJson(data);
+  }
+
   /// 服务端分页设备列表。
   ///
   /// `hasAlert` 由网关按未处理告警聚合筛选；`withAlertCount` 返回每设备告警数，

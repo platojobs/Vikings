@@ -40,3 +40,8 @@ logs/
 *.sqlite3
 data/
 .run/
+
+# ---- Broker 凭证（只放模板/生成脚本，禁止提交口令文件）----
+infra/mosquitto/passwd
+infra/mosquitto/passwd.tmp
+infra/mosquitto/*.passwd

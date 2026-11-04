@@ -17,12 +17,19 @@ from app.schemas import (
     DeviceGroupOut,
     DeviceOut,
     DeviceUpdateRequest,
+    MqttCredentialOut,
     PageOut,
     SensorRecordOut,
     to_utc_datetime,
 )
 from app.security import ROLE_ADMIN, ROLE_OPERATOR, require_role, require_user
-from app.services import alert_service, audit_service, command_service, device_service
+from app.services import (
+    alert_service,
+    audit_service,
+    command_service,
+    device_service,
+    mqtt_credential_service,
+)
 
 router = APIRouter(prefix="/api", tags=["devices"])
 
@@ -105,6 +112,58 @@ async def create_device(
     )
     await session.commit()
     return ApiResponse(data=DeviceOut.model_validate(device))
+
+
+@router.post(
+    "/devices/{device_id}/mqtt-credential",
+    response_model=ApiResponse[MqttCredentialOut],
+)
+async def issue_device_mqtt_credential(
+    device_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    """签发/轮换设备 MQTT 凭证。
+
+    - username 恒等于 device_id，设备只能操作 `device/{deviceId}/...` 自己的子树；
+    - 口令只在本响应返回一次，Broker 密码文件保存 PBKDF2 哈希，Device 表只存指纹；
+    - 轮换会覆盖旧口令，Broker 重载后旧凭证立即失效（`reloaded` 表示是否已重载）。
+    """
+    device = await device_service.get_device(session, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail=f"设备 {device_id} 不存在")
+
+    try:
+        issued = mqtt_credential_service.issue_device_credential(device)
+        await audit_service.log(
+            session,
+            operator=user["sub"],
+            action=audit_service.ACTION_DEVICE_CREDENTIAL,
+            target_type="device",
+            target_id=device_id,
+            detail={
+                "username": issued["username"],
+                "version": issued["version"],
+            },
+        )
+        await session.commit()
+    except mqtt_credential_service.MqttCredentialError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    reloaded, reload_detail = mqtt_credential_service.reload_broker()
+    return ApiResponse(
+        data=MqttCredentialOut(
+            device_id=device_id,
+            username=str(issued["username"]),
+            password=str(issued["password"]),
+            version=int(issued["version"]),
+            issued_at=issued["issued_at"],
+            rotated_at=issued["rotated_at"],
+            reloaded=reloaded,
+            reload_detail=reload_detail,
+        )
+    )
 
 
 @router.post("/devices/bulk", response_model=ApiResponse[DeviceBulkResult])

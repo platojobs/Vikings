@@ -60,6 +60,26 @@ class AuthSession {
   );
 }
 
+/// 登录后由网关下发的 MQTT 只读凭证（9001 WebSocket）。
+class MqttClientCredential {
+  const MqttClientCredential({
+    required this.username,
+    required this.password,
+    this.readOnly = true,
+  });
+
+  final String username;
+  final String password;
+  final bool readOnly;
+
+  factory MqttClientCredential.fromJson(Map<String, dynamic> json) =>
+      MqttClientCredential(
+        username: _asString(json['username']),
+        password: _asString(json['password']),
+        readOnly: json['read_only'] != false,
+      );
+}
+
 /// `GET /api/devices` 的设备条目。
 class DeviceSummary {
   const DeviceSummary({

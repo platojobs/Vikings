@@ -12,10 +12,11 @@ GitHub Actions 的 `e2e` 作业（见第 6 节）。
 | 依赖 | 要求 | 安装 / 检查 |
 | --- | --- | --- |
 | Mosquitto | 2.x，含 WebSocket 支持 | `brew install mosquitto`；`mosquitto -h` |
-| Broker 配置 | `infra/mosquitto/mosquitto.conf` 同时含 `listener 1883` 与 `listener 9001` + `protocol websockets` | 脚本会自动校验 |
+| Broker 配置 | `infra/mosquitto/mosquitto.conf` 同时含 `listener 1883` 与 `listener 9001` + `protocol websockets`，且 `per_listener_settings true`、两个监听均 `allow_anonymous false` | 脚本会自动校验 |
 | 网关运行环境 | 本地优先 `gateway/.venv`；无 venv 时自动退回当前 Python（需已装网关依赖） | `cd gateway && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt` |
 | E2E 额外依赖 | `paho-mqtt` / `websocket-client` / `httpx` | `gateway/.venv/bin/python -m pip install -r scripts/e2e/requirements.txt` |
-| 端口 | `1883`、`9001`、`8000` 空闲（脚本会自起进程并托管） | `lsof -nP -iTCP:1883 -iTCP:9001 -iTCP:8000 -sTCP:LISTEN` |
+| 端口 | `1883`、`9001`、`8000` **必须全部空闲**（脚本自起 Broker 与网关并托管，不接受复用） | `lsof -nP -iTCP:1883 -iTCP:9001 -iTCP:8000 -sTCP:LISTEN` |
+| 凭证 | 无需预置；脚本每次运行在临时目录随机生成 gateway / web / mobile / 设备 / probe 凭证与 `passwd` | 自动完成，不读写仓库内 `infra/mosquitto/passwd` |
 
 `5173` 仅用于环境核对时报告占用情况，E2E 本身不依赖 Web 前端。
 
@@ -43,13 +44,16 @@ python scripts/e2e/e2e_acceptance.py
 
 | 端口 | 用途 | 脚本行为 |
 | --- | --- | --- |
-| 1883 | 设备 MQTT over TCP | 空闲则由脚本启动 Broker；已占用则复用现有 Broker |
-| 9001 | 看板 MQTT over WebSocket | 同上，1883 / 9001 必须同时空闲或同时被占用 |
-| 8000 | 网关 REST | 空闲则由脚本用**临时 SQLite** 启动；已占用则复用现有网关 |
+| 1883 | 设备 MQTT over TCP | 必须空闲；脚本启动 Broker，已占用直接报错（不复用） |
+| 9001 | 看板 MQTT over WebSocket | 必须空闲；与 1883 一并由脚本启动 |
+| 8000 | 网关 REST | 必须空闲；脚本用**临时 SQLite** 与临时凭证启动，已占用直接报错 |
 | 5173 | Web 前端 | 仅检查占用，不启动、不停止 |
 
 隔离原则：
 
+- 每次运行把 `infra/mosquitto/mosquitto.conf`、`acl.device`、`acl.client` 复制到临时目录，
+  生成 gateway / web / mobile / device / probe 五套随机口令与临时 `passwd`；
+  **不复用外部匿名 Broker**，也不读写仓库内的真实凭证。
 - 脚本启动的网关通过 `DATABASE_URL=sqlite+aiosqlite:///<临时文件>` 覆盖 `.env`，
   不会写入生产 PostgreSQL；临时库在结束时删除。
 - Broker 的 `persistence_location` 是相对路径，脚本把其工作目录指向临时目录，
@@ -58,19 +62,21 @@ python scripts/e2e/e2e_acceptance.py
 - 结束时关闭 WS 客户端、模拟器、网关、Broker，删除临时 SQLite 与 Broker 数据目录，
   并等待端口释放。
 
-> 降级验证需要脚本托管 Broker。若 1883/9001 已被外部 Broker 占用，脚本会复用，
-> 但 `degrade_disconnect` 会 FAIL 并提示「Broker 由外部托管」——这是有意的保护，
-> 验收前请先停掉外部 Broker，让脚本自起。
+> 鉴权验收依赖「Broker、网关、凭证」三者来自同一次运行。复用外部 Broker 或网关
+> 会导致口令不一致，因此脚本选择直接失败。验收前请先停掉 `start_all.sh` 或本机
+> Mosquitto / uvicorn。
 
-## 4. 覆盖项（23 项）
+## 4. 覆盖项（25 项）
 
 | 步骤 | 验证内容 |
 | --- | --- |
-| `env_preflight` | mosquitto / venv / 依赖 / 配置 / 端口状态 |
-| `broker` | 启动或复用 1883 + 9001 WebSocket Broker |
-| `gateway` | 启动或复用网关，临时 SQLite，不碰生产库 |
+| `env_preflight` | mosquitto / venv / 依赖 / 鉴权配置 / 端口状态 |
+| `mqtt_credentials` | 复制配置与 ACL，生成 gateway / web / mobile / device / probe 随机凭证与临时 `passwd` |
+| `broker` | 独占 1883 + 9001 WebSocket Broker，加载临时凭证与 ACL |
+| `gateway` | 独占 8000 启动网关，注入临时 Broker 凭证，临时 SQLite，不碰生产库 |
 | `auth_login` | admin 登录，角色校验 |
-| `ws_connected` | paho 以 `transport=websockets` 连接 9001 并订阅固定 Topic 列表 |
+| `ws_connected` | paho 以 `web-console` 凭证、`transport=websockets` 连接 9001 并订阅固定 Topic 列表 |
+| `mqtt_auth_isolation` | 匿名 1883/9001 被拒；设备 A 订阅/发布设备 B Topic 收不到；设备自 Topic 正常；web/mobile 只读；轮换后旧凭证失败、新凭证可用 |
 | `simulator` | 启动模拟设备（`voltage=2.90` 触发 critical） |
 | `realtime_report` | WS 收到上报，端到端延迟 < 3000ms |
 | `rest_device` | REST 设备列表与 `/api/records/latest` 可读，状态 online |
@@ -97,8 +103,11 @@ python scripts/e2e/e2e_acceptance.py
 | `未安装 mosquitto` / `缺少 Broker 配置` | macOS `brew install mosquitto`；Ubuntu `sudo apt-get install -y mosquitto`；确认配置含 9001 + `protocol websockets` |
 | `缺少网关运行依赖` | 同时安装 `gateway/requirements.txt` 与 `scripts/e2e/requirements.txt` |
 | CI 上 1883 被占用 | apt 安装的 `mosquitto.service` 自动启动；作业已 stop/disable/pkill，仍占用则检查端口步骤会直接报错 |
-| `1883/9001 仅有一个被占用` | 有残留进程；先 `lsof -nP -iTCP:1883 -iTCP:9001` 并停止 |
-| `Broker 启动失败` | 看 `.run/e2e/mosquitto.log`；常见为配置路径或端口冲突 |
+| `1883/9001 已被占用` | E2E 要求独占 Broker；先停 `start_all.sh` / 本机 Mosquitto |
+| `8000 已被占用` | E2E 要求自起网关以匹配临时凭证；先停 `start_all.sh` / 本机 uvicorn |
+| `Broker 启动失败` | 看 `.run/e2e/mosquitto.log`；常见为 `passwd` 路径、端口冲突或 ACL 文件缺失 |
+| 网关 `mqttConnected:false` | 临时 `MQTT_PASSWORD` 与 `passwd` 不一致，或 Broker 未加载本次临时配置 |
+| 匿名连接居然成功 | 仓库配置出现 `allow_anonymous true` 或缺少 `per_listener_settings true`；`env_preflight` 会直接拦截 |
 | `网关 25s 内未就绪` | 看 `.run/e2e/gateway.log`；常见为依赖缺失或临时库不可写 |
 | `WebSocket 9001 未完成 MQTT 握手` | Broker 未启用 websockets / 被防火墙拦截 / 9001 未监听 |
 | `未收到上报 / 告警` | 模拟器未连上 1883；检查 `.run/e2e/simulator.log` 与 Topic 拼写 |
@@ -116,13 +125,15 @@ python scripts/e2e/e2e_acceptance.py
 | --- | --- |
 | 触发 | 与其它作业相同：`push` / `pull_request` 到 `main` |
 | 依赖 | `apt-get install mosquitto`；`pip install gateway/requirements.txt + scripts/e2e/requirements.txt` |
+| 凭证 | 脚本运行时在临时目录生成随机口令与 `passwd`，workflow **不提交任何真实口令文件** |
 | 端口 | 固定 `1883` / `9001` / `8000`，执行前检查占用，避免与 runner 残留服务冲突 |
 | 耗时 | 正常约 2~3 分钟（apt + pip 安装占大部分，验收本身约 13 秒） |
 | 超时 | `timeout-minutes: 15`，防止卡死占用 runner |
 | 成败 | 完全以脚本退出码判定：`0` 全 PASS，`1` 存在 FAIL |
 | 清理 | 脚本自行清理；作业另有 `if: always()` 兜底 `pkill`，并输出 `.run/e2e/*.log` 便于排查 |
 
-CI 覆盖：MQTT over WebSocket 9001 握手与实时增量、设备唤醒窗口与指令 ack、
+CI 覆盖：鉴权隔离（匿名拒绝、跨设备越权、客户端只读、凭证轮换）、
+MQTT over WebSocket 9001 握手与实时增量、设备唤醒窗口与指令 ack、
 告警从 MQTT 到 REST 的 acked 状态、停 Broker 后的断连/REST 降级/恢复重连。
 
 排查方式：打开 `e2e` 作业 → 查看「运行真实 Broker 端到端验收」的逐项 PASS/FAIL →

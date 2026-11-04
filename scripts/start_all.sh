@@ -22,14 +22,48 @@ info() { printf '\033[36m[info]\033[0m %s\n' "$1"; }
 warn() { printf '\033[33m[warn]\033[0m %s\n' "$1"; }
 fail() { printf '\033[31m[fail]\033[0m %s\n' "$1"; exit 1; }
 
+# ---------- 0. Mosquitto 凭证（Broker 已禁用匿名，必须先于 Broker 启动） ----------
+CRED_PASSWD="$ROOT/infra/mosquitto/passwd"
+CRED_STATE="$RUN_DIR/mqtt/credentials.json"
+if [ ! -f "$CRED_PASSWD" ] || [ ! -f "$CRED_STATE" ]; then
+  info "生成 Mosquitto 服务/客户端/种子设备凭证（不入库）"
+  "$PYTHON_BIN" scripts/mqtt_credentials.py init \
+    --device-id dev-0001 --device-id dev-0002 \
+    --device-id dev-0003 --device-id dev-0004 >/dev/null
+fi
+[ -f "$CRED_STATE" ] || fail "缺少 $CRED_STATE，无法向网关下发 Broker 凭证"
+
+eval "$("$PYTHON_BIN" - "$CRED_STATE" <<'PY'
+import json, shlex, sys
+state = json.load(open(sys.argv[1]))
+for key, var in (
+    ("iot-gateway", "MQTT_PASSWORD"),
+    ("web-console", "MQTT_WEB_PASSWORD"),
+    ("mobile-console", "MQTT_MOBILE_PASSWORD"),
+):
+    password = state["services"].get(key, {}).get("password")
+    if not password:
+        raise SystemExit(f"[fail] 状态文件中缺少 {key} 口令，请执行 scripts/mqtt_credentials.py rotate --subject {key} --reload")
+    print(f"export {var}={shlex.quote(password)}")
+PY
+)"
+export MQTT_USERNAME=iot-gateway
+export MQTT_WEB_USERNAME=web-console
+export MQTT_MOBILE_USERNAME=mobile-console
+export MQTT_PASSWORD_FILE="$CRED_PASSWD"
+export MQTT_RELOAD_COMMAND="kill -HUP \$(cat '$RUN_DIR/mosquitto.pid')"
+
 # ---------- 1. Mosquitto ----------
 if lsof -nP -iTCP:1883 -sTCP:LISTEN >/dev/null 2>&1; then
   info "Mosquitto 已在运行（1883 端口被占用）"
 else
   [ -x "$MQ_BIN" ] || fail "未找到 mosquitto，请执行 brew install mosquitto"
-  info "启动 Mosquitto（1883 MQTT / 9001 WebSocket）"
-  nohup "$MQ_BIN" -c infra/mosquitto/mosquitto.conf >"$LOG_DIR/mosquitto.log" 2>&1 &
+  info "启动 Mosquitto（1883 MQTT / 9001 WebSocket，匿名已关闭）"
+  # 配置使用相对路径，Broker 工作目录必须是 infra/mosquitto/
+  pushd infra/mosquitto >/dev/null
+  nohup "$MQ_BIN" -c mosquitto.conf >"$LOG_DIR/mosquitto.log" 2>&1 &
   echo $! > "$RUN_DIR/mosquitto.pid"
+  popd >/dev/null
   sleep 1
 fi
 
@@ -92,6 +126,8 @@ cat <<'EOF'
 下一步：
   1) 启动管理后台：./scripts/start_web.sh
   2) 启动 Flutter 设备端：cd device_app && flutter run
-  3) 无手机时可先用模拟器打点：
-     gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 3
+  3) 无手机时可先用模拟器打点（需设备口令）：
+     gateway/.venv/bin/python scripts/mqtt_credentials.py show | grep -A4 dev-0001
+     MQTT_DEVICE_PASSWORD='<上一步输出的口令>' \
+       gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 3
 EOF

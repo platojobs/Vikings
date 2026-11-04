@@ -171,6 +171,65 @@ brew install mosquitto postgresql@16 python@3.14
   真实阈值会被放大，生产建议同时在反向代理层做限流。
 - 新建/重置账号的口令强度校验只影响后续写入，既有账号继续可登录。
 
+#### 4.2.2 Broker 鉴权与凭证管理（v1.17.0）
+
+1883 与 9001 **都已关闭匿名**（`allow_anonymous false` + `per_listener_settings true`），
+陌生连接会收到 CONNACK 拒绝；设备只能操作自己的 Topic 子树，Web/移动端只读。
+口令与 ACL 的完整矩阵见 [docs/contracts.md](docs/contracts.md) 的「1.1 Broker 鉴权与主体—Topic 矩阵」。
+
+**首次初始化**（`start_all.sh` 已自动执行；手工/Docker 部署需先做）：
+
+```bash
+# 生成 infra/mosquitto/passwd（gitignore）与 .run/mqtt/credentials.json（0600，gitignore）
+python scripts/mqtt_credentials.py init \
+  --device-id dev-0001 --device-id dev-0002
+```
+
+**签发 / 轮换 / 吊销设备凭证**（用户名恒等于 `deviceId`）：
+
+```bash
+python scripts/mqtt_credentials.py issue  --subject device:dev-0001 --reload
+python scripts/mqtt_credentials.py rotate --subject device:dev-0001 --reload
+python scripts/mqtt_credentials.py revoke --subject device:dev-0001 --reload
+python scripts/mqtt_credentials.py show          # 仅本机调试：查看状态文件中的口令
+```
+
+也可以登录后台调用 `POST /api/devices/{deviceId}/mqtt-credential` 完成首次签发或轮换；
+响应中的口令只返回一次，平台不保存明文（`device` 表只有版本 / 指纹 / 时间）。
+
+**重载 Broker**（修改 `passwd` 后必须执行，否则旧口令仍有效）：
+
+```bash
+# 本地 start_all 托管
+kill -HUP "$(cat .run/mosquitto.pid)"
+# Docker
+docker compose -f infra/docker-compose.yml kill -s HUP mosquitto
+# 或给网关配置 MQTT_RELOAD_COMMAND，让它签发后自动重载
+```
+
+**既有部署升级步骤**：
+
+1. 执行 `python scripts/mqtt_credentials.py init --device-id <每台存量设备>`（或在后台逐台签发）；
+2. 在网关 `.env` 设置 `MQTT_PASSWORD`、`MQTT_WEB_PASSWORD`、`MQTT_MOBILE_PASSWORD`
+   （网关身份保持 `MQTT_USERNAME=iot-gateway`），并设置 `MQTT_PASSWORD_FILE` 指向 `passwd`；
+3. 重启 Broker 与网关（首次从匿名切到鉴权，建议完整重启而非热重载）；
+4. Web/移动端用户重新登录，客户端会通过 `/api/auth/mqtt-credentials` 换取只读凭证；
+5. 设备端把签发口令写入设备模拟页的「MQTT 口令」，或以 `MQTT_DEVICE_PASSWORD` 注入模拟器。
+
+**故障排查**：
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| Broker 启动报 `Unable to open pwfile "passwd"` | 尚未初始化；先执行 `mqtt_credentials.py init`，并确认工作目录是 `infra/mosquitto/` |
+| 网关 `/api/health` 显示 `mqttConnected:false` | `MQTT_USERNAME` 不是 `iot-gateway`、`MQTT_PASSWORD` 缺失或与 `passwd` 不一致 |
+| 设备连接被拒（CONNACK 5） | 用户名必须等于 `deviceId`，口令必须是该设备最近一次签发/轮换的结果 |
+| Web/移动端实时不了、REST 正常 | `/api/auth/mqtt-credentials` 返回 503 说明服务端未配置 `MQTT_WEB_PASSWORD` / `MQTT_MOBILE_PASSWORD` |
+| 轮换后旧口令仍能连 | Broker 未重载；执行 SIGHUP 或设置 `MQTT_RELOAD_COMMAND` |
+| 后台签发返回 503 | 网关进程对 `infra/mosquitto/` 无写权限；改用命令行脚本在宿主机签发后重载 |
+
+安全约定：`infra/mosquitto/passwd`、`.run/mqtt/credentials.json` 均不入库；仓库只保留
+`mosquitto.conf`、ACL 与生成脚本。文档里的口令一律是占位符，禁止照抄上线。
+
 ### 4.3 启动设备端
 
 ```bash
@@ -197,19 +256,30 @@ App 启动后底部有三个入口，默认进入「设备模拟」，原有模�
 
 > `127.0.0.1` 在真机上指的是手机自己，不是电脑，这是真机连不上 Broker 的最常见原因。
 
+设备模拟页新增「MQTT 口令」输入（Broker 已禁用匿名）：口令取 4.2.2 中该设备最近一次签发/轮换的结果，
+用户名固定等于设备 ID。移动看板与告警中心的只读凭证由登录接口自动换取，无需手工填写。
+
 ### 4.4 无手机时用模拟器打点
 
 ```bash
-gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
+# 口令来自 4.2.2 的签发/轮换输出；不提供口令会直接报错，不会匿名连接
+MQTT_DEVICE_PASSWORD='<dev-0001 的设备口令占位>' \
+  gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
 # 注入异常值触发 AI 告警
-gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 1 --voltage 2.90 --temperature 78
+MQTT_DEVICE_PASSWORD='<dev-0001 的设备口令占位>' \
+  gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count 1 --voltage 2.90 --temperature 78
 ```
 
 ### 4.5 Docker 方式启动基础设施（可选）
 
 ```bash
+# 必须先初始化凭证，否则 Broker 因缺少 passwd 启动失败
+python scripts/mqtt_credentials.py init --device-id dev-0001
 docker compose -f infra/docker-compose.yml up -d
 ```
+
+Docker 将整个 `infra/mosquitto/` 目录挂载到 `/mosquitto/config` 并设为工作目录，
+因此 `passwd` 生成在宿主机即可被容器读取；签发/轮换后重载见 4.2.2。
 
 ### 4.6 手机与局域网访问（重要）
 
@@ -574,6 +644,8 @@ http://192.168.1.8:5173
 | 网关 `/api/health` 显示 `mqttConnected:false` | Broker 未启动或端口不符，查看 `logs/gateway.log` 与 `logs/mosquitto.log` |
 | 浏览器 / 移动看板连不上 9001 | 确认 mosquitto.conf 已配置 `protocol websockets`，并检查防火墙与手机是否同网段 |
 | 设备一直离线 | 检查 LWT 报文、Topic 拼写；模拟器用 `--count 1` 时上报后会立即休眠，属正常现象 |
+| 连接 Broker 返回 CONNACK 5 / 135 | 匿名已关闭：检查用户名是否等于 deviceId、口令是否为最近一次签发/轮换的值，以及 Broker 是否已重载 `passwd` |
+| Web/移动端无实时数据但 REST 正常 | `/api/auth/mqtt-credentials` 未配置或返回 503；见 4.2.2 故障排查 |
 | 告警只有模板文案 | 未配置 `LLM_API_KEY`，属预期降级行为 |
 
 ---
@@ -597,13 +669,17 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 - REST 确认告警，状态变为 acked（open 消失、acked 可查）；
 - 告警中心：真实上报产生新告警 → `GET /api/alerts` 按 deviceId/level/status 筛选可见 →
   `POST /api/alerts/bulk-ack` 批量确认（混入不存在 ID 验证部分失败可见）→ open 不再返回、acked 可查；
+- **鉴权隔离（v1.17.0）**：匿名连接 1883/9001 均被 CONNACK 拒绝；设备 A 用自己凭证
+  订阅/发布设备 B 的 Topic 收不到消息；设备只用自己的 Topic 正常上报/收指令；
+  Web/移动端只读身份能订阅、发布被拒；轮换设备凭证后旧凭证连接失败、新凭证可用；
 - 停 Broker 后 WS 断连、REST 仍可轮询；重启 Broker 后 WS 重连、网关
   `mqtt.connected=true`，并再次收到真实上报。
 
-隔离与清理：脚本自起 Broker 与网关（端口空闲时），网关使用临时 SQLite，
-Broker 使用临时数据目录（保留消息不跨运行累积），不写生产库；
-结束后停止所有托管进程、删除临时目录并等待端口释放。
-若 1883/9001 已被外部 Broker 占用，脚本会复用，但降级步骤会明确 FAIL（不杀外部进程）。
+隔离与清理：脚本强制自起 Broker 与网关，要求 1883/9001/8000 全部空闲，
+**不再复用外部匿名 Broker**（运行前请先停掉 `start_all.sh` 托管的服务）。
+每次运行在临时目录生成 gateway/web/mobile/device/probe 五套随机凭证与临时 `passwd`，
+不写仓库、不提交真实口令；网关使用临时 SQLite，Broker 使用临时数据目录
+（保留消息不跨运行累积），结束后停止所有托管进程、删除临时目录并等待端口释放。
 
 本脚本已纳入 CI 的 `e2e` 作业（ubuntu-latest），由脚本退出码判定成败，
 正常耗时约 2~3 分钟，超时 15 分钟。CI 失败时查看 `e2e` 作业的逐项 PASS/FAIL 与
@@ -621,9 +697,10 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（23 项） | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（25 项，含鉴权隔离与凭证轮换） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
+每次运行由脚本在临时目录生成随机凭证与 `passwd`，**不提交任何真实口令文件**；
 结束后脚本自清理并由 `if: always()` 兜底；不依赖外部服务、不写生产数据。
 成败完全以脚本退出码判定，`timeout-minutes: 15` 防止卡死。
 失败排查：查看作业中逐项 PASS/FAIL 与「失败时输出日志」步骤（各服务日志末尾 80 行）。
@@ -709,3 +786,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.15.0` | 移动端新增「告警中心」第三 tab：级别 / 状态 / 设备筛选、滚动分页、多选批量确认、实时入顶与未读角标；网关新增 `POST /api/alerts/bulk-ack`（部分失败逐类可见），告警级别校验放宽到 info/notice/warning/critical；补 `PATCH /api/devices/{id}` HTTP 回归与真实 Broker 告警中心验收（[发布说明](docs/releases/v1.15.0.md)） |
 | `v1.15.1` | 交付就绪只读审计：按安全、部署、可观测性、数据生命周期、功能闭环、发布工程、文档与测试边界产出 P0/P1/P2 分级清单与执行顺序（[交付就绪清单](docs/delivery-readiness.md)） |
 | `v1.16.0` | P0-2 默认凭据与登录防护：`APP_ENV=production` 启动校验默认 JWT/管理员口令/数据库并在不合规时拒绝启动；演示账号仅开发/测试默认种子；登录按 IP+账号限流（429 + `Retry-After`）；新建/重置口令最小长度与弱口令校验；登录响应结构与既有鉴权语义不变（[发布说明](docs/releases/v1.16.0.md)） |
+| `v1.17.0` | P0-3 Broker 鉴权与设备凭证：1883/9001 关闭匿名并按监听加载 `password_file` + ACL；设备用户名=deviceId、只能读写自己的 Topic 子树；Web/移动端登录后换取独立只读凭证（9001 无 write）；新增设备凭证签发/轮换接口与 CLI，轮换后旧凭证失效；E2E 增加匿名拒绝、跨设备越权、客户端只读与轮换验收（[发布说明](docs/releases/v1.17.0.md)） |

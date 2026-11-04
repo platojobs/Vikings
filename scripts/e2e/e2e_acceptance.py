@@ -3,7 +3,7 @@
 
 覆盖 CI 无法验证的真实链路：
   1. 环境与端口前置检查；
-  2. 启动（或复用）Mosquitto 1883/9001 与网关 8000；
+  2. 启动 Mosquitto 1883/9001 与网关 8000（要求端口全部空闲，使用临时凭证）；
   3. 模拟设备上线、上报、告警；
   4. 以移动看板相同方式连 WebSocket 9001 订阅实时增量；
   5. REST 下发指令并验证设备回执；
@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -46,6 +47,14 @@ GATEWAY_DIR = ROOT / "gateway"
 VENV_PYTHON = GATEWAY_DIR / ".venv" / "bin" / "python"
 MOSQUITTO_CONF = ROOT / "infra" / "mosquitto" / "mosquitto.conf"
 LOG_DIR = ROOT / ".run" / "e2e"
+
+# 复用网关内的凭证工具（纯标准库），保证 E2E 与生产生成同一格式的 PBKDF2 hash
+sys.path.insert(0, str(GATEWAY_DIR))
+from app.mqtt.credentials import (  # noqa: E402
+    generate_password,
+    upsert_credential,
+    write_password_file,
+)
 
 MQTT_HOST = "127.0.0.1"
 MQTT_PORT = 1883
@@ -115,10 +124,15 @@ class Context:
         # Broker 的 persistence_location 是相对路径：把 cwd 指向临时目录，
         # 每次验收都从空的保留消息开始，且不污染仓库内 Broker 数据。
         self.broker_workdir: Optional[Path] = None
+        self.broker_conf: Optional[Path] = None
+        # Broker 已关闭匿名：E2E 自建临时凭证，绝不使用匿名连接
+        self.mqtt: Dict[str, str] = {}
         self.gateway_python: Optional[str] = None
         self.client: Optional[httpx.Client] = None
         self.token = ""
         self.device_id = f"e2e-{uuid.uuid4().hex[:8]}"
+        # 第二个设备：专门用于验证跨设备 ACL 与凭证轮换，不参与业务链路
+        self.probe_device_id = f"e2e-probe-{uuid.uuid4().hex[:8]}"
         self.collector: Optional[WsCollector] = None
         self.alert_id: Optional[str] = None
         self.cmd_id: Optional[str] = None
@@ -187,7 +201,52 @@ def gateway_python(ctx: Context) -> str:
     )
 
 
+def provision_mqtt_credentials(ctx: Context) -> str:
+    """为本次 E2E 生成独立 Broker 配置与凭证。
+
+    - 网关：iot-gateway（跨设备订阅/下发指令）
+    - 客户端：web-console（9001 只读）
+    - 设备：deviceId（只能操作自己的子树）
+    所有口令只写入临时目录与进程 env，不进入仓库。
+    """
+    if not MOSQUITTO_CONF.exists():
+        raise RuntimeError(f"缺少 Broker 配置：{MOSQUITTO_CONF}")
+    workdir = Path(tempfile.mkdtemp(prefix="vikings-e2e-broker-"))
+    mosq_dir = workdir / "infra" / "mosquitto"
+    (mosq_dir / "data").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(MOSQUITTO_CONF, mosq_dir / "mosquitto.conf")
+    for name in ("acl.device", "acl.client"):
+        source = ROOT / "infra" / "mosquitto" / name
+        if not source.exists():
+            raise RuntimeError(f"缺少 ACL 文件：{source}")
+        shutil.copy2(source, mosq_dir / name)
+
+    password_file = mosq_dir / "passwd"
+    write_password_file(password_file, {})
+    ctx.mqtt = {
+        "gateway": generate_password(),
+        "web": generate_password(),
+        "mobile": generate_password(),
+        "device": generate_password(),
+        "probe": generate_password(),
+    }
+    upsert_credential(password_file, "iot-gateway", ctx.mqtt["gateway"])
+    upsert_credential(password_file, "web-console", ctx.mqtt["web"])
+    upsert_credential(password_file, "mobile-console", ctx.mqtt["mobile"])
+    upsert_credential(password_file, ctx.device_id, ctx.mqtt["device"])
+    upsert_credential(password_file, ctx.probe_device_id, ctx.mqtt["probe"])
+
+    ctx.broker_workdir = workdir
+    ctx.broker_conf = mosq_dir / "mosquitto.conf"
+    return (
+        f"临时凭证已生成：gateway/web/mobile + device({ctx.device_id})"
+        f" + probe({ctx.probe_device_id})；Broker 工作目录 {workdir}"
+    )
+
+
 def start_broker(ctx: Context) -> str:
+    if ctx.mqtt and ctx.broker_conf is None:
+        raise RuntimeError("未生成 Broker 凭证，拒绝启动匿名 Broker")
     mosquitto = find_mosquitto()
     if not mosquitto:
         raise RuntimeError(
@@ -199,13 +258,15 @@ def start_broker(ctx: Context) -> str:
     conf = MOSQUITTO_CONF.read_text(encoding="utf-8")
     if "protocol websockets" not in conf or "9001" not in conf:
         raise RuntimeError("mosquitto.conf 未同时配置 protocol websockets 与 9001 端口")
+    if "per_listener_settings true" not in conf or "allow_anonymous true" in conf:
+        raise RuntimeError("Broker 配置必须按监听禁用匿名（per_listener_settings + allow_anonymous false）")
 
-    if port_open(MQTT_PORT) and port_open(MQTT_WS_PORT):
-        ctx.reporter.add("broker", "INFO", "复用已运行的 1883/9001 Broker，不由脚本托管")
-        return "复用现有 Broker"
-
+    # E2E 必须独占 Broker：要用本次临时凭证/ACL，复用外部 Broker 无法保证一致
     if port_open(MQTT_PORT) or port_open(MQTT_WS_PORT):
-        raise RuntimeError("1883/9001 仅有一个被占用，环境不完整；请先停掉残留进程")
+        raise RuntimeError(
+            "1883/9001 已被占用；E2E 需要独占 Broker 以加载临时凭证与 ACL，"
+            "请先停止 start_all / 本机 Mosquitto 后重试"
+        )
 
     if ctx.broker_workdir is None:
         ctx.broker_workdir = Path(tempfile.mkdtemp(prefix="vikings-e2e-broker-"))
@@ -218,8 +279,9 @@ def start_broker(ctx: Context) -> str:
     handle = log_path.open("w", encoding="utf-8")
     ctx.log_handles.append(handle)
     ctx.broker_proc = subprocess.Popen(
-        [mosquitto, "-c", str(MOSQUITTO_CONF)],
-        cwd=str(ctx.broker_workdir),
+        [mosquitto, "-c", str(ctx.broker_conf)],
+        # 配置使用相对路径（passwd/acl.*/data/），工作目录必须是配置所在目录
+        cwd=str(ctx.broker_conf.parent),
         stdout=handle,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -235,8 +297,10 @@ def start_broker(ctx: Context) -> str:
 
 def start_gateway(ctx: Context) -> str:
     if port_open(8000):
-        ctx.reporter.add("gateway", "INFO", "复用已运行的 8000 网关，不由脚本托管")
-        return "复用现有网关"
+        raise RuntimeError(
+            "8000 已被占用；E2E 需要自起网关以加载本次临时 Broker 凭证与临时数据库，"
+            "请先停止 start_all / 本机 uvicorn 后重试"
+        )
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "gateway.log"
@@ -245,11 +309,24 @@ def start_gateway(ctx: Context) -> str:
     ctx.temp_db = db_path
 
     env = os.environ.copy()
+    broker_reload = (
+        f"kill -HUP {ctx.broker_proc.pid}" if ctx.broker_proc else ""
+    )
     env.update(
         {
             "DATABASE_URL": f"sqlite+aiosqlite:///{db_path}",
             "MQTT_HOST": MQTT_HOST,
             "MQTT_PORT": str(MQTT_PORT),
+            "MQTT_USERNAME": "iot-gateway",
+            "MQTT_PASSWORD": ctx.mqtt["gateway"],
+            "MQTT_PASSWORD_FILE": str(
+                (ctx.broker_workdir or Path()) / "infra" / "mosquitto" / "passwd"
+            ),
+            "MQTT_RELOAD_COMMAND": broker_reload,
+            "MQTT_WEB_USERNAME": "web-console",
+            "MQTT_WEB_PASSWORD": ctx.mqtt["web"],
+            "MQTT_MOBILE_USERNAME": "mobile-console",
+            "MQTT_MOBILE_PASSWORD": ctx.mqtt["mobile"],
             "ADMIN_USERNAME": ctx.args.username,
             "ADMIN_PASSWORD": ctx.args.password,
         }
@@ -295,7 +372,7 @@ def start_gateway(ctx: Context) -> str:
 # WebSocket MQTT 订阅器（复用移动看板的传输方式）
 # ---------------------------------------------------------------------------
 class WsCollector:
-    def __init__(self, client_id: str) -> None:
+    def __init__(self, client_id: str, username: str, password: str) -> None:
         self.messages: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self.connected = threading.Event()
@@ -309,6 +386,8 @@ class WsCollector:
             transport="websockets",
             protocol=mqtt.MQTTv311,
         )
+        # 9001 只读主体：能订阅设备 Topic，但 ACL 无任何 write 规则
+        self.client.username_pw_set(username, password)
         self.client.ws_set_options(path="/mqtt")
         self.client.reconnect_delay_set(min_delay=1, max_delay=5)
         self.client.on_connect = self._on_connect
@@ -420,6 +499,231 @@ def login(ctx: Context) -> str:
     return f"admin 登录成功（token 长度 {len(ctx.token)}）"
 
 
+class _MqttProbe:
+    """最小 MQTT 探针：记录 CONNACK/SUBACK 与收到的消息，用于真实鉴权断言。"""
+
+    def __init__(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = "",
+        *,
+        transport: str = "tcp",
+        client_id: Optional[str] = None,
+    ) -> None:
+        self.messages: List[Dict[str, Any]] = []
+        self.rc: Optional[int] = None
+        self.connected = False
+        self.granted: List[int] = []
+        self.transport = transport
+        self._result = threading.Event()
+        self._subacked = threading.Event()
+        self.client = mqtt.Client(
+            callback_api_version=CallbackAPIVersion.VERSION2,
+            client_id=client_id or f"e2e-auth-{uuid.uuid4().hex[:8]}",
+            transport=transport,
+            protocol=mqtt.MQTTv311,
+        )
+        if transport == "websockets":
+            self.client.ws_set_options(path="/mqtt")
+        if username is not None:
+            self.client.username_pw_set(username, password)
+        self.client.on_connect = self._on_connect
+        self.client.on_subscribe = self._on_subscribe
+        self.client.on_message = self._on_message
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        self.rc = int(getattr(reason_code, "value", reason_code))
+        self.connected = not reason_code.is_failure
+        self._result.set()
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        self.granted = list(granted_qos)
+        self._subacked.set()
+
+    def _on_message(self, client, userdata, msg):
+        self.messages.append({"topic": msg.topic, "payload": msg.payload.decode("utf-8", "replace")})
+
+    def connect(self, *, timeout: float = 6.0) -> int:
+        port = MQTT_WS_PORT if self.transport == "websockets" else MQTT_PORT
+        self.client.connect(MQTT_HOST, port, keepalive=15)
+        self.client.loop_start()
+        if not self._result.wait(timeout):
+            raise RuntimeError(f"MQTT 探针 {timeout}s 内未收到 CONNACK")
+        return int(self.rc or 0)
+
+    def subscribe(self, topic: str, *, timeout: float = 6.0) -> List[int]:
+        self._subacked.clear()
+        self.client.subscribe(topic, qos=1)
+        if not self._subacked.wait(timeout):
+            raise RuntimeError(f"订阅 {topic} 后 {timeout}s 内未收到 SUBACK")
+        return self.granted
+
+    def publish(self, topic: str, payload: str, *, qos: int = 0) -> None:
+        self.client.publish(topic, payload, qos=qos)
+
+    def close(self) -> None:
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:  # noqa: BLE001 - 清理阶段不再抛出
+            pass
+
+
+def _connect_rc(username: Optional[str], password: Optional[str], transport: str) -> int:
+    probe = _MqttProbe(username, password, transport=transport)
+    try:
+        return probe.connect()
+    finally:
+        probe.close()
+
+
+def verify_mqtt_auth_isolation(ctx: Context) -> str:
+    """真实 Broker 鉴权验收：匿名拒绝 / 跨设备 ACL / 客户端只读 / 轮换失效。"""
+    if ctx.broker_proc is None:
+        raise RuntimeError("E2E 必须托管 Broker 才能执行凭证轮换")
+    assert ctx.broker_workdir is not None
+
+    # 1) 匿名连接 1883 / 9001 必须被 CONNACK 拒绝
+    # paho v2 在 MQTT 3.1.1 下把 CONNACK 5(Not authorized) 映射为 ReasonCode 135(0x87)
+    rc_1883 = _connect_rc(None, None, "tcp")
+    rc_9001 = _connect_rc(None, None, "websockets")
+    if rc_1883 in (0,) or rc_1883 not in (5, 135):
+        raise RuntimeError(f"匿名 TCP 1883 未被正确拒绝，CONNACK rc={rc_1883}")
+    if rc_9001 in (0,) or rc_9001 not in (5, 135):
+        raise RuntimeError(f"匿名 WebSocket 9001 未被正确拒绝，CONNACK rc={rc_9001}")
+
+    device = _MqttProbe(
+        ctx.probe_device_id, ctx.mqtt["probe"], client_id=f"auth-probe-{ctx.probe_device_id}"
+    )
+    probe_sub = _MqttProbe(
+        ctx.device_id, ctx.mqtt["device"], client_id=f"auth-dev-{ctx.device_id}"
+    )
+    web = _MqttProbe("web-console", ctx.mqtt["web"], transport="websockets")
+    mobile = _MqttProbe("mobile-console", ctx.mqtt["mobile"], transport="websockets")
+    try:
+        # 2) 设备使用自己的凭证：订阅自己的 cmd、发布自己的 report 均成功
+        if device.connect() != 0:
+            raise RuntimeError("设备凭证连接失败")
+        device_granted = device.subscribe(f"device/{ctx.probe_device_id}/cmd")
+        if 128 in device_granted:
+            raise RuntimeError(f"设备无法订阅自己的 cmd，SUBACK={device_granted}")
+        device.publish(
+            f"device/{ctx.probe_device_id}/sensor/report",
+            json.dumps({"deviceId": ctx.probe_device_id, "seq": 1, "ts": int(time.time() * 1000)}),
+        )
+
+        if probe_sub.connect() != 0:
+            raise RuntimeError("probe 设备凭证连接失败")
+        probe_granted = probe_sub.subscribe(f"device/{ctx.device_id}/sensor/report")
+        if 128 in probe_granted:
+            raise RuntimeError(f"probe 无法订阅自己的 report，SUBACK={probe_granted}")
+
+        # 3) 设备 A 订阅设备 B 的 Topic：Mosquitto 对 ACL 拒绝的订阅返回
+        #    SUBACK granted（协议允许），但消息必须在投递阶段被 ACL 过滤。
+        cross_granted = device.subscribe(f"device/{ctx.device_id}/sensor/report")
+        probe_sub.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps({"marker": "cross-read-probe"}),
+        )
+        time.sleep(1.2)
+        if any("cross-read-probe" in m["payload"] for m in device.messages):
+            raise RuntimeError("设备 A 越权订阅收到了设备 B 的上报，ACL 未生效")
+
+        # 4) 设备 A 向设备 B 的 Topic 发布：B 收不到（Broker ACL 丢弃）
+        device.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps({"marker": "cross-device-write"}),
+        )
+        time.sleep(1.2)
+        if any("cross-device-write" in m["payload"] for m in probe_sub.messages):
+            raise RuntimeError("设备 A 越权发布到了设备 B 的 Topic，且被 B 收到")
+
+        # 5) Web 客户端：可订阅只读 Topic，但发布设备上报 Topic 被拒
+        if web.connect() != 0:
+            raise RuntimeError("web-console 只读凭证连接失败")
+        web_granted = web.subscribe(f"device/{ctx.device_id}/sensor/report")
+        if 128 in web_granted:
+            raise RuntimeError(f"web-console 无法订阅只读 Topic，SUBACK={web_granted}")
+
+        # 6) 移动端是独立只读主体：能订阅，不能发布
+        if mobile.connect() != 0:
+            raise RuntimeError("mobile-console 只读凭证连接失败")
+        mobile_granted = mobile.subscribe("device/+/sensor/report")
+        if 128 in mobile_granted:
+            raise RuntimeError(f"mobile-console 无法订阅只读 Topic，SUBACK={mobile_granted}")
+
+        # 设备 B 正常上报：网关、Web、移动端都应收到，设备 A 不得收到
+        probe_sub.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps({"marker": "read-allowed"}),
+        )
+        time.sleep(1.2)
+        if not any("read-allowed" in m["payload"] for m in web.messages):
+            raise RuntimeError("web-console 未收到只读 Topic 消息")
+        if not any("read-allowed" in m["payload"] for m in mobile.messages):
+            raise RuntimeError("mobile-console 未收到只读 Topic 消息")
+        if any("read-allowed" in m["payload"] for m in device.messages):
+            raise RuntimeError("设备 A 收到了设备 B 的只读 Topic 消息")
+
+        web.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps({"marker": "web-write-denied"}),
+        )
+        mobile.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps({"marker": "mobile-write-denied"}),
+        )
+        time.sleep(1.2)
+        if any(
+            "web-write-denied" in m["payload"] or "mobile-write-denied" in m["payload"]
+            for m in probe_sub.messages
+        ):
+            raise RuntimeError("客户端只读身份越权发布设备上报 Topic，且被设备收到")
+
+        # 7) 轮换 probe 设备凭证：SIGHUP 后旧凭证失败、新凭证可用
+        password_file = ctx.broker_workdir / "infra" / "mosquitto" / "passwd"
+        state_file = ctx.broker_workdir / "e2e-credentials.json"
+        rotated = subprocess.run(
+            [
+                gateway_python(ctx),
+                "scripts/mqtt_credentials.py",
+                "--password-file",
+                str(password_file),
+                "--state-file",
+                str(state_file),
+                "rotate",
+                "--subject",
+                f"device:{ctx.probe_device_id}",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if rotated.returncode != 0:
+            raise RuntimeError(f"凭证轮换脚本失败：{rotated.stderr.strip()}")
+        new_password = str(json.loads(rotated.stdout)["password"])
+        os.kill(ctx.broker_proc.pid, signal.SIGHUP)
+        time.sleep(0.8)
+
+        old_rc = _connect_rc(ctx.probe_device_id, ctx.mqtt["probe"], "tcp")
+        new_rc = _connect_rc(ctx.probe_device_id, new_password, "tcp")
+        if old_rc == 0:
+            raise RuntimeError(f"轮换后旧凭证仍可连接，CONNACK rc={old_rc}")
+        if new_rc != 0:
+            raise RuntimeError(f"轮换后新凭证连接失败，CONNACK rc={new_rc}")
+        ctx.mqtt["probe"] = new_password
+    finally:
+        for probe in (device, probe_sub, web, mobile):
+            probe.close()
+
+    return (
+        f"匿名 1883/9001 均被拒(rc={rc_1883}/{rc_9001})；"
+        f"设备A订阅B的SUBACK={cross_granted}；A→B发布未被B收到；"
+        f"web/mobile可订阅(SUBACK={web_granted}/{mobile_granted})但发布被拒；"
+        f"轮换后旧凭证rc={old_rc}、新凭证rc={new_rc}"
+    )
+
+
 def start_simulator(ctx: Context) -> str:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "simulator.log"
@@ -437,6 +741,10 @@ def start_simulator(ctx: Context) -> str:
             "3",
             "--voltage",
             "2.90",
+            "--username",
+            ctx.device_id,
+            "--password",
+            ctx.mqtt["device"],
         ],
         cwd=str(ROOT),
         stdout=handle,
@@ -448,12 +756,16 @@ def start_simulator(ctx: Context) -> str:
 
 def verify_realtime_report(ctx: Context) -> str:
     assert ctx.collector is not None
+    # 只统计真正的设备上报（带 seq/ts）。鉴权隔离步骤也会向同一 Topic 发送
+    # marker 探针消息，避免误取无 ts 的探针报文导致延迟计算失真。
     item = ctx.collector.wait_message(
-        lambda m: m["topic"] == f"device/{ctx.device_id}/sensor/report",
+        lambda m: m["topic"] == f"device/{ctx.device_id}/sensor/report"
+        and int(m["payload"].get("seq", 0)) >= 1
+        and int(m["payload"].get("ts", 0)) > 0,
         12,
         "设备实时上报",
     )
-    lag_ms = int(item["received"] * 1000 - int(item["payload"].get("ts", 0)))
+    lag_ms = int(item["received"] * 1000) - int(item["payload"]["ts"])
     if lag_ms > 3000:
         raise RuntimeError(f"上报到 WebSocket 的延迟过高：{lag_ms}ms（期望 <3000ms）")
     return f"WebSocket 收到上报，端到端延迟约 {lag_ms}ms，seq={item['payload'].get('seq')}"
@@ -648,6 +960,7 @@ def verify_alert_center_bulk_ack(ctx: Context) -> str:
         transport="tcp",
         protocol=mqtt.MQTTv311,
     )
+    publisher.username_pw_set(ctx.device_id, ctx.mqtt["device"])
     publisher.connect(MQTT_HOST, MQTT_PORT, keepalive=15)
     publisher.loop_start()
     try:
@@ -882,6 +1195,7 @@ def recover_real_data(ctx: Context) -> str:
         transport="tcp",
         protocol=mqtt.MQTTv311,
     )
+    publisher.username_pw_set(ctx.device_id, ctx.mqtt["device"])
     publisher.connect(MQTT_HOST, MQTT_PORT, keepalive=15)
     publisher.loop_start()
     try:
@@ -985,12 +1299,18 @@ def main() -> int:
     rep = ctx.reporter
     try:
         rep.run("env_preflight", lambda: preflight(ctx))
+        rep.run("mqtt_credentials", lambda: provision_mqtt_credentials(ctx))
         rep.run("broker", lambda: start_broker(ctx))
         rep.run("gateway", lambda: start_gateway(ctx))
         ctx.client = httpx.Client(base_url=GATEWAY_URL, timeout=10)
         rep.run("auth_login", lambda: login(ctx))
-        ctx.collector = WsCollector(f"e2e-ws-{uuid.uuid4().hex[:8]}")
+        ctx.collector = WsCollector(
+            f"e2e-ws-{uuid.uuid4().hex[:8]}",
+            "web-console",
+            ctx.mqtt["web"],
+        )
         rep.run("ws_connected", lambda: connect_ws(ctx))
+        rep.run("mqtt_auth_isolation", lambda: verify_mqtt_auth_isolation(ctx))
         rep.run("simulator", lambda: start_simulator(ctx))
         rep.run("realtime_report", lambda: verify_realtime_report(ctx))
         # 先查 REST 快照：此时设备仍在线，可同时验证设备与最新值
@@ -1035,6 +1355,12 @@ def preflight(ctx: Context) -> str:
     conf = MOSQUITTO_CONF.read_text(encoding="utf-8")
     if "protocol websockets" not in conf or "listener 9001" not in conf:
         raise RuntimeError("Broker 配置缺少 `listener 9001` 或 `protocol websockets`")
+    if "per_listener_settings true" not in conf:
+        raise RuntimeError("Broker 配置缺少 per_listener_settings true（1883/9001 需独立 ACL）")
+    if "allow_anonymous true" in conf:
+        raise RuntimeError("Broker 配置仍存在 allow_anonymous true；拒绝匿名接入")
+    if conf.count("allow_anonymous false") < 2:
+        raise RuntimeError("Broker 必须对 1883 与 9001 两个监听都显式 allow_anonymous false")
     ports = {p: port_open(p) for p in (1883, 9001, 8000, 5173)}
     return (
         f"mosquitto/{Path(interpreter).name} 可用；端口状态 "

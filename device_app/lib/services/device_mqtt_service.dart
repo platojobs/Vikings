@@ -209,6 +209,7 @@ class DeviceMqttService {
     String? deviceId,
     int? sleepSec,
     int? commandWindowSec,
+    String? mqttPassword,
   }) async {
     final host = (brokerHost ?? _config.brokerHost).trim();
     final id = (deviceId ?? _config.deviceId).trim();
@@ -218,7 +219,8 @@ class DeviceMqttService {
     final identityChanged =
         host != _config.brokerHost ||
         (brokerPort ?? _config.brokerPort) != _config.brokerPort ||
-        id != _config.deviceId;
+        id != _config.deviceId ||
+        (mqttPassword != null && mqttPassword != _config.mqttPassword);
     final wasRunning = _loopRunning;
 
     // 连接参数变更时先用旧配置正常下线，再切换身份，避免把 offline 发到新 Topic
@@ -237,6 +239,7 @@ class DeviceMqttService {
       commandWindowSec: commandWindowSec != null && commandWindowSec > 0
           ? commandWindowSec
           : _config.commandWindowSec,
+      mqttPassword: mqttPassword ?? _config.mqttPassword,
     );
     configNotifier.value = _config;
     _log(
@@ -471,7 +474,8 @@ class DeviceMqttService {
       MqttServerClient? client;
       try {
         client = _createClient();
-        await client.connect();
+        // Broker 已关闭匿名：用户名 = deviceId，ACL 按 %u 绑定自己的子树
+        await client.connect(_config.deviceId, _config.mqttPassword);
         if (client.connectionStatus?.state == MqttConnectionState.connected) {
           _log('MQTT 连接成功（第 $attempt 次尝试）', DeviceLogLevel.success);
           return client;

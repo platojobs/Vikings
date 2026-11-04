@@ -2,12 +2,16 @@
  * MQTT over WebSocket 单例封装。
  *
  * 浏览器无法直连 TCP（1883），因此连接 Mosquitto 的 9001 WebSocket 端口。
+ * Broker 已关闭匿名：连接前必须用登录 JWT 调 /api/auth/mqtt-credentials
+ * 换取 `web-console` 只读凭证（口令只存在于服务端 env，不打进前端产物）。
  * - clientId 随机生成，避免多标签页/重复连接被 Broker 踢掉
  * - 断线依赖 mqtt.js 自带 reconnectPeriod 自动重连
  * - 订阅关系集中登记，重连成功后自动重新订阅
  */
 
 import mqtt, { type MqttClient } from 'mqtt'
+import { getToken } from '@/utils/auth'
+import type { ApiEnvelope, MqttCredential } from '@/types'
 
 type MessageHandler = (payload: unknown, topic: string) => void
 type StatusHandler = (connected: boolean) => void
@@ -18,6 +22,7 @@ const statusHandlers = new Set<StatusHandler>()
 
 let client: MqttClient | null = null
 let connected = false
+let initStarted = false
 
 /** 通配符匹配：支持 `+`（单层）与 `#`（多层结尾） */
 function topicMatches(pattern: string, topic: string): boolean {
@@ -39,15 +44,55 @@ function notifyStatus(next: boolean): void {
   statusHandlers.forEach((handler) => handler(connected))
 }
 
-/** 懒创建连接，全应用只保留一个 client */
-function ensureClient(): MqttClient {
-  if (client) return client
+/** 懒创建连接，全应用只保留一个 client；先换取只读凭证再连 Broker */
+function ensureClient(): void {
+  if (client || initStarted) return
+  initStarted = true
+  void initClient()
+}
+
+async function initClient(): Promise<void> {
+  let credential: MqttCredential
+  try {
+    const token = getToken()
+    if (!token) {
+      throw new Error('未登录，无法换取 MQTT 只读凭证')
+    }
+    const apiBase = (
+      import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+    ).replace(/\/+$/, '')
+    const response = await fetch(
+      `${apiBase}/api/auth/mqtt-credentials?client=web`,
+      {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      },
+    )
+    const payload = (await response.json()) as ApiEnvelope<MqttCredential> & {
+      message?: string
+      detail?: string
+    }
+    if (!response.ok || payload.code !== 0 || !payload.data) {
+      throw new Error(
+        payload.message || payload.detail || `凭证接口失败（HTTP ${response.status}）`,
+      )
+    }
+    credential = payload.data
+  } catch (error) {
+    // 未登录 / 凭证未配置时不匿名连接：置为未连接，稍后重试（登录页本身不需要 MQTT）
+    initStarted = false
+    notifyStatus(false)
+    console.warn('[MQTT] 获取只读凭证失败，不进行匿名降级：', error)
+    window.setTimeout(() => ensureClient(), 5_000)
+    return
+  }
 
   const url = import.meta.env.VITE_MQTT_WS || 'ws://127.0.0.1:9001'
   const clientId = `web-console-${Math.random().toString(16).slice(2, 10)}-${Date.now().toString(36)}`
 
   client = mqtt.connect(url, {
     clientId,
+    username: credential.username,
+    password: credential.password,
     clean: true,
     connectTimeout: 10_000,
     reconnectPeriod: 4_000,
@@ -87,8 +132,6 @@ function ensureClient(): MqttClient {
       })
     })
   })
-
-  return client
 }
 
 /**
@@ -100,7 +143,10 @@ export function subscribe(pattern: string, handler: MessageHandler): () => void 
   if (!handlers) {
     handlers = new Set<MessageHandler>()
     subscriptions.set(pattern, handlers)
-    ensureClient().subscribe(pattern, { qos: 1 })
+    ensureClient()
+    if (client?.connected) {
+      client.subscribe(pattern, { qos: 1 })
+    }
   }
   handlers.add(handler)
 

@@ -23,6 +23,27 @@
   Broker 在设备异常掉线时自动代为发布遗嘱 `offline`，网关无需依赖心跳超时才判定离线。
 - 指令回执 `cmd/ack` 是原需求「OTA 进度反馈」的标准化承载方式，避免为 OTA 单独开一类 Topic。
 
+### 1.1 Broker 鉴权与主体—Topic 矩阵（v1.17.0）
+
+Broker 的 1883（MQTT over TCP）与 9001（MQTT over WebSocket）**均关闭匿名**，
+使用 `per_listener_settings true` 分监听加载各自的 `password_file` 与 `acl_file`；
+账号口令由 `scripts/mqtt_credentials.py` 生成，`infra/mosquitto/passwd` 不入库。
+
+| 主体 | 监听 | 身份来源 | 可读 Topic | 可写 Topic |
+| --- | --- | --- | --- | --- |
+| 网关 `iot-gateway` | 1883 | 网关环境变量 `MQTT_USERNAME` / `MQTT_PASSWORD` | `device/+/sensor/report`、`device/+/status`、`device/+/cmd/ack` | `device/+/cmd`、`device/system/alert`、`device/system/group`、`gateway/status` |
+| 设备 `<deviceId>` | 1883 | 设备凭证，用户名恒等于 `deviceId` | `device/<deviceId>/#`（自己的整棵子树） | `device/<deviceId>/sensor/report`、`device/<deviceId>/status`、`device/<deviceId>/cmd/ack` |
+| Web `web-console` | 9001 | 登录后 `GET /api/auth/mqtt-credentials?client=web` 下发 | `device/+/sensor/report`、`device/+/status`、`device/+/cmd/ack`、`device/system/alert`、`device/system/group` | 无（ACL 不含任何 write） |
+| 移动端 `mobile-console` | 9001 | 登录后 `GET /api/auth/mqtt-credentials?client=mobile` 下发 | 同上 | 无（ACL 不含任何 write） |
+| 匿名 | 1883 / 9001 | — | 无 | 无（CONNACK 拒绝，rc=5 / paho 映射 135） |
+
+关键约束：
+
+- 设备**不能发布** `device/<deviceId>/cmd`（指令只能由网关下发），也不能写 `device/system/*`；
+- 设备可读自己的整棵子树，用于自检与回读；`%u` 只替换为当前连接用户名，读不到其他设备；
+- Web / 移动端是独立只读主体，即使拿到口令也无法通过 9001 发布设备上报 Topic；
+- Mosquitto 对 ACL 拒绝的订阅可能仍返回 SUBACK granted，**隔离以投递结果为准**（收不到消息）。
+
 ---
 
 ## 2. MQTT 消息体（JSON，UTF-8）
@@ -163,6 +184,7 @@
 | --- | --- | --- |
 | POST | `/api/auth/login` | 登录，入参 `{username, password}`，返回 `{token, user:{username, role}}` |
 | GET | `/api/auth/me` | 返回数据库中的最新账号信息（角色被调整后前端刷新即可生效） |
+| GET | `/api/auth/mqtt-credentials?client=web\|mobile` | 登录后换取客户端只读 MQTT 凭证（v1.17.0） |
 
 后续请求头：`Authorization: Bearer <token>`。登录凭证校验数据库 `app_user` 表，
 口令以 PBKDF2-SHA256 哈希存储。角色与权限矩阵：
@@ -191,6 +213,30 @@
 至少 `PASSWORD_MIN_LENGTH`（默认 8）位，且拒绝常见弱口令；不合规返回 400 与可读文案。
 既有账号的口令不做回溯校验，继续可登录。
 
+**客户端 MQTT 凭证（v1.17.0）**：`GET /api/auth/mqtt-credentials?client=web|mobile`
+需登录（任意角色），返回：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "client": "web",
+    "username": "web-console",
+    "password": "<服务端生成的只读口令>",
+    "read_only": true,
+    "topics": ["device/+/sensor/report", "device/+/status", "device/+/cmd/ack",
+               "device/system/alert", "device/system/group"]
+  }
+}
+```
+
+- 口令来自服务端环境变量 `MQTT_WEB_PASSWORD` / `MQTT_MOBILE_PASSWORD`，**不进入前端构建产物**；
+- 未配置口令返回 503；`client` 仅接受 `web` / `mobile`，其他值 422；
+- Web 与移动端使用各自独立账号，9001 监听的 ACL 只有 read 规则，无任何 write；
+- 客户端实现：Web 登录后先取凭证再 `mqtt.connect`，取不到时保持未连接并重试，**不匿名降级**；
+  移动端在实时服务启动前调用同一接口，失败则提示并降级 REST 轮询。
+
 ### 3.2 设备
 
 | 方法 | 路径 | 说明 |
@@ -199,6 +245,7 @@
 | GET | `/api/devices/groups` | 分组概览：每组 `total` / `online` / `offline` |
 | POST | `/api/devices` | 手工注册设备，入参 `device_id`（3~64 位字母数字 _-）、`name`、`model`、`firmware_version`、`group_name`；重复 ID 返回 409 |
 | POST | `/api/devices/bulk` | 批量注册，单次最多 200 台，返回 `{created, skipped}`，重复 ID 跳过 |
+| POST | `/api/devices/{deviceId}/mqtt-credential` | 签发/轮换设备 MQTT 凭证（operator+admin，v1.17.0） |
 | PATCH | `/api/devices/{deviceId}` | 编辑名称 / 型号 / 固件版本 / 分组；设备 ID 与状态不可改 |
 | DELETE | `/api/devices/{deviceId}` | 删除设备（仅 admin）；存在历史时序数据时返回 409 |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
@@ -226,7 +273,37 @@ v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹�
 `GET /api/devices/groups` 也把空分组名与「未分组」合并为同一个 `未分组` 桶（`total` / `online` / `offline` 累加）。
 不传 `group` 时行为不变；普通组名筛选语义不变。
 
-写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
+写操作权限：注册 / 批量注册 / 编辑 / 签发设备凭证为 operator+admin，删除为 admin。
+
+**设备 MQTT 凭证（v1.17.0）**：`POST /api/devices/{deviceId}/mqtt-credential`
+
+- 用户名恒等于 `device_id`，凭证与 `deviceId` 强绑定；每次调用都会生成新口令并覆盖旧值，
+  因此同一接口既是**首次签发**也是**轮换**。设备注册后、首次连接 Broker 前必须调用一次。
+- 响应中的 `password` **只在本次响应出现一次**，平台不提供再次查看；请立即写入设备的安全存储。
+  ```json
+  {
+    "code": 0,
+    "message": "ok",
+    "data": {
+      "device_id": "dev-0001",
+      "username": "dev-0001",
+      "password": "<仅本次返回的随机口令>",
+      "version": 2,
+      "issued_at": "2026-11-05T10:00:00+00:00",
+      "rotated_at": "2026-11-05T10:00:00+00:00",
+      "reloaded": true,
+      "reload_detail": "已向 Mosquitto（pid=12345）发送 SIGHUP"
+    }
+  }
+  ```
+- 存储位置：Broker 的 `password_file` 只保存 PBKDF2-SHA512 hash；`device` 表只保存
+  `mqtt_username`、`mqtt_credential_version`、SHA-256 `fingerprint`、签发/轮换时间，
+  **不保存明文口令**。`DeviceOut` 返回上述元数据，不返回 fingerprint 与口令。
+- `reloaded=false` 表示口令已写入但 Broker 未重载（此时旧口令仍有效），`reload_detail`
+  给出原因；可手工执行 SIGHUP 后重试连接。
+- 写密码文件失败返回 503；设备不存在返回 404；未登录 401、viewer 403。
+- 轮换后旧凭证在 Broker 重载后立即失效；吊销使用
+  `scripts/mqtt_credentials.py revoke --subject device:<deviceId> --reload`。
 
 v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入口（后台没有批量改分组），
 分组变化时网关额外发布 2.6 的 `device/system/group` 事件；接口入参、响应与错误语义不变，
@@ -458,6 +535,11 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | status | varchar(16) | online / offline |
 | last_report_at | timestamptz | 最后上报时间 |
 | last_online_at | timestamptz | 最后上线时间 |
+| mqtt_username | varchar(64) | MQTT 用户名，恒等于 device_id（v1.17.0） |
+| mqtt_credential_version | int | 凭证版本，每次签发/轮换 +1（v1.17.0） |
+| mqtt_credential_fingerprint | varchar(64) | 口令 SHA-256 指纹，用于对账；**不存明文**（v1.17.0） |
+| mqtt_credential_issued_at | timestamptz | 首次签发时间（v1.17.0） |
+| mqtt_credential_rotated_at | timestamptz | 最近轮换时间（v1.17.0） |
 | created_at / updated_at | timestamptz | 时间戳 |
 
 ### 4.2 `sensor_record` 传感器时序表

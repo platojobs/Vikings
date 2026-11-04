@@ -8,11 +8,16 @@
 用法：
     python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
     python scripts/simulate_device.py --device-id dev-0001 --voltage 2.9   # 触发严重告警
+
+Broker 已关闭匿名，必须提供设备凭证：
+    python scripts/mqtt_credentials.py issue --subject device:dev-0001 --reload
+    MQTT_DEVICE_PASSWORD='<由上一命令输出的一次性口令>' python scripts/simulate_device.py --device-id dev-0001
 """
 
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 
@@ -28,6 +33,8 @@ class SimulatedDevice:
         self.device_id = args.device_id
         self.host = args.host
         self.port = args.port
+        self.username = args.username or self.device_id
+        self.password = args.password
         self.count = args.count
         self.interval = args.interval
         self.voltage = args.voltage
@@ -50,6 +57,8 @@ class SimulatedDevice:
             hostname=self.host,
             port=self.port,
             identifier="sim-" + self.device_id,
+            username=self.username,
+            password=self.password,
             will=will,
             keepalive=30,
         ) as client:
@@ -139,7 +148,23 @@ def main() -> None:
     parser.add_argument("--voltage", type=float, default=3.75)
     parser.add_argument("--temperature", type=float, default=24.0)
     parser.add_argument("--firmware", default="1.0.0")
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("MQTT_DEVICE_USERNAME", ""),
+        help="MQTT 用户名，默认等于 device-id（Broker ACL 用 %%u 绑定设备子树）",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("MQTT_DEVICE_PASSWORD", ""),
+        help="MQTT 口令，也可用 MQTT_DEVICE_PASSWORD 环境变量；Broker 已禁用匿名",
+    )
     args = parser.parse_args()
+    if not args.password:
+        parser.error(
+            "必须提供设备 MQTT 口令（--password 或 MQTT_DEVICE_PASSWORD）。"
+            "先执行 python scripts/mqtt_credentials.py issue --subject device:<device-id> --reload"
+        )
+    args.username = args.username or args.device_id
     asyncio.run(SimulatedDevice(args).run())
 
 

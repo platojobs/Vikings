@@ -12,10 +12,13 @@ services:
       - "1883:1883"   # 设备侧 MQTT over TCP
       - "9001:9001"   # 后台侧 MQTT over WebSocket
     volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - mosquitto-data:/mosquitto/data
+      # 整个配置目录挂载：mosquitto.conf + 生成的口令文件 + ACL + data
+      - ./mosquitto:/mosquitto/config
+    # 配置里使用相对路径（passwd/acl.device/...），工作目录必须与配置目录一致
+    working_dir: /mosquitto/config
     healthcheck:
-      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/broker/uptime' -C 1 -W 3 || exit 1"]
+      # 匿名已关闭，改用端口存活探测，避免在 healthcheck 里内嵌口令
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 1883 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -41,5 +44,4 @@ services:
       retries: 5
 
 volumes:
-  mosquitto-data:
   postgres-data:

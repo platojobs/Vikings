@@ -43,6 +43,21 @@ class Device(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="offline")
     last_report_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     last_online_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ---- MQTT 设备凭证元数据（Broker 侧口令文件存放 hash，本表不保存明文口令）----
+    # username 恒等于 device_id（ACL 使用 %u 替换），凭证与设备 ID 强绑定
+    mqtt_username: Mapped[str] = mapped_column(String(64), nullable=True)
+    # 轮换版本号：每次签发/轮换 +1，便于审计与客户端判断是否需要更新
+    mqtt_credential_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # 口令 SHA-256 指纹（不可反推口令），用于对账「当前 Broker 凭证是哪一次签发」
+    mqtt_credential_fingerprint: Mapped[str] = mapped_column(String(64), nullable=True)
+    mqtt_credential_issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    mqtt_credential_rotated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

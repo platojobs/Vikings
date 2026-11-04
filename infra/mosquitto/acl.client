@@ -1,0 +1,17 @@
+# 9001（WebSocket）监听专用 ACL：
+# 移动端与 Web 后台是独立只读主体；这里没有任何 write 规则，
+# 即使拿到设备口令也无法通过 9001 发布设备上报 Topic。
+
+user web-console
+topic read device/+/sensor/report
+topic read device/+/status
+topic read device/+/cmd/ack
+topic read device/system/alert
+topic read device/system/group
+
+user mobile-console
+topic read device/+/sensor/report
+topic read device/+/status
+topic read device/+/cmd/ack
+topic read device/system/alert
+topic read device/system/group

@@ -2,14 +2,21 @@
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_session
-from app.schemas import ApiResponse, LoginRequest, LoginResponse, UserInfo, UserOut
+from app.schemas import (
+    ApiResponse,
+    LoginRequest,
+    LoginResponse,
+    MqttClientCredentialOut,
+    UserInfo,
+    UserOut,
+)
 from app.security import create_access_token, require_user
-from app.services import audit_service, user_service
+from app.services import audit_service, mqtt_credential_service, user_service
 from app.services.login_guard import LoginRateLimiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -63,6 +70,24 @@ async def login(
     return ApiResponse(
         data=LoginResponse(token=token, user=UserInfo(username=user.username, role=user.role))
     )
+
+
+@router.get("/mqtt-credentials", response_model=ApiResponse[MqttClientCredentialOut])
+async def mqtt_credentials(
+    client: str = Query(default="web", pattern="^(web|mobile)$"),
+    _: dict = Depends(require_user),
+):
+    """登录后换取客户端只读 MQTT 凭证。
+
+    口令来自服务端环境变量（MQTT_WEB_PASSWORD / MQTT_MOBILE_PASSWORD），
+    不进入 Web/移动端构建产物；9001 监听的 ACL 只有 read 规则，
+    客户端即使拿到设备口令也无法发布设备上报 Topic。
+    """
+    try:
+        payload = mqtt_credential_service.client_credential(client)
+    except mqtt_credential_service.MqttCredentialError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return ApiResponse(data=MqttClientCredentialOut(**payload))
 
 
 @router.get("/me", response_model=ApiResponse[UserOut])

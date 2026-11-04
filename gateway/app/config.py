@@ -1,6 +1,7 @@
 """网关配置：全部通过环境变量注入，禁止在代码里硬编码连接信息。"""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit
 
@@ -66,6 +67,18 @@ class Settings(BaseSettings):
     mqtt_password: str = ""
     mqtt_client_id: str = "iot-gateway"
     mqtt_will_topic: str = "gateway/status"
+    # Broker 已关闭匿名：网关必须使用 iot-gateway 身份（ACL 见 infra/mosquitto/acl.device）
+    # 密码文件由 scripts/mqtt_credentials.py 生成，路径与 Broker 使用的一致
+    mqtt_password_file: str = "infra/mosquitto/passwd"
+    # 凭证变更后如何让 Broker 重新读取 passwd/acl；留空则自动使用 .run/mosquitto.pid
+    # Docker 部署可设为：docker compose -f infra/docker-compose.yml kill -s HUP mosquitto
+    mqtt_reload_command: str = ""
+    # 客户端只读身份：登录后通过 /api/auth/mqtt-credentials 下发给 Web / 移动端
+    # 口令只存在于服务端环境变量，不进入前端构建产物
+    mqtt_web_username: str = "web-console"
+    mqtt_web_password: str = ""
+    mqtt_mobile_username: str = "mobile-console"
+    mqtt_mobile_password: str = ""
 
     # ---- 鉴权 ----
     jwt_secret: str = "change-me-in-production"
@@ -143,6 +156,18 @@ class Settings(BaseSettings):
         netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@", 1)
         return parsed._replace(netloc=netloc).geturl()
 
+    @property
+    def mqtt_password_path(self) -> Path:
+        """Broker 密码文件的绝对路径；相对路径按仓库根目录解析。
+
+        网关进程通常从 `gateway/` 目录启动，而 Broker 配置里的相对路径
+        （`infra/mosquitto/passwd`）是按仓库根目录解析的，二者必须一致。
+        """
+        path = Path(self.mqtt_password_file)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parents[2] / path
+
     def security_warnings(self) -> List[str]:
         """开发/测试环境的醒目告警；生产环境由 validate_for_production 直接拦截。"""
         warnings: List[str] = []
@@ -158,6 +183,14 @@ class Settings(BaseSettings):
             warnings.append("ADMIN_PASSWORD 仍为默认/弱口令，仅适合本地开发")
         if self.is_sqlite:
             warnings.append("DATABASE_URL 使用 SQLite 默认值，仅适合本地开发")
+        if not self.mqtt_username or not self.mqtt_password:
+            warnings.append(
+                "MQTT_USERNAME/MQTT_PASSWORD 未配置；Broker 已关闭匿名，网关将无法连接"
+            )
+        if not self.mqtt_web_password or not self.mqtt_mobile_password:
+            warnings.append(
+                "MQTT_WEB_PASSWORD/MQTT_MOBILE_PASSWORD 未配置；登录后无法下发客户端只读凭证"
+            )
         return warnings
 
     def validate_for_production(self) -> None:
@@ -192,6 +225,19 @@ class Settings(BaseSettings):
                 or len(db_password) < 8
             ):
                 errors.append("DATABASE_URL 的数据库口令仍是默认/弱口令")
+
+        if not self.mqtt_username.strip() or not self.mqtt_password.strip():
+            errors.append(
+                "MQTT_USERNAME/MQTT_PASSWORD 未配置；生产 Broker 禁止匿名，网关无法接入"
+            )
+        elif self.mqtt_username.strip() != "iot-gateway":
+            errors.append(
+                "MQTT_USERNAME 必须为 iot-gateway（与 infra/mosquitto/acl.device 的服务身份一致）"
+            )
+        if not self.mqtt_web_password.strip() or not self.mqtt_mobile_password.strip():
+            errors.append(
+                "MQTT_WEB_PASSWORD/MQTT_MOBILE_PASSWORD 未配置；无法向 Web/移动端下发只读凭证"
+            )
 
         if errors:
             raise RuntimeError(

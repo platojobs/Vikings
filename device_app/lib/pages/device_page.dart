@@ -20,6 +20,7 @@ class _DevicePageState extends State<DevicePage> {
   late final DeviceMqttService _service;
   late final TextEditingController _hostController;
   late final TextEditingController _deviceIdController;
+  late final TextEditingController _passwordController;
   late final TextEditingController _sleepController;
   late final TextEditingController _windowController;
 
@@ -32,6 +33,7 @@ class _DevicePageState extends State<DevicePage> {
     _service = DeviceMqttService(config: initial);
     _hostController = TextEditingController(text: initial.brokerHost);
     _deviceIdController = TextEditingController(text: initial.deviceId);
+    _passwordController = TextEditingController(text: initial.mqttPassword);
     _sleepController = TextEditingController(text: '${initial.sleepSec}');
     _windowController = TextEditingController(
       text: '${initial.commandWindowSec}',
@@ -42,6 +44,7 @@ class _DevicePageState extends State<DevicePage> {
   void dispose() {
     _hostController.dispose();
     _deviceIdController.dispose();
+    _passwordController.dispose();
     _sleepController.dispose();
     _windowController.dispose();
     _service.dispose();
@@ -64,6 +67,7 @@ class _DevicePageState extends State<DevicePage> {
       await _service.applySettings(
         brokerHost: _hostController.text,
         deviceId: _deviceIdController.text,
+        mqttPassword: _passwordController.text,
         sleepSec: sleepSec,
         commandWindowSec: windowSec,
       );
@@ -385,6 +389,20 @@ class _DevicePageState extends State<DevicePage> {
                         controller: _deviceIdController,
                         decoration: const InputDecoration(
                           labelText: '设备 ID',
+                          helperText: 'MQTT 用户名同一值',
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 190,
+                      child: TextField(
+                        controller: _passwordController,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: 'MQTT 口令',
+                          helperText: 'Broker 已禁用匿名',
                           isDense: true,
                           border: OutlineInputBorder(),
                         ),

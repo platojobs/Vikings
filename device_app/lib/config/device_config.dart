@@ -11,6 +11,7 @@ class DeviceConfig {
     this.commandWindowSec = 8,
     this.reportIntervalSec = 30,
     this.firmwareVersion = '1.0.0',
+    this.mqttPassword = '',
   });
 
   /// MQTT Broker 主机地址。
@@ -34,6 +35,10 @@ class DeviceConfig {
   /// 当前固件版本，OTA 成功后更新，并在下一次上线状态报文中携带。
   final String firmwareVersion;
 
+  /// 设备 MQTT 口令。用户名恒等于 [deviceId]（Broker ACL 按 %u 隔离子树）；
+  /// 凭证由 `scripts/mqtt_credentials.py` 或设备凭证接口签发，轮换后需在设置页更新。
+  final String mqttPassword;
+
   DeviceConfig copyWith({
     String? brokerHost,
     int? brokerPort,
@@ -42,6 +47,7 @@ class DeviceConfig {
     int? commandWindowSec,
     int? reportIntervalSec,
     String? firmwareVersion,
+    String? mqttPassword,
   }) {
     return DeviceConfig(
       brokerHost: brokerHost ?? this.brokerHost,
@@ -51,6 +57,7 @@ class DeviceConfig {
       commandWindowSec: commandWindowSec ?? this.commandWindowSec,
       reportIntervalSec: reportIntervalSec ?? this.reportIntervalSec,
       firmwareVersion: firmwareVersion ?? this.firmwareVersion,
+      mqttPassword: mqttPassword ?? this.mqttPassword,
     );
   }
 }

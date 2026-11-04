@@ -75,6 +75,25 @@ def _migrate_columns(sync_conn) -> None:
         sync_conn.execute(
             text("ALTER TABLE device ADD COLUMN group_name VARCHAR(64) NOT NULL DEFAULT '默认分组'")
         )
+    # v1.17.0：设备 MQTT 凭证元数据（不保存明文口令）
+    if "mqtt_username" not in columns:
+        sync_conn.execute(text("ALTER TABLE device ADD COLUMN mqtt_username VARCHAR(64)"))
+    if "mqtt_credential_version" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE device ADD COLUMN mqtt_credential_version INTEGER NOT NULL DEFAULT 0")
+        )
+    if "mqtt_credential_fingerprint" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE device ADD COLUMN mqtt_credential_fingerprint VARCHAR(64)")
+        )
+    if "mqtt_credential_issued_at" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE device ADD COLUMN mqtt_credential_issued_at TIMESTAMP")
+        )
+    if "mqtt_credential_rotated_at" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE device ADD COLUMN mqtt_credential_rotated_at TIMESTAMP")
+        )
 
 
 async def dispose_engine() -> None:

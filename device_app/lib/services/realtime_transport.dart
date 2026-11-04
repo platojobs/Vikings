@@ -47,6 +47,8 @@ class MqttWebSocketTransport implements RealtimeTransport {
   MqttWebSocketTransport({
     required this.url,
     required this.clientId,
+    this.username = '',
+    this.password = '',
     this.topics = const <String>[
       'device/system/alert',
       'device/system/group',
@@ -58,6 +60,10 @@ class MqttWebSocketTransport implements RealtimeTransport {
   /// 形如 `ws://192.168.1.8:9001`。
   final String url;
   final String clientId;
+
+  /// Broker 已关闭匿名：必须使用登录后由网关下发的只读凭证。
+  final String username;
+  final String password;
   final List<String> topics;
 
   final StreamController<RealtimeMessage> _messages =
@@ -93,7 +99,10 @@ class MqttWebSocketTransport implements RealtimeTransport {
     client.onDisconnected = _notifyDisconnected;
 
     try {
-      await client.connect();
+      await client.connect(
+        username.isEmpty ? null : username,
+        username.isEmpty ? null : password,
+      );
     } catch (error) {
       _safeDisconnect(client);
       throw RealtimeConnectException('实时连接失败：$error');
