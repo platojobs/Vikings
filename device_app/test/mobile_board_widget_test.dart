@@ -42,6 +42,18 @@ const AlertItem _openAlert = AlertItem(
   status: 'open',
 );
 
+const AlertItem _secondAlert = AlertItem(
+  alertId: 'alt-0002',
+  deviceId: 'dev-0002',
+  level: 'warning',
+  metric: 'humidity',
+  value: 90,
+  threshold: 85,
+  message: '湿度过高',
+  aiGenerated: false,
+  status: 'open',
+);
+
 const AlertItem _ackedAlert = AlertItem(
   alertId: 'alt-0001',
   deviceId: 'dev-0001',
@@ -130,6 +142,7 @@ class _FakeApiClient extends ApiClient {
     List<DeviceSummary>? devices,
     List<SensorReading>? readings,
     List<AlertItem>? alerts,
+    this.stats,
   }) : devices = devices ?? const <DeviceSummary>[_device],
        readings = readings ?? const <SensorReading>[_reading],
        alerts = alerts ?? const <AlertItem>[_openAlert],
@@ -141,11 +154,19 @@ class _FakeApiClient extends ApiClient {
   final List<DeviceSummary> devices;
   final List<SensorReading> readings;
   final List<AlertItem> alerts;
+  final StatsOverview? stats;
 
   int loginCalls = 0;
   int fetchCalls = 0;
   int sendCalls = 0;
   int ackCalls = 0;
+
+  /// 最近一次设备请求参数，用于断言搜索/筛选已转为服务端参数。
+  int lastPage = 0;
+  String? lastKeyword;
+  String? lastStatus;
+  bool lastHasAlert = false;
+  int alertFetchCalls = 0;
 
   @override
   Future<AuthSession> login({
@@ -157,23 +178,128 @@ class _FakeApiClient extends ApiClient {
   }
 
   @override
-  Future<List<DeviceSummary>> fetchDevices({required String token}) async {
+  Future<DevicePage> fetchDevices({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+    String? status,
+    String? keyword,
+    bool hasAlert = false,
+    bool withAlertCount = false,
+  }) async {
     fetchCalls += 1;
+    lastPage = page;
+    lastKeyword = keyword;
+    lastStatus = status;
+    lastHasAlert = hasAlert;
     final error = fetchError;
     if (error != null) {
       throw error;
     }
-    return devices;
+
+    // 模拟网关：关键词 / 状态 / 有告警均在服务端过滤，再按 page/pageSize 切片
+    var filtered = devices;
+    if (keyword != null && keyword.isNotEmpty) {
+      final needle = keyword.toLowerCase();
+      filtered = filtered
+          .where(
+            (item) =>
+                item.deviceId.toLowerCase().contains(needle) ||
+                item.name.toLowerCase().contains(needle),
+          )
+          .toList(growable: false);
+    }
+    if (status == 'online') {
+      filtered = filtered.where((item) => item.status == 'online').toList();
+    } else if (status == 'offline') {
+      filtered = filtered.where((item) => item.status != 'online').toList();
+    }
+    if (hasAlert) {
+      final alertIds = alerts
+          .where((item) => item.status == 'open')
+          .map((item) => item.deviceId)
+          .toSet();
+      filtered = filtered
+          .where(
+            (item) =>
+                item.openAlertCount > 0 || alertIds.contains(item.deviceId),
+          )
+          .toList(growable: false);
+    }
+
+    final total = filtered.length;
+    final start = (page - 1) * pageSize;
+    final items = start >= total
+        ? const <DeviceSummary>[]
+        : filtered.sublist(
+            start,
+            start + pageSize > total ? total : start + pageSize,
+          );
+    final stamped = withAlertCount
+        ? items.map((item) {
+            final count = alerts
+                .where(
+                  (alert) =>
+                      alert.status == 'open' && alert.deviceId == item.deviceId,
+                )
+                .length;
+            return item.copyWith(
+              openAlertCount: item.openAlertCount > count
+                  ? item.openAlertCount
+                  : count,
+            );
+          }).toList(growable: false)
+        : items;
+    return DevicePage(
+      items: stamped,
+      total: total,
+      page: page,
+      pageSize: pageSize,
+    );
   }
 
   @override
   Future<List<SensorReading>> fetchLatestReadings({
     required String token,
-  }) async => readings;
+    List<String>? deviceIds,
+  }) async {
+    if (deviceIds == null) {
+      return readings;
+    }
+    if (deviceIds.isEmpty) {
+      return const <SensorReading>[];
+    }
+    return readings
+        .where((item) => deviceIds.contains(item.deviceId))
+        .toList(growable: false);
+  }
 
   @override
-  Future<List<AlertItem>> fetchOpenAlerts({required String token}) async =>
-      alerts;
+  Future<AlertPage> fetchOpenAlerts({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+  }) async {
+    alertFetchCalls += 1;
+    final open = alerts.where((item) => item.status == 'open').toList();
+    final total = open.length;
+    final start = (page - 1) * pageSize;
+    final items = start >= total
+        ? const <AlertItem>[]
+        : open.sublist(start, start + pageSize > total ? total : start + pageSize);
+    return AlertPage(items: items, total: total, page: page, pageSize: pageSize);
+  }
+
+  @override
+  Future<StatsOverview> fetchStatsOverview({required String token}) async =>
+      stats ??
+      StatsOverview(
+        deviceTotal: devices.length,
+        deviceOnline: devices.where((item) => item.status == 'online').length,
+        deviceOffline: devices.where((item) => item.status != 'online').length,
+        reportToday: 0,
+        alertOpen: alerts.where((item) => item.status == 'open').length,
+      );
 
   @override
   Future<List<CommandItem>> fetchCommands({
@@ -312,8 +438,10 @@ void main() {
     expect(api.loginCalls, 1);
     expect(find.text('移动看板'), findsOneWidget);
     expect(find.text('一号机'), findsOneWidget);
-    expect(find.text('温度过高'), findsOneWidget);
     expect(find.text('admin · admin'), findsOneWidget);
+    // 分页页脚后告警区可能落在首屏之外，滚动后再断言
+    await _scrollTo(tester, find.text('温度过高'));
+    expect(find.text('温度过高'), findsOneWidget);
   });
 
   testWidgets('指令下发：填写 → 二次确认 → 展示回执', (tester) async {
@@ -552,7 +680,7 @@ void main() {
     expect(find.text('在线'), findsWidgets);
   });
 
-  testWidgets('设备列表按 20 条分批渲染，可加载更多', (tester) async {
+  testWidgets('服务端分页：滚动到底自动加载下一页并显示没有更多了', (tester) async {
     final devices = List<DeviceSummary>.generate(25, (index) {
       final id = 'dev-${index.toString().padLeft(2, '0')}';
       return DeviceSummary(
@@ -568,24 +696,119 @@ void main() {
     await _pumpBoard(tester, api: api, session: _adminSession);
     await tester.pumpAndSettle();
 
-    await tester.scrollUntilVisible(
-      find.textContaining('加载更多（已显示 20 / 25）'),
-      240,
-      scrollable: find.byType(Scrollable).first,
-    );
-    expect(find.textContaining('加载更多（已显示 20 / 25）'), findsOneWidget);
+    // 首屏只请求第 1 页（20 台），不再一次拉 100 台
+    expect(api.fetchCalls, 1);
+    expect(api.lastPage, 1);
+    expect(find.text('设备 dev-20'), findsNothing);
 
-    await _scrollTo(tester, find.textContaining('加载更多'));
-    await tester.tap(find.textContaining('加载更多'));
-    await tester.pumpAndSettle();
-    expect(find.textContaining('加载更多'), findsNothing);
+    // 页脚进入视口即自动请求第 2 页，无需手动点击
+    for (var i = 0; i < 12 && api.lastPage == 1; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
 
-    await tester.scrollUntilVisible(
-      find.text('设备 dev-24'),
-      240,
-      scrollable: find.byType(Scrollable).first,
-    );
+    expect(api.lastPage, 2);
+    expect(api.fetchCalls, greaterThanOrEqualTo(2));
+
+    // 第二页追加后页脚下移，继续下拉到末页
+    for (var i = 0; i < 6; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+    expect(find.text('没有更多了'), findsOneWidget);
     expect(find.text('设备 dev-24'), findsOneWidget);
+  });
+
+  testWidgets('搜索重置分页：已翻页后回到第 1 页', (tester) async {
+    final devices = List<DeviceSummary>.generate(25, (index) {
+      final id = 'dev-${index.toString().padLeft(2, '0')}';
+      return DeviceSummary(
+        deviceId: id,
+        name: '设备 $id',
+        model: 'Battery-Sensor',
+        firmwareVersion: '1.0.0',
+        groupName: '默认分组',
+        status: 'online',
+      );
+    });
+    final api = _FakeApiClient(devices: devices);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    for (var i = 0; i < 12 && api.lastPage == 1; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+    expect(api.lastPage, 2);
+
+    // 回到顶部搜索：请求参数变为 keyword，且 page 重置为 1
+    await tester.drag(find.byType(ListView).first, const Offset(0, 3000));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'dev-24');
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+    expect(api.lastKeyword, 'dev-24');
+    expect(find.text('设备 dev-24'), findsOneWidget);
+    expect(find.text('设备 dev-00'), findsNothing);
+    expect(find.text('筛选结果：1 台 / 全部 25 台'), findsOneWidget);
+    expect(find.text('没有更多了'), findsOneWidget);
+  });
+
+  testWidgets('有告警筛选使用服务端聚合计数，角标与结果一致', (tester) async {
+    final api = _FakeApiClient(
+      devices: [_device, _secondDevice.copyWith(openAlertCount: 3)],
+      alerts: const [_secondAlert],
+      // 汇总卡使用服务端全量统计：即使只加载 1 页 2 台，总量仍为 10 台
+      stats: const StatsOverview(
+        deviceTotal: 10,
+        deviceOnline: 8,
+        deviceOffline: 2,
+        reportToday: 0,
+        alertOpen: 1,
+      ),
+    );
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ChoiceChip, '有告警'));
+    await tester.pumpAndSettle();
+
+    // 筛选转为服务端参数，不依赖告警列表前 50 条
+    expect(api.lastHasAlert, isTrue);
+    expect(api.lastStatus, isNull);
+    expect(api.lastPage, 1);
+    expect(find.text('二号机'), findsOneWidget);
+    expect(find.text('一号机'), findsNothing);
+    // 卡片角标来自服务端聚合的 open_alert_count
+    expect(find.text('告警 3'), findsOneWidget);
+    expect(find.text('筛选结果：1 台 / 全部 10 台'), findsOneWidget);
+
+    // 告警总数来自服务端 total，而不是已加载列表长度；汇总卡同理
+    expect(find.text('未处理告警（1）'), findsOneWidget);
+    expect(find.text('10'), findsOneWidget);
+    expect(find.text('8'), findsOneWidget);
+  });
+
+  testWidgets('末页显示没有更多了，空结果展示空状态', (tester) async {
+    final api = _FakeApiClient(devices: const [_device, _secondDevice]);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    await _scrollTo(tester, find.text('没有更多了'));
+    expect(find.text('没有更多了'), findsOneWidget);
+    expect(find.textContaining('上拉加载更多'), findsNothing);
+
+    // 回到顶部再输入，避免搜索框不在视口内
+    await tester.drag(find.byType(ListView).first, const Offset(0, 3000));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '不存在的设备');
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+
+    expect(find.text('没有匹配的设备'), findsOneWidget);
+    expect(find.text('没有更多了'), findsNothing);
   });
 
   testWidgets('筛选生效期间实时事件仍落到设备并驱动筛选结果', (tester) async {

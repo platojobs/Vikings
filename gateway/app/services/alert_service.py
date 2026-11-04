@@ -144,6 +144,24 @@ async def count_open_alerts(session: AsyncSession) -> int:
     return int((await session.execute(stmt)).scalar_one())
 
 
+async def open_alert_counts_by_device(
+    session: AsyncSession, device_ids: List[str]
+) -> Dict[str, int]:
+    """按设备聚合未处理告警数。
+
+    移动看板一次只加载一页设备，这里按当前页设备 ID 批量聚合，
+    避免依赖 `GET /api/alerts?pageSize=50` 的前 50 条，也避免 N+1 查询。
+    """
+    if not device_ids:
+        return {}
+    stmt = (
+        select(DeviceAlert.device_id, func.count())
+        .where(DeviceAlert.status == "open", DeviceAlert.device_id.in_(device_ids))
+        .group_by(DeviceAlert.device_id)
+    )
+    return {device_id: int(count) for device_id, count in (await session.execute(stmt)).all()}
+
+
 async def alert_summary(session: AsyncSession) -> Dict:
     """告警中心顶部统计：未处理数 / 未处理严重数 / 今日新增数。"""
     open_stmt = select(func.count()).select_from(DeviceAlert).where(DeviceAlert.status == "open")

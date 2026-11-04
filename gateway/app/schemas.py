@@ -121,6 +121,8 @@ class DeviceOut(BaseModel):
     status: str
     last_report_at: Optional[datetime] = None
     last_online_at: Optional[datetime] = None
+    # 仅 when withAlertCount=true 时填充；默认 None 保持既有返回结构不变
+    open_alert_count: Optional[int] = None
 
     model_config = {"from_attributes": True}
 

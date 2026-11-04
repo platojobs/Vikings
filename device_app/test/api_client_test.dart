@@ -274,10 +274,69 @@ void main() {
       ),
     );
 
-    final devices = await client.fetchDevices(token: 'token');
+    final page = await client.fetchDevices(token: 'token');
 
-    expect(devices, hasLength(1));
-    expect(devices.first.deviceId, 'dev-0001');
-    expect(devices.first.online, isTrue);
+    expect(page.items, hasLength(1));
+    expect(page.items.first.deviceId, 'dev-0001');
+    expect(page.items.first.online, isTrue);
+    expect(page.total, 2);
+    expect(page.pageSize, 20);
+  });
+
+  test('设备分页/筛选/聚合告警参数正确下发', () async {
+    late http.Request captured;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return _jsonResponse(
+          _ok(<String, dynamic>{
+            'items': <dynamic>[],
+            'total': 0,
+            'page': 3,
+            'page_size': 20,
+          }),
+        );
+      }),
+    );
+
+    await client.fetchDevices(
+      token: 'token',
+      page: 3,
+      pageSize: 20,
+      status: 'online',
+      keyword: 'dev',
+      hasAlert: true,
+      withAlertCount: true,
+    );
+
+    expect(captured.url.path, '/api/devices');
+    expect(captured.url.queryParameters, <String, String>{
+      'page': '3',
+      'pageSize': '20',
+      'status': 'online',
+      'keyword': 'dev',
+      'hasAlert': 'true',
+      'withAlertCount': 'true',
+    });
+  });
+
+  test('deviceIds 为空时跳过最新值请求', () async {
+    var calls = 0;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((_) async {
+        calls += 1;
+        return _jsonResponse(_ok(const <dynamic>[]));
+      }),
+    );
+
+    final rows = await client.fetchLatestReadings(
+      token: 'token',
+      deviceIds: const <String>[],
+    );
+
+    expect(rows, isEmpty);
+    expect(calls, 0);
   });
 }

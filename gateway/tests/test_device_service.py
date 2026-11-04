@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import models  # noqa: F401  注册 ORM 元数据
 from app.database import Base
-from app.models import SensorRecord
-from app.services import device_service
+from app.models import DeviceAlert, SensorRecord
+from app.services import alert_service, device_service
 
 
 def _run(tmp_path, scenario):
@@ -229,5 +229,133 @@ def test_latest_records_filters_and_pagination(tmp_path):
         assert [
             row.device_id for row in await device_service.latest_records_all(session, limit=1, offset=1)
         ] == ["dev-a"]
+
+    _run(tmp_path, scenario)
+
+
+def test_list_devices_pagination_boundaries(tmp_path):
+    """首屏 / 翻页 / 末页 / 越界 page：total 始终为过滤后总数，越界返回空列表。"""
+    async def scenario(session):
+        for index in range(25):
+            await device_service.create_device(
+                session, f"dev-{index:02d}", f"设备 {index}", "VG-S100", "1.0.0", "默认分组"
+            )
+
+        page1, total = await device_service.list_devices(session, None, None, 1, 10)
+        page2, _ = await device_service.list_devices(session, None, None, 2, 10)
+        page3, _ = await device_service.list_devices(session, None, None, 3, 10)
+        page99, total99 = await device_service.list_devices(session, None, None, 99, 10)
+
+        assert total == 25 and total99 == 25
+        assert [item.device_id for item in page1] == [f"dev-{i:02d}" for i in range(10)]
+        assert [item.device_id for item in page2] == [f"dev-{i:02d}" for i in range(10, 20)]
+        assert [item.device_id for item in page3] == [f"dev-{i:02d}" for i in range(20, 25)]
+        assert page99 == []
+
+    _run(tmp_path, scenario)
+
+
+def _add_alert(session, alert_id: str, device_id: str, status: str = "open") -> None:
+    session.add(
+        DeviceAlert(
+            alert_id=alert_id,
+            device_id=device_id,
+            level="warning",
+            metric="temperature",
+            value=80.0,
+            threshold=75.0,
+            message="测试告警",
+            ai_generated=False,
+            status=status,
+        )
+    )
+
+
+def test_list_devices_has_alert_filter_and_aggregate_counts(tmp_path):
+    """有告警筛选按数据库聚合，与告警列表分页大小无关；计数按设备正确归并。"""
+    async def scenario(session):
+        for index in range(3):
+            await device_service.create_device(
+                session, f"dev-{index}", f"设备 {index}", "VG-S100", "1.0.0", "默认分组"
+            )
+        _add_alert(session, "alt-a1", "dev-0")
+        _add_alert(session, "alt-a2", "dev-0")
+        _add_alert(session, "alt-b1", "dev-1")
+        _add_alert(session, "alt-c1", "dev-2", status="acked")
+        await session.flush()
+
+        devices, total = await device_service.list_devices(
+            session, None, None, 1, 20, has_alert=True
+        )
+        assert total == 2
+        assert [item.device_id for item in devices] == ["dev-0", "dev-1"]
+
+        # 分页边界下 total 仍为聚合后的总数，不受 pageSize 影响
+        _page1, total_small = await device_service.list_devices(
+            session, None, None, 1, 1, has_alert=True
+        )
+        assert total_small == 2
+
+        counts = await alert_service.open_alert_counts_by_device(
+            session, ["dev-0", "dev-1", "dev-2"]
+        )
+        assert counts == {"dev-0": 2, "dev-1": 1}
+        assert await alert_service.open_alert_counts_by_device(session, []) == {}
+
+        # 组合筛选：有告警 + 关键词，只命中 dev-0
+        both, total_both = await device_service.list_devices(
+            session, None, "设备 0", 1, 20, has_alert=True
+        )
+        assert total_both == 1
+        assert both[0].device_id == "dev-0"
+
+    _run(tmp_path, scenario)
+
+
+def test_list_devices_default_new_params_off(tmp_path):
+    """回归：不传 has_alert 时结果与显式 False 完全一致。"""
+    async def scenario(session):
+        for index in range(3):
+            await device_service.create_device(
+                session, f"dev-{index}", f"设备 {index}", "VG-S100", "1.0.0", "默认分组"
+            )
+            _add_alert(session, f"alt-{index}", f"dev-{index}")
+        await session.flush()
+
+        default, total_default = await device_service.list_devices(session, None, None, 1, 20)
+        explicit, total_explicit = await device_service.list_devices(
+            session, None, None, 1, 20, has_alert=False
+        )
+        assert total_default == total_explicit == 3
+        assert [item.device_id for item in default] == [item.device_id for item in explicit]
+
+    _run(tmp_path, scenario)
+
+
+def test_latest_records_device_ids_filter(tmp_path):
+    async def scenario(session):
+        for device_id in ("dev-a", "dev-b", "dev-c"):
+            await device_service.create_device(
+                session, device_id, device_id, "VG-S100", "1.0.0", "默认分组"
+            )
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        _add_record(session, "dev-a", base)
+        _add_record(session, "dev-b", base.replace(hour=1), seq=2)
+        _add_record(session, "dev-c", base.replace(hour=2), seq=3)
+        await session.flush()
+
+        # 只取当前页设备，顺序仍按时间倒序
+        rows = await device_service.latest_records_all(session, device_ids=["dev-a", "dev-c"])
+        assert [row.device_id for row in rows] == ["dev-c", "dev-a"]
+
+        # 空列表直接返回空，不触发全量查询
+        assert await device_service.latest_records_all(session, device_ids=[]) == []
+
+        # 回归：不传 device_ids 时仍返回全部设备各自最新一条
+        assert [row.device_id for row in await device_service.latest_records_all(session)] == [
+            "dev-c",
+            "dev-b",
+            "dev-a",
+        ]
 
     _run(tmp_path, scenario)

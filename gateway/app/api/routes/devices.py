@@ -22,7 +22,7 @@ from app.schemas import (
     to_utc_datetime,
 )
 from app.security import ROLE_ADMIN, ROLE_OPERATOR, require_role, require_user
-from app.services import audit_service, command_service, device_service
+from app.services import alert_service, audit_service, command_service, device_service
 
 router = APIRouter(prefix="/api", tags=["devices"])
 
@@ -32,17 +32,35 @@ async def list_devices(
     status: Optional[str] = Query(default=None, pattern="^(online|offline)$"),
     keyword: Optional[str] = Query(default=None, max_length=64),
     group: Optional[str] = Query(default=None, max_length=64),
+    hasAlert: bool = Query(default=False, description="仅返回存在未处理告警的设备"),
+    withAlertCount: bool = Query(default=False, description="返回每设备未处理告警数"),
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
+    """设备列表。
+
+    hasAlert / withAlertCount 均为可选且默认关闭：不传时返回结构与语义与历史一致。
+    告警计数在数据库层按设备聚合，不受 `/api/alerts` 的 pageSize 截断影响。
+    """
     items, total = await device_service.list_devices(
-        session, status, keyword, page, pageSize, group
+        session, status, keyword, page, pageSize, group, has_alert=hasAlert
     )
+    counts = {}
+    if withAlertCount:
+        counts = await alert_service.open_alert_counts_by_device(
+            session, [item.device_id for item in items]
+        )
+    out_items = []
+    for item in items:
+        out = DeviceOut.model_validate(item)
+        if withAlertCount:
+            out.open_alert_count = counts.get(item.device_id, 0)
+        out_items.append(out)
     return ApiResponse(
         data=PageOut[DeviceOut](
-            items=[DeviceOut.model_validate(item) for item in items],
+            items=out_items,
             total=total,
             page=page,
             page_size=pageSize,
@@ -219,15 +237,31 @@ async def latest_records(
     keyword: Optional[str] = Query(default=None, max_length=64),
     limit: Optional[int] = Query(default=None, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    deviceIds: Optional[str] = Query(
+        default=None,
+        max_length=8192,
+        description="逗号分隔的设备 ID，仅返回这些设备的最新值（最多 200 个）",
+    ),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
     """全局最新值。
 
-    status / keyword / limit / offset 均为可选参数；不传时返回结构与语义与历史一致
-    （全部设备各自最新一条、按时间倒序、不截断），因此老客户端无需改动。
+    status / keyword / limit / offset / deviceIds 均为可选参数；不传时返回结构与语义
+    与历史一致（全部设备各自最新一条、按时间倒序、不截断），因此老客户端无需改动。
     """
-    rows = await device_service.latest_records_all(session, status, keyword, limit, offset)
+    device_ids = None
+    if deviceIds is not None:
+        device_ids = []
+        for part in deviceIds.split(","):
+            part = part.strip()
+            if part and part not in device_ids:
+                device_ids.append(part)
+        if len(device_ids) > 200:
+            raise HTTPException(status_code=400, detail="deviceIds 单次最多 200 个")
+    rows = await device_service.latest_records_all(
+        session, status, keyword, limit, offset, device_ids
+    )
     return ApiResponse(data=[SensorRecordOut.model_validate(row) for row in rows])
 
 

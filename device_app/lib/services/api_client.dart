@@ -44,23 +44,57 @@ class ApiClient {
     );
   }
 
-  Future<List<DeviceSummary>> fetchDevices({required String token}) async {
+  /// 服务端分页设备列表。
+  ///
+  /// `hasAlert` 由网关按未处理告警聚合筛选；`withAlertCount` 返回每设备告警数，
+  /// 两者都不受告警列表 pageSize 影响。关键词与状态同样转为请求参数。
+  Future<DevicePage> fetchDevices({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+    String? status,
+    String? keyword,
+    bool hasAlert = false,
+    bool withAlertCount = false,
+  }) async {
     final data = await _send(
       'GET',
       '/api/devices',
       token: token,
-      query: <String, String>{'page': '1', 'pageSize': '100'},
+      query: <String, String>{
+        'page': '$page',
+        'pageSize': '$pageSize',
+        if (status != null && status.isNotEmpty) 'status': status,
+        if (keyword != null && keyword.isNotEmpty) 'keyword': keyword,
+        if (hasAlert) 'hasAlert': 'true',
+        if (withAlertCount) 'withAlertCount': 'true',
+      },
     );
     if (data is! Map<String, dynamic>) {
       throw const ApiException(ApiErrorKind.invalidResponse, '设备列表响应缺少 data');
     }
-    return _mapList(data['items'], DeviceSummary.fromJson);
+    return DevicePage.fromJson(data);
   }
 
+  /// 每设备最新一条上报。
+  ///
+  /// 传入 [deviceIds] 时只取当前已加载页的设备，避免一次拉取全量设备最新值；
+  /// 传空列表直接返回空，不发请求。
   Future<List<SensorReading>> fetchLatestReadings({
     required String token,
+    List<String>? deviceIds,
   }) async {
-    final data = await _send('GET', '/api/records/latest', token: token);
+    if (deviceIds != null && deviceIds.isEmpty) {
+      return const <SensorReading>[];
+    }
+    final data = await _send(
+      'GET',
+      '/api/records/latest',
+      token: token,
+      query: deviceIds == null
+          ? null
+          : <String, String>{'deviceIds': deviceIds.join(',')},
+    );
     return _mapList(data, SensorReading.fromJson);
   }
 
@@ -79,18 +113,35 @@ class ApiClient {
     return _mapList(data, SensorReading.fromJson);
   }
 
-  Future<List<AlertItem>> fetchOpenAlerts({required String token}) async {
+  /// 未处理告警分页列表，`total` 为服务端全量未处理数。
+  Future<AlertPage> fetchOpenAlerts({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+  }) async {
     final data = await _send(
       'GET',
       '/api/alerts',
       token: token,
-      query: <String, String>{'status': 'open', 'page': '1', 'pageSize': '50'},
+      query: <String, String>{
+        'status': 'open',
+        'page': '$page',
+        'pageSize': '$pageSize',
+      },
     );
     if (data is! Map<String, dynamic>) {
       throw const ApiException(ApiErrorKind.invalidResponse, '告警响应缺少 data');
     }
-    final items = data['items'];
-    return _mapList(items, AlertItem.fromJson);
+    return AlertPage.fromJson(data);
+  }
+
+  /// 看板汇总卡的服务端全量统计（设备总数 / 在线数 / 未处理告警数）。
+  Future<StatsOverview> fetchStatsOverview({required String token}) async {
+    final data = await _send('GET', '/api/stats/overview', token: token);
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '统计响应缺少 data');
+    }
+    return StatsOverview.fromJson(data);
   }
 
   Future<List<CommandItem>> fetchCommands({

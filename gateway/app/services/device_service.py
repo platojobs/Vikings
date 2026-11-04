@@ -11,7 +11,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Device, SensorRecord
+from app.models import Device, DeviceAlert, SensorRecord
 from app.schemas import DeviceStatusMessage, SensorReportMessage
 from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE
 
@@ -97,10 +97,20 @@ async def list_devices(
     page: int,
     page_size: int,
     group_name: Optional[str] = None,
+    has_alert: bool = False,
 ) -> Tuple[List[Device], int]:
     stmt = select(Device)
     count_stmt = select(func.count()).select_from(Device)
 
+    if has_alert:
+        # 「有告警」在数据库层按未处理告警聚合，不受告警列表分页大小影响
+        alert_device_ids = (
+            select(DeviceAlert.device_id)
+            .where(DeviceAlert.status == "open")
+            .distinct()
+        )
+        stmt = stmt.where(Device.device_id.in_(alert_device_ids))
+        count_stmt = count_stmt.where(Device.device_id.in_(alert_device_ids))
     if status:
         stmt = stmt.where(Device.status == status)
         count_stmt = count_stmt.where(Device.status == status)
@@ -261,11 +271,13 @@ async def latest_records_all(
     keyword: Optional[str] = None,
     limit: Optional[int] = None,
     offset: int = 0,
+    device_ids: Optional[List[str]] = None,
 ) -> List[SensorRecord]:
     """全局每个设备的最新一条（仪表盘首屏兜底，避免前端空窗）。
 
     过滤与分页均为可选：不传时与历史行为完全一致（无过滤、无截断、按时间倒序）。
-    设备状态 / 关键词过滤需要关联设备表，仅在传入时才做 join。
+    设备状态 / 关键词过滤需要关联设备表，仅在传入时才做 join；
+    device_ids 用于移动看板只取当前已加载页设备的实时值，避免全量拉取。
     """
     subq = (
         select(SensorRecord.device_id, func.max(SensorRecord.ts).label("max_ts"))
@@ -275,6 +287,11 @@ async def latest_records_all(
     stmt = select(SensorRecord).join(
         subq, (SensorRecord.device_id == subq.c.device_id) & (SensorRecord.ts == subq.c.max_ts)
     )
+
+    if device_ids is not None:
+        if not device_ids:
+            return []
+        stmt = stmt.where(SensorRecord.device_id.in_(device_ids))
 
     if status or keyword:
         stmt = stmt.join(Device, Device.device_id == SensorRecord.device_id)

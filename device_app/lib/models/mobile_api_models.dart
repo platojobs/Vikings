@@ -71,6 +71,7 @@ class DeviceSummary {
     required this.status,
     this.lastReportAt,
     this.lastOnlineAt,
+    this.openAlertCount = 0,
   });
 
   final String deviceId;
@@ -84,7 +85,22 @@ class DeviceSummary {
   final DateTime? lastReportAt;
   final DateTime? lastOnlineAt;
 
+  /// 该设备未处理告警数（服务端聚合，`withAlertCount=true` 时返回）。
+  final int openAlertCount;
+
   bool get online => status == 'online';
+
+  DeviceSummary copyWith({int? openAlertCount}) => DeviceSummary(
+    deviceId: deviceId,
+    name: name,
+    model: model,
+    firmwareVersion: firmwareVersion,
+    groupName: groupName,
+    status: status,
+    lastReportAt: lastReportAt,
+    lastOnlineAt: lastOnlineAt,
+    openAlertCount: openAlertCount ?? this.openAlertCount,
+  );
 
   factory DeviceSummary.fromJson(Map<String, dynamic> json) => DeviceSummary(
     deviceId: _asString(json['device_id']),
@@ -95,6 +111,104 @@ class DeviceSummary {
     status: _asString(json['status'], 'offline'),
     lastReportAt: _asTime(json['last_report_at']),
     lastOnlineAt: _asTime(json['last_online_at']),
+    openAlertCount: _asInt(json['open_alert_count']),
+  );
+}
+
+/// `GET /api/devices` 的分页结果：`data.items` + `total/page/page_size`。
+class DevicePage {
+  const DevicePage({
+    required this.items,
+    required this.total,
+    required this.page,
+    required this.pageSize,
+  });
+
+  final List<DeviceSummary> items;
+  final int total;
+  final int page;
+  final int pageSize;
+
+  bool get hasMore => page * pageSize < total;
+
+  factory DevicePage.fromJson(Map<String, dynamic> json) => DevicePage(
+    items: (json['items'] is List)
+        ? (json['items'] as List)
+              .whereType<Map>()
+              .map((item) => DeviceSummary.fromJson(Map<String, dynamic>.from(item)))
+              .toList(growable: false)
+        : const <DeviceSummary>[],
+    total: _asInt(json['total']),
+    page: _asInt(json['page'], 1),
+    pageSize: _asInt(json['page_size'], 20),
+  );
+}
+
+/// `GET /api/alerts` 的分页结果。
+class AlertPage {
+  const AlertPage({
+    required this.items,
+    required this.total,
+    required this.page,
+    required this.pageSize,
+  });
+
+  final List<AlertItem> items;
+  final int total;
+  final int page;
+  final int pageSize;
+
+  factory AlertPage.fromJson(Map<String, dynamic> json) => AlertPage(
+    items: (json['items'] is List)
+        ? (json['items'] as List)
+              .whereType<Map>()
+              .map((item) => AlertItem.fromJson(Map<String, dynamic>.from(item)))
+              .toList(growable: false)
+        : const <AlertItem>[],
+    total: _asInt(json['total']),
+    page: _asInt(json['page'], 1),
+    pageSize: _asInt(json['page_size'], 20),
+  );
+}
+
+/// `GET /api/stats/overview`：看板汇总卡使用的服务端全量统计。
+class StatsOverview {
+  const StatsOverview({
+    required this.deviceTotal,
+    required this.deviceOnline,
+    required this.deviceOffline,
+    required this.reportToday,
+    required this.alertOpen,
+  });
+
+  final int deviceTotal;
+  final int deviceOnline;
+  final int deviceOffline;
+  final int reportToday;
+  final int alertOpen;
+
+  static const StatsOverview empty = StatsOverview(
+    deviceTotal: 0,
+    deviceOnline: 0,
+    deviceOffline: 0,
+    reportToday: 0,
+    alertOpen: 0,
+  );
+
+  StatsOverview copyWith({int? alertOpen}) => StatsOverview(
+    deviceTotal: deviceTotal,
+    deviceOnline: deviceOnline,
+    deviceOffline: deviceOffline,
+    reportToday: reportToday,
+    alertOpen: alertOpen ?? this.alertOpen,
+  );
+
+  factory StatsOverview.fromJson(Map<String, dynamic> json) => StatsOverview(
+    deviceTotal: _asInt(json['device_total']),
+    deviceOnline: _asInt(json['device_online']),
+    deviceOffline: _asInt(json['device_offline']),
+    reportToday: _asInt(json['report_today']),
+    alertOpen: _asInt(json['alert_open']),
   );
 }
 

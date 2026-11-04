@@ -279,19 +279,25 @@ http://192.168.1.8:5173
 | 单设备最近 10 条上报 | `GET /api/devices/{id}/records` | REST（详情页） |
 | 指令回执 | `GET /api/devices/{id}/commands` | REST（详情页，写完自动刷新） |
 
-搜索与筛选（v1.10.0）：
+搜索、筛选与分页（v1.11.0 起全部走服务端）：
 
 | 能力 | 行为 |
 | --- | --- |
-| 搜索框 | 按设备名称 / ID 模糊匹配，大小写不敏感；输入 300ms 防抖，避免逐字符请求 |
-| 状态筛选 | 全部 / 在线 / 离线 / 有告警（未处理告警按设备聚合）；切换后重拉首屏快照 |
-| 列表分页 | 首屏 REST 快照最多 100 台，列表每次渲染 20 条，底部「加载更多」增量展示 |
-| 汇总联动 | 汇总卡始终保留全量统计，并标注「筛选结果 N 台 / 全部 M 台」；筛选无结果时给出可读空状态，不清空汇总卡 |
-| 实时协同 | 筛选只作用于渲染层，MQTT 上报 / 上下线 / 告警仍写入完整快照；上下线事件会即时改变「在线 / 离线」筛选结果，实时值不会因筛选丢失 |
+| 搜索框 | 按设备名称 / ID 模糊匹配（`keyword` 请求参数），大小写不敏感；输入 300ms 防抖后重置到第 1 页 |
+| 状态筛选 | 全部 / 在线 / 离线 / 有告警：分别下发 `status=online/offline`、`hasAlert=true`，切换即按新参数重拉第 1 页 |
+| 列表分页 | 首屏 `page=1&pageSize=20`；设备区页脚进入视口自动请求下一页，加载中显示「加载中…」，末页显示「没有更多了」 |
+| 有告警与角标 | `withAlertCount=true` 返回每设备 `open_alert_count`（数据库按 `status='open'` 聚合），筛选与卡片角标同源，不受告警列表分页大小影响 |
+| 告警列表 | `status=open&page=N&pageSize=20` 按页追加；标题「未处理告警（N）」使用服务端 `total`，不再停在 50 条 |
+| 汇总联动 | 汇总卡取 `/api/stats/overview` 的 `device_total` / `device_online` / `alert_open`，与分页口径解耦；并标注「筛选结果 N 台 / 全部 M 台」，筛选无结果时给出可读空状态，不清空汇总卡 |
+| 实时协同 | MQTT 上报只更新已加载设备的数值 / 在线状态，不触发整页重拉；上下线事件即时改变「在线 / 离线」筛选结果；新设备或不满足当前页的设备在下次刷新（下拉、切换筛选、轮询兜底）时按服务端分页出现 |
 
-> 分页策略：设备快照一次性取回（`pageSize=100`），列表按 20 条递增渲染，
-> 避免首屏一次性构造大量卡片；网关已支持 `page/pageSize/status/keyword` 服务端分页，
-> 设备规模超过 100 台时可平滑切换为服务端分页。
+> 性能预期：首屏只传输 1 页设备（20 条）与这些设备的最新值（`/api/records/latest?deviceIds=...`），
+> 不再一次性拉取 100 台或全量最新值；滚动翻页按需追加，设备规模增长时首屏耗时基本恒定。
+> 告警列表同样按页加载，避免未处理告警很多时一次性渲染。
+>
+> 已知边界：手动下拉刷新 / 筛选切换会重置到第 1 页（已加载的后续页不保留）；
+> 实时新增设备不即时插入当前列表，需等下一次刷新；「有告警」筛选依赖网关 v1.11.0 的
+> `hasAlert` / `withAlertCount` 参数，旧网关会忽略未知参数（此时请升级网关）。
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -393,7 +399,7 @@ http://192.168.1.8:5173
 | --- | --- | --- |
 | POST | `/api/auth/login` | 登录换取 JWT |
 | GET | `/api/auth/me` | 当前账号最新信息（角色刷新） |
-| GET | `/api/devices` | 设备列表（status / keyword / group / 分页） |
+| GET | `/api/devices` | 设备列表（status / keyword / group / hasAlert / withAlertCount / 分页） |
 | GET | `/api/devices/groups` | 分组概览（总数 / 在线 / 离线） |
 | POST | `/api/devices` | 注册设备 |
 | POST | `/api/devices/bulk` | 批量注册（重复跳过） |
@@ -575,3 +581,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.9.2` | 真实 Broker 端到端验收：WebSocket 实时增量、指令回执、告警 acked、停 Broker 降级与恢复；验收固化为可重复脚本 |
 | `v1.9.3` | E2E 纳入 GitHub Actions 独立作业（mosquitto + 端口检查 + 超时 + 清理）；E2E 使用临时 Broker 数据目录与 Python/Mosquitto 路径自适应 |
 | `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试（[发布说明](docs/releases/v1.10.0.md)） |
+| `v1.11.0` | 移动看板切换服务端分页与筛选，拆掉首屏 100 台与告警 pageSize=50 上限；网关 `/api/devices` 新增可选 `hasAlert` / `withAlertCount`（按设备聚合未处理告警数），`/api/records/latest` 新增可选 `deviceIds`；汇总卡改用服务端统计，实时与分页协同（[发布说明](docs/releases/v1.11.0.md)） |

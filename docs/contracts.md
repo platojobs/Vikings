@@ -153,7 +153,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`group`、`page`、`pageSize` |
+| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`group`、`hasAlert`、`withAlertCount`、`page`、`pageSize` |
 | GET | `/api/devices/groups` | 分组概览：每组 `total` / `online` / `offline` |
 | POST | `/api/devices` | 手工注册设备，入参 `device_id`（3~64 位字母数字 _-）、`name`、`model`、`firmware_version`、`group_name`；重复 ID 返回 409 |
 | POST | `/api/devices/bulk` | 批量注册，单次最多 200 台，返回 `{created, skipped}`，重复 ID 跳过 |
@@ -162,12 +162,23 @@
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit` |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
-| GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`，均可选 |
+| GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`、`deviceIds`，均可选 |
 
 `/api/records/latest` 的过滤与分页参数全部可选：不传时语义与历史一致（每个设备各自最新一条、
 按时间倒序、不截断）；`keyword` 同时匹配设备 ID 与名称，`status` 依赖设备表关联。
+`deviceIds` 为逗号分隔的设备 ID（单次最多 200 个，自动去重），只返回这些设备的最新值；
+传空串返回空数组，便于看板按已加载页分批取值，不再全量拉取。
+
 `/api/devices` 的 `status` / `keyword` / `group` / `page` / `pageSize` 同样为可选参数，
-不传时默认第一页 20 台、不加过滤。
+不传时默认第一页 20 台、不加过滤。v1.11.0 新增两个可选参数，默认关闭、不影响既有调用方：
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `hasAlert` | `true` / `false`（默认） | 仅返回存在未处理告警的设备；筛选在数据库层按 `device_alert.status='open'` 聚合，不依赖告警列表分页大小 |
+| `withAlertCount` | `true` / `false`（默认） | 每个设备条目额外返回 `open_alert_count`（未处理告警数，无告警为 0）；不传时该字段为 `null`，既有字段语义不变 |
+
+设备条目（`DeviceOut`）字段：`device_id`、`name`、`model`、`firmware_version`、`group_name`、
+`status`、`last_report_at`、`last_online_at`、`open_alert_count`（可选，仅 `withAlertCount=true` 时填充）。
 
 写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
 
@@ -231,18 +242,19 @@ fire-and-forget，不阻塞告警主链路。
 账号变更全部写入审计日志（`user.create` / `user.update` / `user.delete`），
 审计 detail 只记录变更项，不落口令明文。
 
-### 3.10 移动看板复用的网关接口（v1.7.0 只读 / v1.9.0 写操作，无新增契约）
+### 3.10 移动看板复用的网关接口（v1.7.0 只读 / v1.9.0 写操作 / v1.11.0 服务端分页，兼容增量）
 
-device_app 的移动看板不新增、不修改任何网关端点，读写均消费以下既有接口：
+device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 中新增的可选参数，未新增端点：
 
 | 用途 | 接口 | 参数 / 说明 |
 | --- | --- | --- |
 | 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, user}` |
-| 设备列表 | `GET /api/devices` | `page=1&pageSize=100`，`data.items` 为设备数组 |
-| 每设备最新值 | `GET /api/records/latest` | 返回全部设备各自最新一条 |
+| 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `hasAlert` / `withAlertCount=true` |
+| 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
 | 单设备历史上报 | `GET /api/devices/{id}/records` | 看板固定 `limit=10` |
-| 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=50` |
+| 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数 |
 | 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
+| 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
 
 统一鉴权头 `Authorization: Bearer <token>`；token 由登录接口下发，与 Web 后台一致。
 看板对 `401` 的处理：清除本地 token 并回到登录页；`403` 提示无权访问；
@@ -289,6 +301,24 @@ v1.8.0 起看板增量数据改走 MQTT over WebSocket（默认 `ws://<网关主
 
 移动看板的 Widget 测试通过构造参数注入 fake `ApiClient`、实时服务与存储，
 覆盖上述交互并确保测试过程不产生真实写请求；契约断言仍以本节的端点与错误语义为准。
+
+#### 3.10.3 移动看板服务端分页与实时协同（v1.11.0）
+
+v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上限：
+
+| 行为 | 契约 |
+| --- | --- |
+| 设备首屏 | `GET /api/devices?page=1&pageSize=20&withAlertCount=true`，按 `page * pageSize < total` 判断是否还有下一页 |
+| 滚动加载 | 设备区页脚进入视口即请求下一页并原样追加；加载中展示「加载中…」，`已加载条数 == total` 时展示「没有更多了」 |
+| 搜索/状态筛选 | `keyword` / `status` 作为请求参数下发，300ms 防抖后重置 `page=1`，避免把旧页拼进新筛选 |
+| 有告警筛选 | `hasAlert=true`（数据库层聚合 `status='open'`）+ `withAlertCount=true`；卡片角标显示 `open_alert_count`，与筛选结果同源，不再依赖告警列表前 50 条 |
+| 告警分页 | `GET /api/alerts?status=open&page=N&pageSize=20`；标题「未处理告警（N）」使用服务端 `total`，列表按页追加 |
+| 汇总卡 | `GET /api/stats/overview` 的 `device_total` / `device_online` / `alert_open`，与分页口径解耦，不会因只看第 1 页而失真 |
+| 实时上报 | 只更新已加载设备的数值/在线状态，不触发整页重拉；新设备或不满足当前页的设备**不会即时插入**，在下次刷新（下拉、筛选切换、轮询兜底）时按服务端分页结果出现 |
+| 实时告警 | 插入列表头条并递增服务端计数与对应已加载设备角标；未加载设备的下次刷新补齐 |
+| 上下线事件 | 立即改变已加载设备在「在线 / 离线」筛选中的可见性；分页游标与 `total` 仍以服务端为准 |
+
+上述行为均有 Widget 测试覆盖（翻页加载、搜索重置分页、聚合告警筛选、末页/空状态）。
 
 ---
 

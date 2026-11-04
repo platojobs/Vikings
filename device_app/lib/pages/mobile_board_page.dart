@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 import '../config/api_config.dart';
 import '../models/command_request.dart';
@@ -94,10 +95,27 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   String _keyword = '';
   _BoardStatusFilter _statusFilter = _BoardStatusFilter.all;
 
-  /// 列表按批懒加载，避免一次性渲染全量设备卡片。
-  int _visibleCount = _boardPageSize;
+  /// 服务端分页状态：只加载当前页，滚动到底追加下一页，不再受首屏 100 台上限约束。
+  final ScrollController _scrollController = ScrollController();
+  final GlobalKey _deviceFooterKey = GlobalKey();
+  int _devicePage = 1;
+  int _deviceTotal = 0;
+  bool _deviceHasMore = false;
+  bool _loadingMoreDevices = false;
+
+  /// 未处理告警同样按页加载，`_alertTotal` 为服务端全量未处理数（不是已加载条数）。
+  int _alertPage = 1;
+  int _alertTotal = 0;
+  bool _loadingMoreAlerts = false;
+
+  /// 汇总卡的服务端全量统计，与设备分页口径解耦（只看第 1 页也不失真）。
+  StatsOverview _stats = StatsOverview.empty;
+
+  /// 请求序号：搜索 / 筛选快速切换时丢弃过期响应，避免旧页覆盖新页。
+  int _requestSeq = 0;
 
   static const int _boardPageSize = 20;
+  static const int _alertPageSize = 20;
   static const Duration _searchDebounceDelay = Duration(milliseconds: 300);
 
   static const Duration _pollInterval = Duration(seconds: 15);
@@ -117,6 +135,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
               MqttWebSocketTransport(url: uri, clientId: clientId),
         );
     WidgetsBinding.instance.addObserver(this);
+    _scrollController.addListener(_onScroll);
     _bootstrap();
   }
 
@@ -143,6 +162,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     WidgetsBinding.instance.removeObserver(this);
     _searchDebounce?.cancel();
     _searchController.dispose();
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
     _pollTimer?.cancel();
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
@@ -271,7 +292,20 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           return;
         }
         setState(() {
-          _alerts = <AlertItem>[alert, ..._alerts].take(50).toList();
+          _alerts = <AlertItem>[alert, ..._alerts];
+          // 计数以服务端全量为准，实时新增同样累加，不再被 50 条上限截断
+          _alertTotal += 1;
+          _stats = _stats.copyWith(alertOpen: _stats.alertOpen + 1);
+          // 已加载设备立即更新角标；未加载设备由下次刷新补齐
+          _devices = _devices
+              .map(
+                (device) => device.deviceId == alert.deviceId
+                    ? device.copyWith(
+                        openAlertCount: device.openAlertCount + 1,
+                      )
+                    : device,
+              )
+              .toList(growable: false);
         });
       case ReportEvent(:final reading):
         setState(() {
@@ -434,6 +468,23 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         _alerts = _alerts
             .where((item) => item.alertId != alert.alertId)
             .toList(growable: false);
+        if (_alertTotal > 0) {
+          _alertTotal -= 1;
+        }
+        _stats = _stats.copyWith(
+          alertOpen: _stats.alertOpen > 0 ? _stats.alertOpen - 1 : 0,
+        );
+        _devices = _devices
+            .map(
+              (device) => device.deviceId == alert.deviceId
+                  ? device.copyWith(
+                      openAlertCount: device.openAlertCount > 0
+                          ? device.openAlertCount - 1
+                          : 0,
+                    )
+                  : device,
+            )
+            .toList(growable: false);
       });
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('告警已确认')));
@@ -462,11 +513,16 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     }
   }
 
+  /// 拉取第 1 页设备 + 当前页实时值 + 第 1 页告警 + 服务端汇总。
+  ///
+  /// 搜索 / 状态筛选全部作为请求参数下发并重置到第 1 页；实时事件只更新已加载设备，
+  /// 不触发整页重拉。汇总卡使用 `/api/stats/overview` 的全量口径，与分页解耦。
   Future<void> _loadData({bool silent = false}) async {
     final session = _session;
     if (session == null) {
       return;
     }
+    final requestId = ++_requestSeq;
     if (!silent) {
       setState(() {
         _loading = true;
@@ -476,18 +532,44 @@ class _MobileBoardPageState extends State<MobileBoardPage>
 
     final client = _createApiClient(_baseUrl);
     try {
+      final page = await client.fetchDevices(
+        token: session.token,
+        page: 1,
+        pageSize: _boardPageSize,
+        status: _requestStatus,
+        keyword: _keyword,
+        hasAlert: _statusFilter == _BoardStatusFilter.alert,
+        withAlertCount: true,
+      );
+      final deviceIds = page.items
+          .map((device) => device.deviceId)
+          .toList(growable: false);
       final results = await Future.wait<Object>([
-        client.fetchDevices(token: session.token),
-        client.fetchLatestReadings(token: session.token),
-        client.fetchOpenAlerts(token: session.token),
+        client.fetchLatestReadings(
+          token: session.token,
+          deviceIds: deviceIds,
+        ),
+        client.fetchOpenAlerts(
+          token: session.token,
+          page: 1,
+          pageSize: _alertPageSize,
+        ),
+        client.fetchStatsOverview(token: session.token),
       ]);
-      if (!mounted) {
+      if (!mounted || requestId != _requestSeq) {
         return;
       }
+      final alertPage = results[1] as AlertPage;
       setState(() {
-        _devices = results[0] as List<DeviceSummary>;
-        _readings = results[1] as List<SensorReading>;
-        _alerts = results[2] as List<AlertItem>;
+        _devices = page.items;
+        _devicePage = 1;
+        _deviceTotal = page.total;
+        _deviceHasMore = page.items.length < page.total;
+        _readings = results[0] as List<SensorReading>;
+        _alerts = alertPage.items;
+        _alertPage = 1;
+        _alertTotal = alertPage.total;
+        _stats = results[2] as StatsOverview;
         // REST 快照比本地实时状态更新，清空后再由新事件补齐
         _liveStatus.clear();
         _error = null;
@@ -495,20 +577,159 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     } on ApiException catch (error) {
       if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
-      } else if (mounted) {
+      } else if (mounted && requestId == _requestSeq) {
         setState(() => _error = _describe(error));
       }
     } catch (_) {
-      if (mounted) {
+      if (mounted && requestId == _requestSeq) {
         setState(() => _error = '加载失败，请稍后重试');
       }
     } finally {
       client.close();
-      if (mounted) {
+      if (mounted && requestId == _requestSeq) {
         setState(() => _loading = false);
       }
     }
   }
+
+  /// 滚动到底加载下一页设备：追加结果，不重置滚动位置，也不打断已加载卡片。
+  Future<void> _loadMoreDevices() async {
+    final session = _session;
+    if (session == null || _loadingMoreDevices || !_deviceHasMore) {
+      return;
+    }
+    final requestId = _requestSeq;
+    setState(() => _loadingMoreDevices = true);
+    final client = _createApiClient(_baseUrl);
+    try {
+      final page = await client.fetchDevices(
+        token: session.token,
+        page: _devicePage + 1,
+        pageSize: _boardPageSize,
+        status: _requestStatus,
+        keyword: _keyword,
+        hasAlert: _statusFilter == _BoardStatusFilter.alert,
+        withAlertCount: true,
+      );
+      final newIds = page.items
+          .map((device) => device.deviceId)
+          .toList(growable: false);
+      final readings = await client.fetchLatestReadings(
+        token: session.token,
+        deviceIds: newIds,
+      );
+      if (!mounted || requestId != _requestSeq) {
+        return;
+      }
+      setState(() {
+        _devices = <DeviceSummary>[..._devices, ...page.items];
+        _devicePage = page.page > 0 ? page.page : _devicePage + 1;
+        _deviceTotal = page.total;
+        _deviceHasMore = _devices.length < page.total;
+        _readings = _mergeReadings(_readings, readings);
+      });
+    } on ApiException catch (error) {
+      if (error.kind == ApiErrorKind.unauthorized) {
+        await _handleExpired();
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('加载更多失败：${error.userMessage}')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('加载更多失败，请稍后重试')));
+      }
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() => _loadingMoreDevices = false);
+      }
+    }
+  }
+
+  /// 未处理告警按页追加，`_alertTotal` 始终是服务端全量数。
+  Future<void> _loadMoreAlerts() async {
+    final session = _session;
+    if (session == null || _loadingMoreAlerts || _alerts.length >= _alertTotal) {
+      return;
+    }
+    setState(() => _loadingMoreAlerts = true);
+    final client = _createApiClient(_baseUrl);
+    try {
+      final page = await client.fetchOpenAlerts(
+        token: session.token,
+        page: _alertPage + 1,
+        pageSize: _alertPageSize,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _alerts = <AlertItem>[..._alerts, ...page.items];
+        _alertPage = page.page > 0 ? page.page : _alertPage + 1;
+        _alertTotal = page.total;
+      });
+    } on ApiException catch (error) {
+      if (error.kind == ApiErrorKind.unauthorized) {
+        await _handleExpired();
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('加载告警失败：${error.userMessage}')),
+        );
+      }
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() => _loadingMoreAlerts = false);
+      }
+    }
+  }
+
+  List<SensorReading> _mergeReadings(
+    List<SensorReading> current,
+    List<SensorReading> incoming,
+  ) {
+    final byDevice = <String, SensorReading>{
+      for (final reading in current) reading.deviceId: reading,
+    };
+    for (final reading in incoming) {
+      byDevice[reading.deviceId] = reading;
+    }
+    return byDevice.values.toList(growable: false);
+  }
+
+  /// 设备页脚进入视口即触发下一页；页脚位于设备区末尾，不会在滚动告警区时误触发。
+  void _onScroll() {
+    if (!_deviceHasMore || _loadingMoreDevices) {
+      return;
+    }
+    final footerContext = _deviceFooterKey.currentContext;
+    if (footerContext == null) {
+      return;
+    }
+    final box = footerContext.findRenderObject();
+    if (box is! RenderBox) {
+      return;
+    }
+    final viewport = RenderAbstractViewport.maybeOf(box);
+    if (viewport == null || !_scrollController.hasClients) {
+      return;
+    }
+    final footerOffset = viewport.getOffsetToReveal(box, 0).offset;
+    final position = _scrollController.position;
+    if (position.pixels + position.viewportDimension >= footerOffset - 32) {
+      unawaited(_loadMoreDevices());
+    }
+  }
+
+  /// 当前状态筛选对应的请求参数。
+  String? get _requestStatus => switch (_statusFilter) {
+    _BoardStatusFilter.online => 'online',
+    _BoardStatusFilter.offline => 'offline',
+    _ => null,
+  };
 
   String _describe(ApiException error) {
     if (error.kind == ApiErrorKind.network ||
@@ -531,6 +752,13 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _devices = const <DeviceSummary>[];
       _readings = const <SensorReading>[];
       _alerts = const <AlertItem>[];
+      _devicePage = 1;
+      _deviceTotal = 0;
+      _deviceHasMore = false;
+      _alertPage = 1;
+      _alertTotal = 0;
+      _stats = StatsOverview.empty;
+      _requestSeq += 1;
       _loading = false;
       _error = null;
       _writeBlockedReason = null;
@@ -551,6 +779,13 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _devices = const <DeviceSummary>[];
       _readings = const <SensorReading>[];
       _alerts = const <AlertItem>[];
+      _devicePage = 1;
+      _deviceTotal = 0;
+      _deviceHasMore = false;
+      _alertPage = 1;
+      _alertTotal = 0;
+      _stats = StatsOverview.empty;
+      _requestSeq += 1;
       _error = null;
       _writeBlockedReason = null;
       _ackingAlertId = null;
@@ -665,9 +900,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
 
   // ---------------- 搜索与状态筛选 ----------------
 
-  /// 输入防抖：300ms 内连续输入只触发一次过滤与首屏重拉。
+  /// 输入防抖：300ms 内连续输入只触发一次；关键词作为请求参数并重置到第 1 页。
   void _onSearchChanged(String value) {
-    // 立即重建一次以同步输入框清除按钮显隐，实际过滤等防抖结束后执行。
+    // 立即重建一次以同步输入框清除按钮显隐，实际请求等防抖结束后执行。
     if (mounted) {
       setState(() {});
     }
@@ -676,14 +911,11 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       if (!mounted) {
         return;
       }
-      final keyword = value.trim().toLowerCase();
+      final keyword = value.trim();
       if (keyword == _keyword) {
         return;
       }
-      setState(() {
-        _keyword = keyword;
-        _visibleCount = _boardPageSize;
-      });
+      setState(() => _keyword = keyword);
       unawaited(_loadData(silent: true));
     });
   }
@@ -695,39 +927,29 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       setState(() {});
       return;
     }
-    setState(() {
-      _keyword = '';
-      _visibleCount = _boardPageSize;
-    });
+    setState(() => _keyword = '');
     unawaited(_loadData(silent: true));
   }
 
-  /// 切换筛选后重拉首屏，保证列表与汇总卡基于同一份最新快照。
+  /// 切换筛选后按新参数重拉第 1 页，避免把上一页结果拼到新筛选里。
   void _onStatusChanged(_BoardStatusFilter filter) {
     if (_statusFilter == filter) {
       return;
     }
-    setState(() {
-      _statusFilter = filter;
-      _visibleCount = _boardPageSize;
-    });
+    setState(() => _statusFilter = filter);
     unawaited(_loadData(silent: true));
   }
 
-  /// 未处理告警按设备聚合，供「有告警」筛选使用。
-  Set<String> get _alertDeviceIds => _alerts
-      .where((item) => item.status == 'open')
-      .map((item) => item.deviceId)
-      .toSet();
-
-  /// 只在渲染层过滤：实时事件仍然落在完整快照上，筛选期间不会丢实时值。
+  /// 服务端已按状态 / 关键词 / 有告警完成过滤与分页；这里只做实时状态修正：
+  /// 上下线事件能立即改变「在线 / 离线」结果；「有告警」直接使用服务端聚合的
+  /// `openAlertCount`，不再依赖未处理告警列表的前 50 条。
   List<DeviceSummary> get _filteredDevices {
-    final alertIds = _alertDeviceIds;
+    final keyword = _keyword.toLowerCase();
     return _devices.where((device) {
-      if (_keyword.isNotEmpty) {
+      if (keyword.isNotEmpty) {
         final id = device.deviceId.toLowerCase();
         final name = device.name.toLowerCase();
-        if (!id.contains(_keyword) && !name.contains(_keyword)) {
+        if (!id.contains(keyword) && !name.contains(keyword)) {
           return false;
         }
       }
@@ -735,7 +957,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         _BoardStatusFilter.all => true,
         _BoardStatusFilter.online => _isOnline(device),
         _BoardStatusFilter.offline => !_isOnline(device),
-        _BoardStatusFilter.alert => alertIds.contains(device.deviceId),
+        _BoardStatusFilter.alert => device.openAlertCount > 0,
       };
     }).toList(growable: false);
   }
@@ -768,7 +990,6 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       );
     }
     final filtered = _filteredDevices;
-    final visibleDevices = filtered.take(_visibleCount).toList(growable: false);
     return Scaffold(
       appBar: AppBar(
         title: const Text('移动看板'),
@@ -790,6 +1011,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         child: RefreshIndicator(
           onRefresh: _loadData,
           child: ListView(
+            controller: _scrollController,
             padding: const EdgeInsets.all(12),
             children: [
               if (_error != null) _buildErrorBanner(),
@@ -801,7 +1023,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                 _buildWriteHint(_writeDisabledHint),
               ],
               const SizedBox(height: 10),
-              _buildSummary(filtered.length),
+              _buildSummary(),
               const SizedBox(height: 12),
               _buildFilterPanel(),
               const SizedBox(height: 12),
@@ -812,24 +1034,28 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                   child: Center(child: CircularProgressIndicator()),
                 ),
               if (!_loading && _devices.isEmpty)
-                _buildEmpty('暂无设备。请先在 Web 后台注册设备，或启动设备模拟器上报。'),
+                _filterActive
+                    ? _buildFilterEmpty()
+                    : _buildEmpty('暂无设备。请先在 Web 后台注册设备，或启动设备模拟器上报。'),
               if (!_loading && _devices.isNotEmpty && filtered.isEmpty)
                 _buildFilterEmpty(),
-              ...visibleDevices.map(_buildDeviceCard),
-              if (filtered.length > _visibleCount)
+              ...filtered.map(_buildDeviceCard),
+              if (filtered.isNotEmpty) _buildDeviceFooter(),
+              const SizedBox(height: 8),
+              _buildSectionTitle('未处理告警（$_alertTotal）'),
+              if (_alerts.isEmpty) _buildEmpty('当前没有未处理告警'),
+              ..._alerts.map(_buildAlertCard),
+              if (_alerts.length < _alertTotal)
                 Center(
                   child: TextButton(
-                    onPressed: () =>
-                        setState(() => _visibleCount += _boardPageSize),
+                    onPressed: _loadingMoreAlerts ? null : _loadMoreAlerts,
                     child: Text(
-                      '加载更多（已显示 ${visibleDevices.length} / ${filtered.length}）',
+                      _loadingMoreAlerts
+                          ? '告警加载中…'
+                          : '加载更多告警（已显示 ${_alerts.length} / $_alertTotal）',
                     ),
                   ),
                 ),
-              const SizedBox(height: 8),
-              _buildSectionTitle('未处理告警（${_alerts.length}）'),
-              if (_alerts.isEmpty) _buildEmpty('当前没有未处理告警'),
-              ..._alerts.map(_buildAlertCard),
               const SizedBox(height: 18),
               const Center(
                 child: Text(
@@ -986,8 +1212,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     );
   }
 
-  Widget _buildSummary(int matched) {
-    final online = _devices.where(_isOnline).length;
+  /// 汇总卡：设备总数 / 在线 / 未处理告警均来自服务端全量统计，
+  /// 不因只加载第 1 页而失真；「筛选结果」为当前筛选的服务端 total。
+  Widget _buildSummary() {
+    final total = _stats.deviceTotal;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
       decoration: BoxDecoration(
@@ -999,9 +1227,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         children: [
           Row(
             children: [
-              _summaryItem('设备总数', '${_devices.length}'),
-              _summaryItem('在线', '$online'),
-              _summaryItem('未处理告警', '${_alerts.length}'),
+              _summaryItem('设备总数', '$total'),
+              _summaryItem('在线', '${_stats.deviceOnline}'),
+              _summaryItem('未处理告警', '${_stats.alertOpen}'),
             ],
           ),
           const SizedBox(height: 10),
@@ -1009,12 +1237,46 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           const SizedBox(height: 8),
           Text(
             _filterActive
-                ? '筛选结果：$matched 台 / 全部 ${_devices.length} 台'
-                : '全部 ${_devices.length} 台设备，实时值随 MQTT 增量更新',
+                ? '筛选结果：$_deviceTotal 台 / 全部 $total 台'
+                : '全部 $total 台设备，实时值随 MQTT 增量更新',
             style: const TextStyle(fontSize: 12, color: Colors.black54),
           ),
         ],
       ),
+    );
+  }
+
+  /// 设备分页页脚：进入视口自动加载下一页，加载中显示进度，末页显示「没有更多了」。
+  Widget _buildDeviceFooter() {
+    final Widget content;
+    if (_loadingMoreDevices) {
+      content = Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: const [
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          SizedBox(width: 8),
+          Text('加载中…', style: TextStyle(fontSize: 12, color: Colors.black54)),
+        ],
+      );
+    } else if (_deviceHasMore) {
+      content = Text(
+        '上拉加载更多（已显示 ${_devices.length} / $_deviceTotal）',
+        style: const TextStyle(fontSize: 12, color: Colors.black45),
+      );
+    } else {
+      content = const Text(
+        '没有更多了',
+        style: TextStyle(fontSize: 12, color: Colors.black38),
+      );
+    }
+    return Padding(
+      key: _deviceFooterKey,
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(child: content),
     );
   }
 
@@ -1091,7 +1353,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           Text(
             '当前筛选：${_statusFilter.label}'
             '${_keyword.isEmpty ? '' : ' · 关键词「$_keyword」'}；'
-            '可清空关键词或切回「全部」。上方汇总卡仍为全部 ${_devices.length} 台设备。',
+            '可清空关键词或切回「全部」。上方汇总卡仍为全部 ${_stats.deviceTotal} 台设备。',
             style: const TextStyle(fontSize: 12, color: Colors.black54),
           ),
         ],
@@ -1171,6 +1433,27 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                       ),
                     ),
                   ),
+                  if (device.openAlertCount > 0) ...[
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '告警 ${device.openAlertCount}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.red,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
                   OnlineBadge(online: _isOnline(device)),
                 ],
               ),
