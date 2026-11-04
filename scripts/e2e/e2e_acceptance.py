@@ -112,6 +112,10 @@ class Context:
         self.simulator_proc: Optional[subprocess.Popen] = None
         self.log_handles: List[Any] = []
         self.temp_db: Optional[str] = None
+        # Broker 的 persistence_location 是相对路径：把 cwd 指向临时目录，
+        # 每次验收都从空的保留消息开始，且不污染仓库内 Broker 数据。
+        self.broker_workdir: Optional[Path] = None
+        self.gateway_python: Optional[str] = None
         self.client: Optional[httpx.Client] = None
         self.token = ""
         self.device_id = f"e2e-{uuid.uuid4().hex[:8]}"
@@ -146,28 +150,50 @@ def log_tail(path: Path, lines: int = 12) -> str:
     return "\n".join(content[-lines:])
 
 
-def assert_venv_python() -> None:
-    if not VENV_PYTHON.exists():
-        raise RuntimeError(
-            f"缺少 gateway 虚拟环境：{VENV_PYTHON}；请先执行 "
-            "cd gateway && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt"
+def find_mosquitto() -> Optional[str]:
+    """优先 PATH；CI 的 apt 包常装到 /usr/sbin，补充兜底路径。"""
+    found = shutil.which("mosquitto")
+    if found:
+        return found
+    for candidate in ("/usr/sbin/mosquitto", "/usr/local/sbin/mosquitto"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def gateway_python(ctx: Context) -> str:
+    """本地优先 gateway/.venv；CI 无 venv 时退回当前解释器（需已装齐依赖）。"""
+    if ctx.gateway_python:
+        return ctx.gateway_python
+    candidates: List[str] = []
+    if VENV_PYTHON.exists():
+        candidates.append(str(VENV_PYTHON))
+    candidates.append(sys.executable)
+    errors: List[str] = []
+    for exe in candidates:
+        probe = subprocess.run(
+            [exe, "-c", "import aiomqtt, paho.mqtt.client, websocket, uvicorn"],
+            capture_output=True,
+            text=True,
         )
-    probe = subprocess.run(
-        [str(VENV_PYTHON), "-c", "import aiomqtt, paho.mqtt.client, websocket"],
-        capture_output=True,
-        text=True,
+        if probe.returncode == 0:
+            ctx.gateway_python = exe
+            return exe
+        errors.append(f"{exe}: {probe.stderr.strip()}")
+    raise RuntimeError(
+        "缺少网关运行依赖（aiomqtt / paho-mqtt / websocket-client / uvicorn）；"
+        "请安装 gateway/requirements.txt 与 scripts/e2e/requirements.txt。\n"
+        + "\n".join(errors)
     )
-    if probe.returncode != 0:
-        raise RuntimeError(
-            "gateway 虚拟环境缺少 E2E 依赖（aiomqtt / paho-mqtt / websocket-client）："
-            + probe.stderr.strip()
-        )
 
 
 def start_broker(ctx: Context) -> str:
-    mosquitto = shutil.which("mosquitto")
+    mosquitto = find_mosquitto()
     if not mosquitto:
-        raise RuntimeError("未安装 mosquitto（macOS: brew install mosquitto）")
+        raise RuntimeError(
+            "未安装 mosquitto（macOS: brew install mosquitto；"
+            "Ubuntu: sudo apt-get install -y mosquitto）"
+        )
     if not MOSQUITTO_CONF.exists():
         raise RuntimeError(f"缺少 Broker 配置：{MOSQUITTO_CONF}")
     conf = MOSQUITTO_CONF.read_text(encoding="utf-8")
@@ -181,13 +207,19 @@ def start_broker(ctx: Context) -> str:
     if port_open(MQTT_PORT) or port_open(MQTT_WS_PORT):
         raise RuntimeError("1883/9001 仅有一个被占用，环境不完整；请先停掉残留进程")
 
+    if ctx.broker_workdir is None:
+        ctx.broker_workdir = Path(tempfile.mkdtemp(prefix="vikings-e2e-broker-"))
+    (ctx.broker_workdir / "infra" / "mosquitto" / "data").mkdir(
+        parents=True, exist_ok=True
+    )
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "mosquitto.log"
     handle = log_path.open("w", encoding="utf-8")
     ctx.log_handles.append(handle)
     ctx.broker_proc = subprocess.Popen(
         [mosquitto, "-c", str(MOSQUITTO_CONF)],
-        cwd=str(ROOT),
+        cwd=str(ctx.broker_workdir),
         stdout=handle,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -205,9 +237,6 @@ def start_gateway(ctx: Context) -> str:
     if port_open(8000):
         ctx.reporter.add("gateway", "INFO", "复用已运行的 8000 网关，不由脚本托管")
         return "复用现有网关"
-
-    if not VENV_PYTHON.exists():
-        raise RuntimeError(f"缺少网关虚拟环境：{VENV_PYTHON}")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "gateway.log"
@@ -229,7 +258,7 @@ def start_gateway(ctx: Context) -> str:
     ctx.log_handles.append(handle)
     ctx.gateway_proc = subprocess.Popen(
         [
-            str(VENV_PYTHON),
+            gateway_python(ctx),
             "-m",
             "uvicorn",
             "app.main:app",
@@ -391,15 +420,13 @@ def login(ctx: Context) -> str:
 
 
 def start_simulator(ctx: Context) -> str:
-    if not VENV_PYTHON.exists():
-        raise RuntimeError(f"缺少网关虚拟环境：{VENV_PYTHON}")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "simulator.log"
     handle = log_path.open("w", encoding="utf-8")
     ctx.log_handles.append(handle)
     ctx.simulator_proc = subprocess.Popen(
         [
-            str(VENV_PYTHON),
+            gateway_python(ctx),
             "scripts/simulate_device.py",
             "--device-id",
             ctx.device_id,
@@ -726,6 +753,9 @@ def cleanup(ctx: Context) -> None:
     if ctx.temp_db:
         for suffix in ("", "-wal", "-shm"):
             Path(ctx.temp_db + suffix).unlink(missing_ok=True)
+    if ctx.broker_workdir:
+        shutil.rmtree(ctx.broker_workdir, ignore_errors=True)
+        ctx.broker_workdir = None
 
     if ctx.own_broker:
         try:
@@ -801,10 +831,12 @@ def main() -> int:
 
 
 def preflight(ctx: Context) -> str:
-    missing = [name for name in ("mosquitto",) if shutil.which(name) is None]
-    if missing:
-        raise RuntimeError("缺少可执行文件：" + ", ".join(missing) + "（brew install mosquitto）")
-    assert_venv_python()
+    if not find_mosquitto():
+        raise RuntimeError(
+            "未安装 mosquitto（macOS: brew install mosquitto；"
+            "Ubuntu: sudo apt-get install -y mosquitto）"
+        )
+    interpreter = gateway_python(ctx)
     if not MOSQUITTO_CONF.exists():
         raise RuntimeError(f"缺少 Broker 配置：{MOSQUITTO_CONF}")
     conf = MOSQUITTO_CONF.read_text(encoding="utf-8")
@@ -812,9 +844,9 @@ def preflight(ctx: Context) -> str:
         raise RuntimeError("Broker 配置缺少 `listener 9001` 或 `protocol websockets`")
     ports = {p: port_open(p) for p in (1883, 9001, 8000, 5173)}
     return (
-        "mosquitto/venv 可用；端口状态 "
+        f"mosquitto/{Path(interpreter).name} 可用；端口状态 "
         + ", ".join(f"{p}={'占用' if v else '空闲'}" for p, v in ports.items())
-        + f"；将使用临时库，deviceId={ctx.device_id}"
+        + f"；将使用临时库与临时 Broker 数据目录，deviceId={ctx.device_id}"
     )
 
 

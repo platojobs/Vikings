@@ -62,3 +62,58 @@ jobs:
       - run: flutter pub get
       - run: flutter analyze
       - run: flutter test
+
+  e2e:
+    name: 真实 Broker 端到端验收
+    runs-on: ubuntu-latest
+    # 安装依赖 + 真实 Broker/网关/模拟器全链路，正常 2~3 分钟；超时兜底防卡死
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 Mosquitto（1883 TCP + 9001 WebSocket）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          # 发行版包自带 mosquitto.service，会占用 1883；验收必须由脚本托管 Broker
+          sudo systemctl stop mosquitto || true
+          sudo systemctl disable mosquitto || true
+          sudo pkill -x mosquitto || true
+          mosquitto -h 2>&1 | head -3 || true
+      - name: 安装网关与 E2E 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r gateway/requirements.txt -r scripts/e2e/requirements.txt
+      - name: 检查端口占用
+        run: |
+          python - <<'PY'
+          import socket, sys
+
+          busy = []
+          for port in (1883, 9001, 8000):
+              with socket.socket() as sock:
+                  sock.settimeout(0.3)
+                  if sock.connect_ex(("127.0.0.1", port)) == 0:
+                      busy.append(port)
+          if busy:
+              print(f"::error::端口被占用：{busy}，可能仍有残留服务")
+              sys.exit(1)
+          print("端口 1883/9001/8000 空闲")
+          PY
+      - name: 运行真实 Broker 端到端验收
+        run: python scripts/e2e/e2e_acceptance.py
+      - name: 失败时输出日志
+        if: failure()
+        run: |
+          for log in .run/e2e/*.log; do
+            echo "===== $log"
+            tail -80 "$log"
+          done
+      - name: 兜底清理
+        if: always()
+        run: |
+          pkill -f "mosquitto -c" || true
+          pkill -f "uvicorn app.main:app" || true
+          pkill -f "simulate_device.py" || true

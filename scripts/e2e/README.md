@@ -1,10 +1,11 @@
 # 端到端验收（真实 Broker / WebSocket / 网关）
 
-`e2e_acceptance.py` 用于验证 CI 覆盖不到的真实链路：真实 Mosquitto、真实
-MQTT over WebSocket、真实网关进程、真实 REST 写接口与断线降级恢复。
+`e2e_acceptance.py` 用真实 Mosquitto、真实 MQTT over WebSocket、真实网关进程、
+真实 REST 写接口与断线恢复来验证真实链路。它既可在本地发布前运行，也已纳入
+GitHub Actions 的 `e2e` 作业（见第 6 节）。
 
 脚本以「移动看板」相同的方式连接 `9001` WebSocket 订阅，逐项输出 PASS / FAIL，
-全部通过时退出码为 `0`，任一项失败为 `1`，可直接用于本地发布前检查。
+全部通过时退出码为 `0`，任一项失败为 `1`。
 
 ## 1. 前置条件
 
@@ -12,7 +13,7 @@ MQTT over WebSocket、真实网关进程、真实 REST 写接口与断线降级�
 | --- | --- | --- |
 | Mosquitto | 2.x，含 WebSocket 支持 | `brew install mosquitto`；`mosquitto -h` |
 | Broker 配置 | `infra/mosquitto/mosquitto.conf` 同时含 `listener 1883` 与 `listener 9001` + `protocol websockets` | 脚本会自动校验 |
-| 网关虚拟环境 | `gateway/.venv` 可用，已装网关依赖 | `cd gateway && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt` |
+| 网关运行环境 | 本地优先 `gateway/.venv`；无 venv 时自动退回当前 Python（需已装网关依赖） | `cd gateway && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt` |
 | E2E 额外依赖 | `paho-mqtt` / `websocket-client` / `httpx` | `gateway/.venv/bin/python -m pip install -r scripts/e2e/requirements.txt` |
 | 端口 | `1883`、`9001`、`8000` 空闲（脚本会自起进程并托管） | `lsof -nP -iTCP:1883 -iTCP:9001 -iTCP:8000 -sTCP:LISTEN` |
 
@@ -24,6 +25,13 @@ MQTT over WebSocket、真实网关进程、真实 REST 写接口与断线降级�
 cd /path/to/Vikings
 gateway/.venv/bin/python scripts/e2e/e2e_acceptance.py
 echo $?    # 0 = 全部 PASS，1 = 存在 FAIL
+```
+
+CI 中无需 venv，安装依赖后直接运行：
+
+```bash
+pip install -r gateway/requirements.txt -r scripts/e2e/requirements.txt
+python scripts/e2e/e2e_acceptance.py
 ```
 
 可选参数：`--username` / `--password`（默认 `admin / admin123`，用于临时库初始化）。
@@ -44,8 +52,11 @@ echo $?    # 0 = 全部 PASS，1 = 存在 FAIL
 
 - 脚本启动的网关通过 `DATABASE_URL=sqlite+aiosqlite:///<临时文件>` 覆盖 `.env`，
   不会写入生产 PostgreSQL；临时库在结束时删除。
+- Broker 的 `persistence_location` 是相对路径，脚本把其工作目录指向临时目录，
+  保留消息不会在多次运行间累积，也不会写入仓库内 `infra/mosquitto/data/`。
 - 脚本只终止自己启动的进程（`start_new_session=True`），不杀外部已运行的服务。
-- 结束时关闭 WS 客户端、模拟器、网关、Broker，并等待端口释放。
+- 结束时关闭 WS 客户端、模拟器、网关、Broker，删除临时 SQLite 与 Broker 数据目录，
+  并等待端口释放。
 
 > 降级验证需要脚本托管 Broker。若 1883/9001 已被外部 Broker 占用，脚本会复用，
 > 但 `degrade_disconnect` 会 FAIL 并提示「Broker 由外部托管」——这是有意的保护，
@@ -75,14 +86,15 @@ echo $?    # 0 = 全部 PASS，1 = 存在 FAIL
 | `recover_broker` | 重启 Broker |
 | `recover_ws` | WS 自动重连，网关 `/api/system/status` 的 `mqtt.connected=true` |
 | `recover_real_data` | 恢复后 TCP 发布新上报，WS 能再次收到（链路真正恢复） |
-| `cleanup` | 进程停止、端口释放、临时库删除 |
+| `cleanup` | 进程停止、端口释放、临时库与临时 Broker 数据目录删除 |
 
 ## 5. 常见失败原因
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| `未安装 mosquitto` / `缺少 Broker 配置` | 执行 `brew install mosquitto`；确认配置文件含 9001 + `protocol websockets` |
-| `gateway 虚拟环境缺少 E2E 依赖` | 安装 `scripts/e2e/requirements.txt` |
+| `未安装 mosquitto` / `缺少 Broker 配置` | macOS `brew install mosquitto`；Ubuntu `sudo apt-get install -y mosquitto`；确认配置含 9001 + `protocol websockets` |
+| `缺少网关运行依赖` | 同时安装 `gateway/requirements.txt` 与 `scripts/e2e/requirements.txt` |
+| CI 上 1883 被占用 | apt 安装的 `mosquitto.service` 自动启动；作业已 stop/disable/pkill，仍占用则检查端口步骤会直接报错 |
 | `1883/9001 仅有一个被占用` | 有残留进程；先 `lsof -nP -iTCP:1883 -iTCP:9001` 并停止 |
 | `Broker 启动失败` | 看 `.run/e2e/mosquitto.log`；常见为配置路径或端口冲突 |
 | `网关 25s 内未就绪` | 看 `.run/e2e/gateway.log`；常见为依赖缺失或临时库不可写 |
@@ -94,15 +106,24 @@ echo $?    # 0 = 全部 PASS，1 = 存在 FAIL
 | `degrade_disconnect` 提示外部托管 | 先停止外部 Broker，再让脚本托管 |
 | `端口清理异常` | 有子进程未退出；脚本已 terminate → kill，仍失败请手动 `lsof` 检查 |
 
-## 6. 与 CI 的关系
+## 6. 与 CI 的关系（新增 `e2e` 作业）
 
-GitHub Actions 的 CI 只跑 `flutter analyze/test`、网关 `pytest` 与 `web build`，
-不安装 Mosquitto、不启动真实 Broker，因此**无法覆盖**本脚本验证的链路：
+`.github/workflows/ci.yml` 中的 `e2e` 作业在 `ubuntu-latest` 上自包含运行本脚本：
 
-- MQTT over WebSocket 9001 的真实握手与实时增量；
-- 设备模拟器的唤醒窗口、指令 ack 与状态机；
-- 告警从 MQTT 到 REST 的 acked 状态；
-- 停 Broker 后的客户端断连、REST 降级与恢复重连。
+| 项目 | 内容 |
+| --- | --- |
+| 触发 | 与其它作业相同：`push` / `pull_request` 到 `main` |
+| 依赖 | `apt-get install mosquitto`；`pip install gateway/requirements.txt + scripts/e2e/requirements.txt` |
+| 端口 | 固定 `1883` / `9001` / `8000`，执行前检查占用，避免与 runner 残留服务冲突 |
+| 耗时 | 正常约 2~3 分钟（apt + pip 安装占大部分，验收本身约 13 秒） |
+| 超时 | `timeout-minutes: 15`，防止卡死占用 runner |
+| 成败 | 完全以脚本退出码判定：`0` 全 PASS，`1` 存在 FAIL |
+| 清理 | 脚本自行清理；作业另有 `if: always()` 兜底 `pkill`，并输出 `.run/e2e/*.log` 便于排查 |
 
-因此本脚本定位为**发布前本地验收资产**，不纳入 CI；CI 保持快速、无外部依赖。
-每次涉及 Broker / 实时链路 / 指令 / 告警的改动，发布前应至少跑一次本脚本。
+CI 覆盖：MQTT over WebSocket 9001 握手与实时增量、设备唤醒窗口与指令 ack、
+告警从 MQTT 到 REST 的 acked 状态、停 Broker 后的断连/REST 降级/恢复重连。
+
+排查方式：打开 `e2e` 作业 → 查看「运行真实 Broker 端到端验收」的逐项 PASS/FAIL →
+查看「失败时输出日志」步骤中 `mosquitto.log`、`gateway.log`、`simulator.log` 的末尾 80 行。
+常见原因见第 5 节；若 runner 的 apt mosquitto 不含 WebSocket 支持，会在
+`ws_connected` / `broker` 步骤失败并明确提示。

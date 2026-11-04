@@ -476,8 +476,8 @@ http://192.168.1.8:5173
 
 ## 12. 端到端验收（真实 Broker）
 
-`scripts/e2e/e2e_acceptance.py` 验证 CI 覆盖不到的真实链路：真实 Mosquitto、
-MQTT over WebSocket（与移动看板同一连接方式）、真实网关、REST 写接口与断线恢复。
+`scripts/e2e/e2e_acceptance.py` 用真实 Mosquitto、MQTT over WebSocket（与移动看板
+同一连接方式）、真实网关、REST 写接口与断线恢复验证真实链路；本地与 CI 均可运行。
 
 ```bash
 gateway/.venv/bin/python -m pip install -r scripts/e2e/requirements.txt
@@ -495,16 +495,34 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
   `mqtt.connected=true`，并再次收到真实上报。
 
 隔离与清理：脚本自起 Broker 与网关（端口空闲时），网关使用临时 SQLite，
-不写生产库；结束后停止所有托管进程、删除临时库并等待端口释放。
+Broker 使用临时数据目录（保留消息不跨运行累积），不写生产库；
+结束后停止所有托管进程、删除临时目录并等待端口释放。
 若 1883/9001 已被外部 Broker 占用，脚本会复用，但降级步骤会明确 FAIL（不杀外部进程）。
 
-CI 只跑 analyze / test / pytest / web build，不安装 Broker，因此本脚本定位为
-**发布前本地验收资产**，不纳入 CI。前置条件、逐项覆盖、常见失败原因见
-[scripts/e2e/README.md](scripts/e2e/README.md)。
+本脚本已纳入 CI 的 `e2e` 作业（ubuntu-latest），由脚本退出码判定成败，
+正常耗时约 2~3 分钟，超时 15 分钟。CI 失败时查看 `e2e` 作业的逐项 PASS/FAIL 与
+「失败时输出日志」步骤（`mosquitto.log` / `gateway.log` / `simulator.log`）。
+前置条件、逐项覆盖、常见失败原因见 [scripts/e2e/README.md](scripts/e2e/README.md)。
 
 ---
 
-## 13. 测试
+## 13. 测试与 CI
+
+### 13.1 GitHub Actions 作业
+
+| 作业 | 运行环境 | 内容 | 正常耗时 |
+| --- | --- | --- | --- |
+| `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
+| `web` | ubuntu-latest | `npm ci` + `npm run build` | 约 1~2 分钟 |
+| `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（21 项） | 约 2~3 分钟 |
+
+`e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
+结束后脚本自清理并由 `if: always()` 兜底；不依赖外部服务、不写生产数据。
+成败完全以脚本退出码判定，`timeout-minutes: 15` 防止卡死。
+失败排查：查看作业中逐项 PASS/FAIL 与「失败时输出日志」步骤（各服务日志末尾 80 行）。
+
+### 13.2 本地测试
 
 | 层 | 命令 | 覆盖范围 |
 | --- | --- | --- |
@@ -541,3 +559,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.9.0` | 移动看板接入受限写操作：指令下发（校准/配置/重启/单台 OTA）与告警确认，复用网关既有接口并按角色 / 403 禁用 |
 | `v1.9.1` | 移动看板 Widget 测试补强：登录、写操作确认/取消/回执、告警移除、权限禁用、实时降级与 401 路径 |
 | `v1.9.2` | 真实 Broker 端到端验收：WebSocket 实时增量、指令回执、告警 acked、停 Broker 降级与恢复；验收固化为可重复脚本 |
+| `v1.9.3` | E2E 纳入 GitHub Actions 独立作业（mosquitto + 端口检查 + 超时 + 清理）；E2E 使用临时 Broker 数据目录与 Python/Mosquitto 路径自适应 |
