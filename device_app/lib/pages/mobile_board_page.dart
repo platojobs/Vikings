@@ -26,19 +26,38 @@ import 'login_page.dart';
 /// - 保留本地设备模拟器为默认入口，两套 MQTT 连接互不影响；
 /// - 未登录、后端不可达、token 失效、实时断线均给出可读提示，不白屏、不崩溃。
 class MobileBoardPage extends StatefulWidget {
-  const MobileBoardPage({super.key, this.active = true});
+  const MobileBoardPage({
+    super.key,
+    this.active = true,
+    this.storage,
+    this.apiClientFactory,
+    this.realtimeServiceFactory,
+  });
 
   /// 页面是否处于前台可见。切到设备模拟或 App 进入后台时置为 false，
   /// 用于断开实时连接、停止轮询省电。
   final bool active;
 
+  /// 可选的存储与网络依赖，仅用于测试注入；为空时沿用生产默认实现。
+  final AppStorage? storage;
+  final BoardApiClientFactory? apiClientFactory;
+  final BoardRealtimeFactory? realtimeServiceFactory;
+
   @override
   State<MobileBoardPage> createState() => _MobileBoardPageState();
 }
 
+/// 按网关地址创建 REST 客户端；测试可注入 fake，生产默认走真实网络。
+typedef BoardApiClientFactory = ApiClient Function(String baseUrl);
+
+/// 按实时地址创建 MQTT 服务；测试可注入假服务，生产默认走 WebSocket。
+typedef BoardRealtimeFactory = BoardRealtimeService Function(String url);
+
 class _MobileBoardPageState extends State<MobileBoardPage>
     with WidgetsBindingObserver {
-  final AppStorage _storage = AppStorage();
+  late final AppStorage _storage;
+  late final BoardApiClientFactory _createApiClient;
+  late final BoardRealtimeFactory _createRealtime;
 
   AuthSession? _session;
   String _baseUrl = ApiConfig.defaultBaseUrl;
@@ -74,6 +93,17 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   @override
   void initState() {
     super.initState();
+    _storage = widget.storage ?? AppStorage();
+    _createApiClient =
+        widget.apiClientFactory ??
+        (String baseUrl) => ApiClient(baseUrl: baseUrl);
+    _createRealtime =
+        widget.realtimeServiceFactory ??
+        (String url) => BoardRealtimeService(
+          url: url,
+          transportFactory: (uri, clientId) =>
+              MqttWebSocketTransport(url: uri, clientId: clientId),
+        );
     WidgetsBinding.instance.addObserver(this);
     _bootstrap();
   }
@@ -160,11 +190,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     if (url.isEmpty) {
       return;
     }
-    final service = BoardRealtimeService(
-      url: url,
-      transportFactory: (uri, clientId) =>
-          MqttWebSocketTransport(url: uri, clientId: clientId),
-    );
+    final service = _createRealtime(url);
     _realtime = service;
     _eventSub = service.events.listen(_onRealtimeEvent);
     service.state.addListener(_onRealtimeStateChanged);
@@ -315,7 +341,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         statusCode: 401,
       );
     }
-    final client = ApiClient(baseUrl: _baseUrl);
+    final client = _createApiClient(_baseUrl);
     try {
       return await client.sendCommand(
         token: session.token,
@@ -384,7 +410,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     }
 
     setState(() => _ackingAlertId = alert.alertId);
-    final client = ApiClient(baseUrl: _baseUrl);
+    final client = _createApiClient(_baseUrl);
     try {
       await client.ackAlert(token: session.token, alertId: alert.alertId);
       if (!mounted) {
@@ -434,7 +460,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       });
     }
 
-    final client = ApiClient(baseUrl: _baseUrl);
+    final client = _createApiClient(_baseUrl);
     try {
       final results = await Future.wait<Object>([
         client.fetchDevices(token: session.token),
@@ -643,6 +669,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         initialBaseUrl: _baseUrl,
         notice: _notice,
         onLoggedIn: _handleLoggedIn,
+        storage: _storage,
+        apiClientFactory: _createApiClient,
       );
     }
     return Scaffold(
@@ -1061,6 +1089,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         baseUrl: _baseUrl,
         token: session.token,
         canWrite: _canWrite,
+        apiClientFactory: _createApiClient,
         onIssueCommand: () => _openCommandDialog(device),
       ),
     );
@@ -1075,6 +1104,7 @@ class _DeviceDetailSheet extends StatefulWidget {
     required this.baseUrl,
     required this.token,
     required this.canWrite,
+    required this.apiClientFactory,
     required this.onIssueCommand,
   });
 
@@ -1086,6 +1116,9 @@ class _DeviceDetailSheet extends StatefulWidget {
 
   /// 当前会话是否可写（viewer 或服务端 403 后为 false）。
   final bool canWrite;
+
+  /// 与页面共用同一 REST 客户端工厂，测试可注入 fake。
+  final BoardApiClientFactory apiClientFactory;
 
   /// 页面层统一处理指令弹窗、提交与 401/403，返回网关回执。
   final Future<CommandItem?> Function() onIssueCommand;
@@ -1124,7 +1157,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
   }
 
   Future<void> _loadDetail() async {
-    final client = ApiClient(baseUrl: widget.baseUrl);
+    final client = widget.apiClientFactory(widget.baseUrl);
     try {
       final results = await Future.wait<Object>([
         client.fetchCommands(

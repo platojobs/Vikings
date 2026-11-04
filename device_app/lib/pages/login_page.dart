@@ -14,6 +14,8 @@ class LoginPage extends StatefulWidget {
     required this.initialBaseUrl,
     required this.onLoggedIn,
     this.notice,
+    this.storage,
+    this.apiClientFactory,
   });
 
   final String initialBaseUrl;
@@ -22,12 +24,17 @@ class LoginPage extends StatefulWidget {
   /// 由看板页传入的提示，例如「登录已失效，请重新登录」。
   final String? notice;
 
+  /// 可选的存储与网络依赖，仅用于测试注入；为空时沿用生产默认实现。
+  final AppStorage? storage;
+  final ApiClient Function(String baseUrl)? apiClientFactory;
+
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final AppStorage _storage = AppStorage();
+  late final AppStorage _storage;
+  late final ApiClient Function(String baseUrl) _createApiClient;
   late final TextEditingController _baseUrlController;
   late final TextEditingController _usernameController;
   late final TextEditingController _passwordController;
@@ -38,6 +45,10 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void initState() {
     super.initState();
+    _storage = widget.storage ?? AppStorage();
+    _createApiClient =
+        widget.apiClientFactory ??
+        (String baseUrl) => ApiClient(baseUrl: baseUrl);
     _baseUrlController = TextEditingController(text: widget.initialBaseUrl);
     _usernameController = TextEditingController(text: 'admin');
     _passwordController = TextEditingController();
@@ -72,9 +83,12 @@ class _LoginPageState extends State<LoginPage> {
       _error = null;
     });
 
-    final client = ApiClient(baseUrl: baseUrl);
+    final client = _createApiClient(baseUrl);
     try {
-      final session = await client.login(username: username, password: password);
+      final session = await client.login(
+        username: username,
+        password: password,
+      );
       try {
         await _storage.saveBaseUrl(baseUrl);
         await _storage.saveSession(session);
@@ -89,7 +103,8 @@ class _LoginPageState extends State<LoginPage> {
     } on ApiException catch (error) {
       if (mounted) {
         setState(() {
-          _error = error.kind == ApiErrorKind.network ||
+          _error =
+              error.kind == ApiErrorKind.network ||
                   error.kind == ApiErrorKind.timeout
               ? '${error.userMessage}\n当前地址：$baseUrl'
               : error.userMessage;
@@ -122,12 +137,19 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.info_outline, color: Colors.orange, size: 18),
+                    const Icon(
+                      Icons.info_outline,
+                      color: Colors.orange,
+                      size: 18,
+                    ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
                         widget.notice!,
-                        style: const TextStyle(color: Colors.orange, fontSize: 13),
+                        style: const TextStyle(
+                          color: Colors.orange,
+                          fontSize: 13,
+                        ),
                       ),
                     ),
                   ],

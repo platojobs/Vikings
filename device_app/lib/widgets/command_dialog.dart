@@ -143,6 +143,10 @@ class _CommandDialogState extends State<CommandDialog> {
         ],
         _DialogStep.confirm => <Widget>[
           TextButton(
+            onPressed: _submitting ? null : () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          TextButton(
             onPressed: _submitting
                 ? null
                 : () => setState(() {
