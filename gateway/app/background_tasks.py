@@ -24,7 +24,7 @@ from sqlalchemy import delete, func, select, update
 
 from app.config import get_settings
 from app.database import SessionFactory
-from app.models import AuditLog, Device, DeviceAlert, SensorRecord
+from app.models import AuditLog, Device, DeviceAlert, DeviceCommand, SensorRecord
 from app.topics import DEVICE_STATUS_OFFLINE
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,54 @@ async def sweep_offline_devices() -> int:
         if count:
             logger.info("离线巡检：%d 台设备因超时未上报被置为离线", count)
         return count
+
+
+async def sweep_stale_commands(
+    *,
+    session_factory: Optional[SessionFactoryLike] = None,
+    now: Optional[datetime] = None,
+    timeout_seconds: Optional[int] = None,
+) -> int:
+    """把长时间没有回执的指令置为 failed，并同步 OTA 任务汇总。
+
+    语义：设备在超时窗口内没有任何回执（issued/received/progress 且 updated_at 过旧），
+    判定为失败。这是「任务永久 running」的兜底终态，与设备意外离线的二级巡检同一思路。
+    终态不可回退：之后即使收到迟到的 success，也不会把任务从 failed 改回成功；
+    重试应重新创建指令/任务。返回本次置为失败的指令数。
+    """
+    factory = _factory(session_factory)
+    now_dt = now or datetime.now(timezone.utc)
+    timeout = settings.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+    cutoff = now_dt - timedelta(seconds=timeout)
+    async with factory() as session:
+        stmt = select(DeviceCommand).where(
+            DeviceCommand.state.in_(("issued", "received", "progress")),
+            DeviceCommand.updated_at < cutoff,
+        )
+        stale = list((await session.execute(stmt)).scalars().all())
+        task_ids = set()
+        for cmd in stale:
+            cmd.state = "failed"
+            cmd.message = f"设备超时未回执（超过 {timeout} 秒）"[:255]
+            cmd.updated_at = now_dt
+            if cmd.ota_task_id:
+                task_ids.add(cmd.ota_task_id)
+        await session.flush()
+        if task_ids:
+            # 延迟导入避免 services 与后台任务模块在启动早期形成环
+            from app.services.command_service import refresh_task_summary
+
+            for task_id in task_ids:
+                await refresh_task_summary(session, task_id)
+        await session.commit()
+        if stale:
+            logger.warning(
+                "指令超时巡检：%d 条指令超过 %ds 无回执，已置为 failed（OTA 任务 %d 个）",
+                len(stale),
+                timeout,
+                len(task_ids),
+            )
+        return len(stale)
 
 
 async def _purge_where(

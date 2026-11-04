@@ -12,7 +12,8 @@
 > 完整步骤、端口、证书替换、升级备份与人工验收命令见 **[docs/deployment.md](docs/deployment.md)**；
 > 日常启停、迁移流程、日志、凭证轮换、保留策略与回滚见 [docs/operations.md](docs/operations.md)；
 > 日志字段、`/ready` 健康分层、Prometheus 指标与告警阈值见 **[docs/observability.md](docs/observability.md)**；
-> 移动端出包（keystore/签名、构建号、CI 制品、依赖治理）见 **[docs/mobile-release.md](docs/mobile-release.md)**。
+> 移动端出包（keystore/签名、构建号、CI 制品、依赖治理）见 **[docs/mobile-release.md](docs/mobile-release.md)**；
+> 发布前真机验收（接入、凭证、指令、OTA、告警、弱网、省电、异常文案）见 **[docs/device-acceptance.md](docs/device-acceptance.md)**。
 
 ---
 
@@ -87,7 +88,8 @@
 ├── docs/
 │   ├── architecture.md        架构设计与决策说明
 │   ├── contracts.md           三端接口契约（Topic / REST / 表结构 / 阈值）
-│   └── mobile-release.md      Android 发布：签名、构建号、CI 制品与依赖治理
+│   ├── mobile-release.md      Android 发布：签名、构建号、CI 制品与依赖治理
+│   └── device-acceptance.md   发布前真机手工验收清单（可执行步骤与通过标准）
 ├── infra/
 │   ├── mosquitto/                 双端口 Broker 配置 + ACL
 │   ├── postgres/init.sql          建表 + 索引 + 种子数据（幂等）
@@ -806,3 +808,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.20.0` | P1-1 可观测性：JSON 结构化日志与 `X-Request-Id` 全链路、`/api/health/ready` 分层就绪探针、Prometheus `/metrics`（请求/延迟/5xx、登录 429、MQTT 掉线与 DB 错误）、反代内网白名单与可直接加载的告警规则；真实停库/停 Broker 演练（[发布说明](docs/releases/v1.20.0.md)） |
 | `v1.21.0` | P1-4 + P2-2 + P2-1 告警闭环：Web 多选批量确认（复用 `bulk-ack`，部分失败逐类可见、viewer 只读）、`ack_note` / `acked_by` / `acked_at` 处置元数据（迁移 `0003`，单条与批量可选备注、审计脱敏摘要）、级别口径收窄为 `warning` / `critical`；E2E 验证备注与 `acked_by`（[发布说明](docs/releases/v1.21.0.md)） |
 | `v1.22.0` | P1-5 移动端发布工程：release 签名支持环境变量/`key.properties`（缺密钥显式降级并标注 `debug-signed`）、CI 在 main/标签构建 APK+AAB 并上传制品（含版本号与 SHA、`SHA256SUMS`、`SIGNING.txt`）、标签版本/构建号递增校验、Dependabot 四生态分组更新、Actions 升级到 Node 24 运行时；真实临时 keystore 验签与无密钥路径验证（[发布说明](docs/releases/v1.22.0.md)） |
+| `v1.23.0` | P1-7 测试盲区收敛：OTA 全链路进 E2E（创建→下发→分片进度→成功→REST/固件/审计一致）、设备失败与超时两条失败路径；修复终态可回退、下发失败不计任务、跨设备回执、无回执永久 running（新增指令超时巡检与 `COMMAND_TIMEOUT_SECONDS`）；真实故障注入（网关重启、设备重连、DB 短暂不可用）；Postgres 作业扩到告警/设备/认证/HTTP/指令 56 条核心用例；新增真机验收清单（[发布说明](docs/releases/v1.23.0.md)） |

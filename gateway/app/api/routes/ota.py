@@ -22,15 +22,18 @@ async def create_task(
     if not mqtt.is_connected:
         raise HTTPException(status_code=503, detail="MQTT Broker 未连接，无法下发 OTA 任务")
 
-    task = await command_service.create_ota_task(
-        session=session,
-        publisher=mqtt.publish,
-        device_ids=body.device_ids,
-        target_version=body.target_version,
-        url=body.url,
-        description=body.description,
-        operator=user.get("sub", "system"),
-    )
+    try:
+        task = await command_service.create_ota_task(
+            session=session,
+            publisher=mqtt.publish,
+            device_ids=body.device_ids,
+            target_version=body.target_version,
+            url=body.url,
+            description=body.description,
+            operator=user.get("sub", "system"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await audit_service.log(
         session,
         operator=user.get("sub", "system"),

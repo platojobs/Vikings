@@ -28,6 +28,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,21 @@ class Context:
         self.cmd_id: Optional[str] = None
         self.ack_seen: Optional[Dict[str, Any]] = None
         self.interrupted = False
+        # ---- P1-7 / v1.23.0：OTA 全链路与故障注入 ----
+        # 网关重启必须复用同一个临时库/同一份 env，才符合"网关重启而非换环境"的语义
+        self.gateway_env: Optional[Dict[str, str]] = None
+        self.ota_task_id: Optional[str] = None
+        self.ota_cmd_id: Optional[str] = None
+        self.ota_ack_states: List[str] = []
+        self.restart_device_id = f"e2e-restart-{uuid.uuid4().hex[:8]}"
+        self.fail_device_id = f"e2e-fail-{uuid.uuid4().hex[:8]}"
+        self.reconnect_device_id = f"e2e-reconnect-{uuid.uuid4().hex[:8]}"
+        self.silent_device_id = f"e2e-silent-{uuid.uuid4().hex[:8]}"
+        self.restart_task_id: Optional[str] = None
+        self.restart_cmd_id: Optional[str] = None
+        self.restart_probe: Any = None
+        self.probes: List[Any] = []
+        self.db_lock_conn: Optional[sqlite3.Connection] = None
 
 
 def port_open(port: int, host: str = MQTT_HOST) -> bool:
@@ -297,7 +313,7 @@ def start_broker(ctx: Context) -> str:
     return "脚本启动 Broker（1883 + 9001 websockets）"
 
 
-def start_gateway(ctx: Context) -> str:
+def start_gateway(ctx: Context, *, reuse_db: bool = False) -> str:
     if port_open(8000):
         raise RuntimeError(
             "8000 已被占用；E2E 需要自起网关以加载本次临时 Broker 凭证与临时数据库，"
@@ -305,34 +321,50 @@ def start_gateway(ctx: Context) -> str:
         )
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / "gateway.log"
-    fd, db_path = tempfile.mkstemp(prefix="vikings-e2e-", suffix=".db")
-    os.close(fd)
-    ctx.temp_db = db_path
+    log_path = LOG_DIR / ("gateway-restart.log" if reuse_db else "gateway.log")
+    if reuse_db:
+        if not ctx.temp_db or not ctx.gateway_env:
+            raise RuntimeError("网关重启前缺少临时库或环境变量，拒绝凭空重启")
+        db_path = ctx.temp_db
+        env = ctx.gateway_env
+    else:
+        fd, db_path = tempfile.mkstemp(prefix="vikings-e2e-", suffix=".db")
+        os.close(fd)
+        ctx.temp_db = db_path
+        env = os.environ.copy()
+        broker_reload = (
+            f"kill -HUP {ctx.broker_proc.pid}" if ctx.broker_proc else ""
+        )
+        env.update(
+            {
+                "DATABASE_URL": f"sqlite+aiosqlite:///{db_path}",
+                "MQTT_HOST": MQTT_HOST,
+                "MQTT_PORT": str(MQTT_PORT),
+                "MQTT_USERNAME": "iot-gateway",
+                "MQTT_PASSWORD": ctx.mqtt["gateway"],
+                "MQTT_PASSWORD_FILE": str(
+                    (ctx.broker_workdir or Path()) / "infra" / "mosquitto" / "passwd"
+                ),
+                "MQTT_RELOAD_COMMAND": broker_reload,
+                "MQTT_WEB_USERNAME": "web-console",
+                "MQTT_WEB_PASSWORD": ctx.mqtt["web"],
+                "MQTT_MOBILE_USERNAME": "mobile-console",
+                "MQTT_MOBILE_PASSWORD": ctx.mqtt["mobile"],
+                # 指令终态兜底：阈值要大于本场景 OTA 时长（含网关重启窗口），
+                # 巡检周期压到 2s 让超时用例可控；超时用例另用回拨 updated_at 复现
+                "COMMAND_TIMEOUT_SECONDS": os.environ.get(
+                    "E2E_COMMAND_TIMEOUT_SECONDS", "120"
+                ),
+                # 仅供"缺陷回归演示"等场景临时调大；默认 2s 保证超时用例 15s 内可判
+                "COMMAND_SWEEP_INTERVAL_SECONDS": os.environ.get(
+                    "E2E_COMMAND_SWEEP_INTERVAL_SECONDS", "2"
+                ),
+                "ADMIN_USERNAME": ctx.args.username,
+                "ADMIN_PASSWORD": ctx.args.password,
+            }
+        )
+        ctx.gateway_env = env
 
-    env = os.environ.copy()
-    broker_reload = (
-        f"kill -HUP {ctx.broker_proc.pid}" if ctx.broker_proc else ""
-    )
-    env.update(
-        {
-            "DATABASE_URL": f"sqlite+aiosqlite:///{db_path}",
-            "MQTT_HOST": MQTT_HOST,
-            "MQTT_PORT": str(MQTT_PORT),
-            "MQTT_USERNAME": "iot-gateway",
-            "MQTT_PASSWORD": ctx.mqtt["gateway"],
-            "MQTT_PASSWORD_FILE": str(
-                (ctx.broker_workdir or Path()) / "infra" / "mosquitto" / "passwd"
-            ),
-            "MQTT_RELOAD_COMMAND": broker_reload,
-            "MQTT_WEB_USERNAME": "web-console",
-            "MQTT_WEB_PASSWORD": ctx.mqtt["web"],
-            "MQTT_MOBILE_USERNAME": "mobile-console",
-            "MQTT_MOBILE_PASSWORD": ctx.mqtt["mobile"],
-            "ADMIN_USERNAME": ctx.args.username,
-            "ADMIN_PASSWORD": ctx.args.password,
-        }
-    )
     handle = log_path.open("w", encoding="utf-8")
     ctx.log_handles.append(handle)
     ctx.gateway_proc = subprocess.Popen(
@@ -361,13 +393,28 @@ def start_gateway(ctx: Context) -> str:
             try:
                 resp = httpx.get(GATEWAY_URL + "/", timeout=2)
                 if resp.status_code == 200:
-                    return f"脚本启动网关（临时 SQLite：{Path(db_path).name}）"
+                    action = "重启" if reuse_db else "启动"
+                    return f"脚本{action}网关（临时 SQLite：{Path(db_path).name}）"
             except httpx.HTTPError:
                 pass
             time.sleep(0.4)
         raise RuntimeError("网关 25s 内未就绪")
     except Exception as exc:
         raise RuntimeError(f"网关启动失败：{exc}\n{log_tail(log_path)}") from exc
+
+
+def stop_gateway_process(ctx: Context) -> None:
+    """停止网关进程但保留临时库与 env，供"重启后自愈"场景复用。"""
+    proc = ctx.gateway_proc
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    ctx.gateway_proc = None
+    wait_port(8000, opened=False, timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +610,28 @@ class _MqttProbe:
     def publish(self, topic: str, payload: str, *, qos: int = 0) -> None:
         self.client.publish(topic, payload, qos=qos)
 
+    def publish_json(self, topic: str, payload: Dict[str, Any], *, qos: int = 1) -> None:
+        info = self.client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=qos)
+        info.wait_for_publish(timeout=5)
+
+    def wait_message(
+        self,
+        predicate: Callable[[Dict[str, Any]], bool],
+        timeout: float,
+        description: str,
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for item in list(self.messages):
+                try:
+                    payload = json.loads(item["payload"])
+                except (ValueError, TypeError):
+                    continue
+                if predicate({"topic": item["topic"], "payload": payload}):
+                    return {"topic": item["topic"], "payload": payload}
+            time.sleep(0.05)
+        raise TimeoutError(f"{timeout}s 内未收到{description}")
+
     def close(self) -> None:
         try:
             self.client.loop_stop()
@@ -737,10 +806,11 @@ def start_simulator(ctx: Context) -> str:
             "scripts/simulate_device.py",
             "--device-id",
             ctx.device_id,
+            # 6 轮覆盖后续 OTA 窗口（含 2s 休眠），避免测试步骤增加后模拟器提前退出
             "--count",
-            "3",
+            "6",
             "--interval",
-            "3",
+            "2",
             "--voltage",
             "2.90",
             "--username",
@@ -1190,6 +1260,633 @@ def verify_group_change(ctx: Context) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# P1-7 / v1.23.0：OTA 全链路与故障注入
+# ---------------------------------------------------------------------------
+def _register_device(ctx: Context, device_id: str, name: str, firmware: str = "1.0.0") -> None:
+    api(
+        ctx,
+        "POST",
+        "/api/devices",
+        json={
+            "device_id": device_id,
+            "name": name,
+            "model": "VG-S100",
+            "firmware_version": firmware,
+            "group_name": "E2E验收组",
+        },
+    )
+
+
+def _create_device_with_credentials(
+    ctx: Context, device_id: str, name: str, firmware: str = "1.0.0"
+) -> str:
+    """REST 注册设备并真实签发 MQTT 凭证（顺带覆盖签发/热加载链路）。"""
+    _register_device(ctx, device_id, name, firmware)
+    credential = api(ctx, "POST", f"/api/devices/{device_id}/mqtt-credential")
+    if not credential.get("reloaded"):
+        raise RuntimeError(
+            f"设备 {device_id} 凭证未热加载：{credential.get('reload_detail')}"
+        )
+    return str(credential["password"])
+
+
+def _open_device_probe(
+    ctx: Context,
+    device_id: str,
+    password: str,
+    *,
+    publish_online: bool = True,
+    client_id: Optional[str] = None,
+    firmware: str = "1.0.0",
+) -> Any:
+    probe = _MqttProbe(
+        device_id,
+        password,
+        client_id=client_id or f"e2e-dev-{device_id}",
+    )
+    ctx.probes.append(probe)
+    try:
+        rc = probe.connect()
+        if rc != 0:
+            raise RuntimeError(f"设备 {device_id} MQTT 连接失败，CONNACK rc={rc}")
+        granted = probe.subscribe(f"device/{device_id}/cmd")
+        if 128 in granted:
+            raise RuntimeError(f"设备 {device_id} 无法订阅自己的 cmd，SUBACK={granted}")
+        if publish_online:
+            probe.publish_json(
+                f"device/{device_id}/status",
+                {
+                    "deviceId": device_id,
+                    "status": "online",
+                    "firmwareVersion": firmware,
+                    "reason": "e2e",
+                    "ts": int(time.time() * 1000),
+                },
+            )
+        return probe
+    except Exception:
+        probe.close()
+        raise
+
+
+def _wait_device_status(
+    ctx: Context, device_id: str, expected: str, timeout: float = 10
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    detail: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        detail = api(ctx, "GET", f"/api/devices/{device_id}")
+        if detail.get("status") == expected:
+            return detail
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"设备 {device_id} 在 {timeout}s 内未变为 {expected}，最近状态={detail}"
+    )
+
+
+def _create_ota_task(ctx: Context, device_id: str, target: str, description: str) -> Dict[str, Any]:
+    return api(
+        ctx,
+        "POST",
+        "/api/ota/tasks",
+        json={
+            "deviceIds": [device_id],
+            "targetVersion": target,
+            "url": f"https://updates.example.com/vikings-{target}.bin",
+            "description": description,
+        },
+    )
+
+
+def _wait_ota_task(
+    ctx: Context,
+    task_id: str,
+    predicate: Callable[[Dict[str, Any]], bool],
+    timeout: float,
+    description: str,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    detail: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        detail = api(ctx, "GET", f"/api/ota/tasks/{task_id}")
+        if predicate(detail):
+            return detail
+        time.sleep(0.2)
+    raise RuntimeError(f"{timeout}s 内未达成{description}，最近任务详情={detail}")
+
+
+def _ota_ack_payload(
+    cmd_id: str, state: str, progress: int, message: str
+) -> Dict[str, Any]:
+    return {
+        "cmdId": cmd_id,
+        "type": "ota",
+        "state": state,
+        "progress": progress,
+        "message": message,
+        "ts": int(time.time() * 1000),
+    }
+
+
+def verify_ota_full_chain(ctx: Context) -> str:
+    """OTA 主链路：创建任务 → 网关下发 → 模拟设备分片进度 → success → REST 一致。"""
+    assert ctx.collector is not None
+    target = "1.1.0"
+    created = _create_ota_task(ctx, ctx.device_id, target, "E2E OTA 全链路")
+    task_id = str(created.get("task_id") or "")
+    devices = created.get("devices") or []
+    if not task_id or len(devices) != 1:
+        raise RuntimeError(f"OTA 任务创建响应异常：{created}")
+    if int(created.get("total", 0)) != 1:
+        raise RuntimeError(f"OTA 任务 total 异常：{created}")
+    if int(created.get("success", 0)) != 0 or int(created.get("failed", 0)) != 0:
+        raise RuntimeError(f"OTA 任务创建时不应已有终态：{created}")
+    cmd_id = str(devices[0].get("cmd_id") or "")
+    ctx.ota_task_id = task_id
+    ctx.ota_cmd_id = cmd_id
+
+    received = ctx.collector.wait_message(
+        lambda m: m["topic"] == f"device/{ctx.device_id}/cmd/ack"
+        and m["payload"].get("cmdId") == cmd_id
+        and m["payload"].get("state") == "received",
+        12,
+        "OTA received 回执",
+    )
+    success = ctx.collector.wait_message(
+        lambda m: m["topic"] == f"device/{ctx.device_id}/cmd/ack"
+        and m["payload"].get("cmdId") == cmd_id
+        and m["payload"].get("state") == "success",
+        20,
+        "OTA success 回执",
+    )
+    acks = [
+        m["payload"]
+        for m in list(ctx.collector.messages)
+        if m["topic"] == f"device/{ctx.device_id}/cmd/ack"
+        and m["payload"].get("cmdId") == cmd_id
+    ]
+    progress_values = [
+        int(ack.get("progress", 0)) for ack in acks if ack.get("state") == "progress"
+    ]
+    if len(progress_values) < 2:
+        raise RuntimeError(f"设备未回报足够的分片进度：{progress_values}")
+    if progress_values != sorted(progress_values):
+        raise RuntimeError(f"OTA 进度回退或乱序：{progress_values}")
+    if int(success["payload"].get("progress", 0)) != 100:
+        raise RuntimeError(f"OTA success 回执 progress 不是 100：{success['payload']}")
+    ctx.ota_ack_states = [ack.get("state", "") for ack in acks]
+
+    detail = _wait_ota_task(
+        ctx,
+        task_id,
+        lambda d: int(d.get("success", 0)) == 1
+        and int(d.get("failed", 0)) == 0
+        and (d.get("devices") or [{}])[0].get("state") == "success"
+        and int((d.get("devices") or [{}])[0].get("progress", 0)) == 100,
+        20,
+        "OTA 任务 success=1 且进度=100",
+    )
+    device = api(ctx, "GET", f"/api/devices/{ctx.device_id}")
+    if device.get("firmware_version") != target:
+        raise RuntimeError(
+            f"OTA 成功后设备固件版本未更新：{device.get('firmware_version')} != {target}"
+        )
+    return (
+        f"任务 {task_id} 真实下发到 {ctx.device_id}；设备回执 "
+        f"received→progress{progress_values}→success(100)；"
+        f"REST 任务 success=1 failed=0，固件已更新为 {target}"
+    )
+
+
+def verify_ota_audit(ctx: Context) -> str:
+    if not ctx.ota_task_id:
+        raise RuntimeError("OTA 主链路未记录 task_id，无法校验审计")
+    page = api(
+        ctx,
+        "GET",
+        "/api/audit-logs",
+        params={"action": "ota.create", "page": 1, "pageSize": 50},
+    )
+    row = next(
+        (
+            item
+            for item in page.get("items") or []
+            if item.get("target_id") == ctx.ota_task_id
+        ),
+        None,
+    )
+    if row is None:
+        raise RuntimeError(f"审计日志缺少 ota.create 记录：{ctx.ota_task_id}")
+    if row.get("operator") != ctx.args.username:
+        raise RuntimeError(f"OTA 审计操作人不正确：{row}")
+    detail = row.get("detail") or {}
+    if detail.get("targetVersion") != "1.1.0" or int(detail.get("deviceCount", 0)) != 1:
+        raise RuntimeError(f"OTA 审计明细不完整：{row}")
+    return (
+        f"审计记录 action=ota.create target={ctx.ota_task_id} "
+        f"operator={row.get('operator')} targetVersion={detail.get('targetVersion')}"
+    )
+
+
+def verify_ota_device_reported_failure(ctx: Context) -> str:
+    """设备主动回执 failed：任务必须进入 failed 终态，不能永久 running。"""
+    password = _create_device_with_credentials(ctx, ctx.fail_device_id, "OTA 失败设备")
+    probe = _open_device_probe(ctx, ctx.fail_device_id, password, firmware="1.0.0")
+    _wait_device_status(ctx, ctx.fail_device_id, "online", 8)
+    target = "1.2.0"
+    created = _create_ota_task(ctx, ctx.fail_device_id, target, "E2E OTA 设备失败路径")
+    task_id = str(created.get("task_id") or "")
+    cmd_id = str((created.get("devices") or [{}])[0].get("cmd_id") or "")
+    if not task_id or not cmd_id:
+        raise RuntimeError(f"失败路径 OTA 任务创建异常：{created}")
+
+    probe.wait_message(
+        lambda m: m["topic"] == f"device/{ctx.fail_device_id}/cmd"
+        and m["payload"].get("cmdId") == cmd_id,
+        10,
+        "失败路径 OTA 指令",
+    )
+    probe.publish_json(
+        f"device/{ctx.fail_device_id}/cmd/ack",
+        _ota_ack_payload(cmd_id, "received", 0, "指令已接收"),
+    )
+    probe.publish_json(
+        f"device/{ctx.fail_device_id}/cmd/ack",
+        _ota_ack_payload(cmd_id, "failed", 40, "固件校验失败（设备侧）"),
+    )
+    detail = _wait_ota_task(
+        ctx,
+        task_id,
+        lambda d: int(d.get("failed", 0)) == 1
+        and int(d.get("success", 0)) == 0
+        and (d.get("devices") or [{}])[0].get("state") == "failed",
+        15,
+        "OTA 任务 failed=1 终态",
+    )
+    device_row = (detail.get("devices") or [{}])[0]
+    if "校验失败" not in str(device_row.get("message") or ""):
+        raise RuntimeError(f"失败原因未保留：{device_row}")
+    failed_device = api(ctx, "GET", f"/api/devices/{ctx.fail_device_id}")
+    if failed_device.get("firmware_version") != "1.0.0":
+        raise RuntimeError(f"OTA 失败却改写了固件版本：{failed_device.get('firmware_version')}")
+    return (
+        f"任务 {task_id} 由设备回执 failed(progress=40)：任务 failed=1 success=0，"
+        f"设备状态={device_row.get('state')}，不会永久 running；"
+        f"设备固件仍为 1.0.0，未被误标为 {target}"
+    )
+
+
+def verify_ota_timeout_terminal(ctx: Context) -> str:
+    """无回执设备：超时巡检把 issued 指令判 failed，任务离开 running。
+
+    为了不让 E2E 等满生产阈值，这里只回拨该指令的 updated_at（时间维度），
+    巡检逻辑、SQL 过滤与汇总刷新都走真实后台协程。
+    """
+    _register_device(ctx, ctx.silent_device_id, "OTA 无回执设备")
+    target = "1.4.0"
+    created = _create_ota_task(ctx, ctx.silent_device_id, target, "E2E OTA 超时路径")
+    task_id = str(created.get("task_id") or "")
+    cmd_id = str((created.get("devices") or [{}])[0].get("cmd_id") or "")
+    if not task_id or not cmd_id:
+        raise RuntimeError(f"超时路径 OTA 任务创建异常：{created}")
+    if not ctx.temp_db:
+        raise RuntimeError("缺少临时库路径，无法回拨超时时钟")
+
+    conn = sqlite3.connect(ctx.temp_db, timeout=5)
+    try:
+        updated = conn.execute(
+            "UPDATE device_command SET updated_at='2000-01-01 00:00:00.000000' WHERE cmd_id=?",
+            (cmd_id,),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError(f"回拨超时时钟失败：cmd_id={cmd_id} rowcount={updated.rowcount}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    detail = _wait_ota_task(
+        ctx,
+        task_id,
+        lambda d: int(d.get("failed", 0)) == 1
+        and int(d.get("success", 0)) == 0
+        and (d.get("devices") or [{}])[0].get("state") == "failed",
+        15,
+        "超时巡检将 OTA 任务置为 failed",
+    )
+    device_row = (detail.get("devices") or [{}])[0]
+    if "超时" not in str(device_row.get("message") or ""):
+        raise RuntimeError(f"超时失败原因不可见：{device_row}")
+    return (
+        f"任务 {task_id} 下发到无回执设备后，后台巡检在 15s 内将指令置 failed；"
+        f"任务 failed=1 success=0（不再永久 running），原因={device_row.get('message')}"
+    )
+
+
+def verify_device_reconnect(ctx: Context) -> str:
+    """设备自身 MQTT 断连后重连（Broker 全程保持运行），重连后指令链路继续可用。"""
+    password = _create_device_with_credentials(
+        ctx, ctx.reconnect_device_id, "MQTT 重连设备"
+    )
+    probe = _open_device_probe(ctx, ctx.reconnect_device_id, password, firmware="1.0.0")
+    _wait_device_status(ctx, ctx.reconnect_device_id, "online", 8)
+
+    probe.publish_json(
+        f"device/{ctx.reconnect_device_id}/status",
+        {
+            "deviceId": ctx.reconnect_device_id,
+            "status": "offline",
+            "firmwareVersion": "1.0.0",
+            "reason": "device-sleep",
+            "ts": int(time.time() * 1000),
+        },
+    )
+    probe.close()
+    _wait_device_status(ctx, ctx.reconnect_device_id, "offline", 8)
+    if not port_open(MQTT_PORT):
+        raise RuntimeError("设备断开期间 Broker 不应停机（本场景是设备侧重连）")
+
+    reconnected = _open_device_probe(
+        ctx,
+        ctx.reconnect_device_id,
+        password,
+        client_id=f"e2e-dev-{ctx.reconnect_device_id}-2",
+    )
+    _wait_device_status(ctx, ctx.reconnect_device_id, "online", 10)
+    if not gateway_mqtt_connected(ctx):
+        raise RuntimeError("设备重连后网关 MQTT 状态不正确")
+
+    command = api(
+        ctx,
+        "POST",
+        f"/api/devices/{ctx.reconnect_device_id}/commands",
+        json={"type": "config", "payload": {"reportIntervalSec": 15}},
+    )
+    cmd_id = str(command.get("cmd_id") or "")
+    if not cmd_id:
+        raise RuntimeError(f"重连后指令下发响应异常：{command}")
+    reconnected.wait_message(
+        lambda m: m["topic"] == f"device/{ctx.reconnect_device_id}/cmd"
+        and m["payload"].get("cmdId") == cmd_id,
+        10,
+        "重连后的 config 指令",
+    )
+    reconnected.publish_json(
+        f"device/{ctx.reconnect_device_id}/cmd/ack",
+        {
+            "cmdId": cmd_id,
+            "type": "config",
+            "state": "success",
+            "progress": 100,
+            "message": "重连后执行完成",
+            "ts": int(time.time() * 1000),
+        },
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        rows = api(
+            ctx,
+            "GET",
+            f"/api/devices/{ctx.reconnect_device_id}/commands",
+            params={"limit": 20},
+        )
+        row = next((item for item in rows if item.get("cmd_id") == cmd_id), None)
+        if row and row.get("state") == "success":
+            return (
+                "设备主动断开→网关 REST 状态 offline→设备用同一凭证重连并上线；"
+                f"重连后下发 config cmd={cmd_id} 仍能收到并回执 success（Broker 未停机）"
+            )
+        time.sleep(0.3)
+    raise RuntimeError("设备重连后指令未在 10s 内变为 success")
+
+
+def ota_restart_prepare(ctx: Context) -> str:
+    """网关重启场景前置：OTA 进行到 30%，设备与回执均已在库。"""
+    password = _create_device_with_credentials(
+        ctx, ctx.restart_device_id, "OTA 重启设备"
+    )
+    probe = _open_device_probe(ctx, ctx.restart_device_id, password, firmware="1.0.0")
+    _wait_device_status(ctx, ctx.restart_device_id, "online", 8)
+    ctx.restart_probe = probe
+
+    target = "1.3.0"
+    created = _create_ota_task(ctx, ctx.restart_device_id, target, "E2E OTA 网关重启")
+    task_id = str(created.get("task_id") or "")
+    cmd_id = str((created.get("devices") or [{}])[0].get("cmd_id") or "")
+    if not task_id or not cmd_id:
+        raise RuntimeError(f"重启场景 OTA 任务创建异常：{created}")
+    ctx.restart_task_id = task_id
+    ctx.restart_cmd_id = cmd_id
+
+    probe.wait_message(
+        lambda m: m["topic"] == f"device/{ctx.restart_device_id}/cmd"
+        and m["payload"].get("cmdId") == cmd_id,
+        10,
+        "重启场景 OTA 指令",
+    )
+    probe.publish_json(
+        f"device/{ctx.restart_device_id}/cmd/ack",
+        _ota_ack_payload(cmd_id, "received", 0, "指令已接收"),
+    )
+    probe.publish_json(
+        f"device/{ctx.restart_device_id}/cmd/ack",
+        _ota_ack_payload(cmd_id, "progress", 30, "下载固件 30%"),
+    )
+    detail = _wait_ota_task(
+        ctx,
+        task_id,
+        lambda d: (d.get("devices") or [{}])[0].get("state") == "progress"
+        and int((d.get("devices") or [{}])[0].get("progress", 0)) == 30,
+        10,
+        "OTA 进度 30% 已落库",
+    )
+    return (
+        f"任务 {task_id} 设备 {ctx.restart_device_id} 已回执 progress=30；"
+        f"REST success={detail.get('success')} failed={detail.get('failed')}"
+    )
+
+
+def gateway_stop_mid_ota(ctx: Context) -> str:
+    """在 OTA 进度 30% 时停网关；停机期间的设备回执/上报按非持久会话丢弃。"""
+    if not ctx.restart_task_id or not ctx.restart_cmd_id or ctx.restart_probe is None:
+        raise RuntimeError("网关重启场景未正确前置")
+    detail = api(ctx, "GET", f"/api/ota/tasks/{ctx.restart_task_id}")
+    row = (detail.get("devices") or [{}])[0]
+    if int(row.get("progress", 0)) != 30 or int(detail.get("success", 0)) != 0:
+        raise RuntimeError(f"停机前进度不是 30%：{detail}")
+
+    stop_gateway_process(ctx)
+    if ctx.gateway_proc is not None or port_open(8000):
+        raise RuntimeError("网关进程未真正停止")
+
+    # 网关离线期间设备继续推进并补发 success，同时上报 seq=7777
+    ctx.restart_probe.publish_json(
+        f"device/{ctx.restart_device_id}/cmd/ack",
+        _ota_ack_payload(ctx.restart_cmd_id, "progress", 60, "下载固件 60%"),
+    )
+    ctx.restart_probe.publish_json(
+        f"device/{ctx.restart_device_id}/cmd/ack",
+        _ota_ack_payload(ctx.restart_cmd_id, "success", 100, "升级完成（停机期间）"),
+    )
+    ctx.restart_probe.publish_json(
+        f"device/{ctx.restart_device_id}/sensor/report",
+        {
+            "deviceId": ctx.restart_device_id,
+            "temperature": 24.0,
+            "humidity": 55.0,
+            "voltage": 3.75,
+            "rssi": -60,
+            "battery": 80,
+            "seq": 7777,
+            "ts": int(time.time() * 1000),
+        },
+    )
+    time.sleep(1.0)
+    return (
+        "网关已在 OTA progress=30% 时停止；设备随后发布的 progress=60、success=100 "
+        "与 seq=7777 上报发生在网关离线期，按 MQTT 非持久会话语义丢弃"
+    )
+
+
+def gateway_restart_recover(ctx: Context) -> str:
+    """重启同一临时库上的网关：持久进度不丢、停机数据明确丢弃、恢复后链路自愈。"""
+    if not ctx.restart_task_id or not ctx.restart_cmd_id or ctx.restart_probe is None:
+        raise RuntimeError("网关重启场景未正确前置")
+    start_gateway(ctx, reuse_db=True)
+    wait_readiness(ctx, expected=True, timeout=25)
+
+    persisted = api(ctx, "GET", f"/api/ota/tasks/{ctx.restart_task_id}")
+    row = (persisted.get("devices") or [{}])[0]
+    if int(row.get("progress", 0)) != 30 or row.get("state") != "progress":
+        raise RuntimeError(f"重启后进度未持久化到 30%：{persisted}")
+    if int(persisted.get("success", 0)) != 0 or int(persisted.get("failed", 0)) != 0:
+        raise RuntimeError(f"停机期间的 success 回执不应落库：{persisted}")
+
+    latest = api(ctx, "GET", "/api/records/latest")
+    if any(item.get("device_id") == ctx.restart_device_id for item in latest):
+        raise RuntimeError("网关停机期间的 seq=7777 上报不应落库")
+
+    # 设备侧重发终态与上报，验证恢复后真正自愈
+    ctx.restart_probe.publish_json(
+        f"device/{ctx.restart_device_id}/cmd/ack",
+        _ota_ack_payload(ctx.restart_cmd_id, "success", 100, "重启后补发成功"),
+    )
+    ctx.restart_probe.publish_json(
+        f"device/{ctx.restart_device_id}/sensor/report",
+        {
+            "deviceId": ctx.restart_device_id,
+            "temperature": 24.5,
+            "humidity": 56.0,
+            "voltage": 3.75,
+            "rssi": -58,
+            "battery": 81,
+            "seq": 7778,
+            "ts": int(time.time() * 1000),
+        },
+    )
+    detail = _wait_ota_task(
+        ctx,
+        ctx.restart_task_id,
+        lambda d: int(d.get("success", 0)) == 1
+        and int(d.get("failed", 0)) == 0
+        and (d.get("devices") or [{}])[0].get("state") == "success",
+        12,
+        "重启后 OTA 任务 success=1",
+    )
+    device = api(ctx, "GET", f"/api/devices/{ctx.restart_device_id}")
+    if device.get("firmware_version") != "1.3.0":
+        raise RuntimeError(f"重启后 OTA 成功未更新固件：{device.get('firmware_version')}")
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        latest = api(ctx, "GET", "/api/records/latest")
+        if any(item.get("device_id") == ctx.restart_device_id for item in latest):
+            return (
+                "网关用同一临时库重启；OTA 进度保持 30%、停机期间 success/seq=7777 明确丢弃；"
+                "恢复后设备补发 success 使任务转为 success=1，固件更新 1.3.0，"
+                "seq=7778 上报重新入库（链路自愈）"
+            )
+        time.sleep(0.3)
+    raise RuntimeError("恢复后设备上报未在 10s 内入库")
+
+
+def wait_readiness(ctx: Context, *, expected: bool, timeout: float) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    body: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(GATEWAY_URL + "/api/health/ready", timeout=5)
+            body = resp.json()
+        except (httpx.HTTPError, ValueError):
+            time.sleep(0.3)
+            continue
+        ready = resp.status_code == 200
+        if ready == expected:
+            return body
+        time.sleep(0.3)
+    raise RuntimeError(
+        f"/api/health/ready 未在 {timeout}s 内变为 {'ready' if expected else 'not_ready'}：{body}"
+    )
+
+
+def verify_db_outage_recovery(ctx: Context) -> str:
+    """/ready 必须真实反映数据库不可用；/health 仍 200；恢复后继续服务。"""
+    if not ctx.temp_db:
+        raise RuntimeError("缺少临时库路径，无法注入数据库故障")
+    if ctx.gateway_proc is None or ctx.gateway_proc.poll() is not None:
+        raise RuntimeError("数据库故障注入前网关进程不存活")
+
+    # 用独占锁让读者拿不到锁：这是 SQLite 下最接近"数据库短暂不可用"的真实故障
+    lock = sqlite3.connect(ctx.temp_db, timeout=0)
+    lock.execute("PRAGMA busy_timeout=0")
+    acquired = False
+    try:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            try:
+                lock.execute("BEGIN EXCLUSIVE")
+                acquired = True
+                break
+            except sqlite3.OperationalError:
+                time.sleep(0.2)
+        if not acquired:
+            raise RuntimeError("6s 内无法获取 SQLite 独占锁（后台任务占用过久）")
+        ctx.db_lock_conn = lock
+
+        health = httpx.get(GATEWAY_URL + "/api/health", timeout=5)
+        if health.status_code != 200:
+            raise RuntimeError(f"数据库不可用时 /api/health 未保持 200：{health.status_code}")
+        if ctx.gateway_proc.poll() is not None:
+            raise RuntimeError("数据库不可用导致网关进程退出")
+
+        ready = httpx.get(GATEWAY_URL + "/api/health/ready", timeout=10)
+        if ready.status_code != 503:
+            raise RuntimeError(
+                f"数据库不可用时 /api/health/ready 未返回 503：{ready.status_code} {ready.text}"
+            )
+        body = ready.json()
+        database = ((body.get("data") or {}).get("components") or {}).get("database") or {}
+        if database.get("ok") is not False:
+            raise RuntimeError(f"/ready 未指出数据库失败：{database}")
+        if not database.get("error"):
+            raise RuntimeError(f"/ready 数据库失败缺少错误摘要：{database}")
+    finally:
+        try:
+            lock.rollback()
+        except sqlite3.Error:
+            pass
+        lock.close()
+        ctx.db_lock_conn = None
+
+    wait_readiness(ctx, expected=True, timeout=15)
+    api(ctx, "GET", "/api/devices", params={"page": 1, "pageSize": 20})
+    return (
+        "数据库被独占锁住时：/api/health 仍 200（存活），/api/health/ready 返回 503 且 "
+        "components.database.ok=false、error 可见，网关进程未退出；释放后 /ready 回 200，"
+        "REST 设备列表继续可用"
+    )
+
+
 def stop_simulator(ctx: Context) -> str:
     proc = ctx.simulator_proc
     if proc is None or proc.poll() is not None:
@@ -1300,6 +1997,19 @@ def recover_real_data(ctx: Context) -> str:
 def cleanup(ctx: Context) -> None:
     started = time.monotonic()
     notes: List[str] = []
+    if ctx.db_lock_conn is not None:
+        try:
+            ctx.db_lock_conn.rollback()
+            ctx.db_lock_conn.close()
+            notes.append("数据库故障注入锁已释放")
+        except sqlite3.Error:
+            pass
+        ctx.db_lock_conn = None
+    for probe in ctx.probes:
+        probe.close()
+    if ctx.probes:
+        notes.append(f"{len(ctx.probes)} 个设备探针已断开")
+        ctx.probes.clear()
     if ctx.collector is not None:
         ctx.collector.stop()
         ctx.collector = None
@@ -1391,7 +2101,20 @@ def main() -> int:
         rep.run("alert_ack", lambda: ack_alert(ctx))
         rep.run("alert_center_bulk_ack", lambda: verify_alert_center_bulk_ack(ctx))
         rep.run("group_change", lambda: verify_group_change(ctx))
+        # OTA 必须在模拟器唤醒窗口内下发（与 command 一样依赖 6s 监听窗口）
+        rep.run("ota_window", lambda: wait_report_round(ctx, 3))
+        rep.run("ota_full_chain", lambda: verify_ota_full_chain(ctx))
+        rep.run("ota_audit", lambda: verify_ota_audit(ctx))
         rep.run("stop_simulator", lambda: stop_simulator(ctx))
+        # 失败路径：设备主动回执 failed / 设备无回执触发超时终态
+        rep.run("ota_device_failure", lambda: verify_ota_device_reported_failure(ctx))
+        rep.run("ota_timeout_terminal", lambda: verify_ota_timeout_terminal(ctx))
+        # 故障注入：设备侧重连（Broker 不停）、网关重启、数据库短暂不可用
+        rep.run("device_reconnect", lambda: verify_device_reconnect(ctx))
+        rep.run("ota_restart_prepare", lambda: ota_restart_prepare(ctx))
+        rep.run("gateway_stop_mid_ota", lambda: gateway_stop_mid_ota(ctx))
+        rep.run("gateway_restart_recover", lambda: gateway_restart_recover(ctx))
+        rep.run("db_outage_recovery", lambda: verify_db_outage_recovery(ctx))
         rep.run("degrade_disconnect", lambda: degrade_disconnect(ctx))
         rep.run("degrade_polling_rest", lambda: degrade_polling_rest(ctx))
         rep.run("recover_broker", lambda: recover_broker(ctx))

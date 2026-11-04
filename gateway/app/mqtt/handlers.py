@@ -92,7 +92,7 @@ class MessageHandler:
             return
 
         async with SessionFactory() as session:
-            cmd = await command_service.apply_ack(session, msg)
+            cmd = await command_service.apply_ack(session, msg, device_id=device_id)
             await session.commit()
 
         if cmd is None:

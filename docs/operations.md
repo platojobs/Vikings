@@ -83,7 +83,7 @@ docker compose -f infra/docker-compose.prod.yml logs gateway --since 1h | \
 | 端点 | 语义 | 是否查库/查 Broker |
 | --- | --- | --- |
 | `/api/health` | 存活：进程活着就 200 | 否 |
-| `/api/health/ready` | 就绪：DB 真实 `SELECT 1` + MQTT 已连接 | 是 |
+| `/api/health/ready` | 就绪：DB 真实读 `device` 表 + MQTT 已连接 | 是 |
 
 容器 `HEALTHCHECK` 与编排健康检查引用 `/ready`：数据库或 Broker 不可用时容器不应标记为健康。
 数据库故障时 `/api/health` 仍返回 200，`/ready` 返回 503 并在 `components` 指出具体层。
@@ -476,3 +476,75 @@ curl -skI https://<host>/ | grep -Ei 'strict-transport|x-content-type|referrer-p
 
 周期性轮换：管理员口令、`JWT_SECRET`（会使现有 token 失效）、MQTT 服务与客户端口令。
 轮换 `JWT_SECRET` 后重建 gateway 并通知用户重新登录。
+
+---
+
+## 10. 故障场景处置（v1.23.0）
+
+以下场景均在 E2E（`scripts/e2e/e2e_acceptance.py`）中真实注入并断言，不是纸面推演。
+每条给出「语义」与「处置动作」，避免只确认"进程没崩"。
+
+### 10.1 网关在上报 / OTA 过程中重启
+
+**语义**：网关使用 MQTT 非持久会话（clean session），停机期间设备发布到
+`cmd/ack`、`sensor/report` 的报文**明确丢弃**，不会在恢复后补投；
+已写入数据库的进度（`device_command.state/progress`、`ota_task` 汇总）持久保留。
+
+**处置**：
+
+1. `curl -sf http://127.0.0.1:8000/api/health/ready | jq` 确认 DB 与 MQTT 均 ready；
+2. `GET /api/ota/tasks/{taskId}` 对比重启前进度：进度不前进属正常，**不应回退**；
+3. 让设备侧重新上报一次终态（设备通常会在重连后补发）；若任务已进入 `failed`
+   （设备失败或超时），不要改库复活，直接创建新任务重试；
+4. 用审计（`action=ota.create`）与 `.run/e2e/gateway-restart.log` 对齐时间线。
+
+**不要做**：手工把 `success` 写进 `device_command`/`ota_task`。终态不可回退是刻意设计，
+绕过它会让后续真实回执失去可比性。
+
+### 10.2 设备自身断连后重连（Broker 未停机）
+
+**语义**：设备主动发布 `offline(reason=sleep)` 或异常掉线触发 LWT 后，网关设备状态转
+`offline`；设备用同一凭证重连并发布 `online` 后恢复可用，重连后新下发的指令仍能到达并回执。
+
+**处置**：
+
+1. `GET /api/devices/{deviceId}` 看 `status` 与 `last_seen`；
+2. 检查 Broker 日志中该 `clientId` 的 CONNECT/DISCONNECT；若反复重连，优先查弱网、
+   clientId 冲突与凭证是否被吊销；
+3. 设备长时间不回来时按离线巡检处理（默认 300s 置离线），不要手工改状态。
+
+### 10.3 数据库短暂不可用
+
+**语义**：`/api/health` 保持 200（只看进程存活）；`/api/health/ready` 返回 503，
+`components.database.ok=false` 且带脱敏错误摘要；网关进程不退出，后台巡检/清理
+下个周期自动重试。DB 恢复后 `/ready` 回 200，REST 继续服务。
+
+**处置**：
+
+1. `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/health`（应为 200）；
+2. `curl -s http://127.0.0.1:8000/api/health/ready | jq '.data.components.database'`；
+3. 按错误摘要检查：磁盘写满、SQLite 文件权限/独占锁、Postgres 连接数或容器健康；
+4. 恢复后再次确认 `/ready=200` 与 `/api/devices` 可读，再决定是否需要补偿丢失的上报。
+
+> `/ready` 从 v1.23.0 起真实读取 `device` 表，而不是 `SELECT 1`，因此独占锁/存储损坏
+> 这类"连接还在但读不了库"的故障也能被发现。
+
+### 10.4 指令一直停在 issued / progress（设备无回执）
+
+**语义**：超过 `COMMAND_TIMEOUT_SECONDS`（默认 300s）无有效回执的指令，由后台巡检
+`指令超时巡检` 置为 `failed`，`message=设备超时未回执（超过 N 秒）`，并同步刷新
+OTA 任务 `failed` 计数。此后即使迟到 `success` 也不会复活。
+
+**处置**：
+
+1. `GET /api/devices/{deviceId}/commands` 确认 `state` 与 `updated_at`；
+2. 查看设备是否在线、Topic ACL 是否允许订阅 `device/{deviceId}/cmd`；
+3. 需要重试时**创建新指令/新 OTA 任务**，不要延长超时阈值来等待已失联设备；
+4. 若单次 OTA 正常耗时就接近阈值，调大 `COMMAND_TIMEOUT_SECONDS` 与
+   `COMMAND_SWEEP_INTERVAL_SECONDS`（compose 已透传，见 `infra/prod/.env.example`）。
+
+### 10.5 Broker 停机与降级
+
+Broker 停机时 `/api/health` 仍 200、`/ready` 的 `components.mqtt.connected=false`；
+Web/移动端由 WebSocket 实时切换为 REST 轮询（见第 2 节指标）。Broker 恢复后网关自动重连，
+设备重新上线后数据恢复。该场景已由既有 E2E `degrade_* / recover_*` 覆盖。

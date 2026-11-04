@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     # 离线巡检与数据清理的执行周期（秒）
     offline_sweep_interval_seconds: int = 60
     data_purge_interval_seconds: int = 3600
+    # 指令终态兜底：超过该秒数仍停留在 issued/received/progress 的指令判为失败，
+    # 避免设备无回执时任务永久停在 running（默认与设备离线阈值一致 300s）
+    command_timeout_seconds: int = 300
+    command_sweep_interval_seconds: int = 60
 
     # ---- 告警 Webhook 外推（空则关闭）----
     # 产生 critical 告警时向该 URL POST JSON，可用于对接钉钉/飞书/企业微信机器人

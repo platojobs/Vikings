@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app import models  # noqa: F401  注册 ORM 元数据
-from app.database import Base, get_session
+from app.database import get_session
 from app.main import app
 from app.models import AuditLog, Device, DeviceAlert
 from app.security import ROLE_OPERATOR, ROLE_VIEWER, create_access_token
+from db_utils import create_test_engine
 
 
 class _BrokenMqtt:
@@ -29,9 +30,7 @@ class _BrokenMqtt:
 
 
 async def _run_with_app(tmp_path, scenario):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path/'http.db'}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine = await create_test_engine(tmp_path, "http.db")
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
     async def override_session():

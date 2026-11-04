@@ -86,7 +86,7 @@ grep '<requestId>' logs/gateway.log
 | 端点 | 语义 | 查库 | 查 Broker | 典型使用方 |
 | --- | --- | --- | --- | --- |
 | `GET /api/health` | 存活（liveness） | 否 | 否 | 进程级探针、E2E、现有调用方 |
-| `GET /api/health/ready` | 就绪（readiness） | 真实 `SELECT 1`（3 秒超时） | 读取连接状态 | 容器 `HEALTHCHECK`、反代启动依赖、人工排查 |
+| `GET /api/health/ready` | 就绪（readiness） | 真实读取 `device` 表（3 秒超时） | 读取连接状态 | 容器 `HEALTHCHECK`、反代启动依赖、人工排查 |
 
 `/api/health` 返回结构保持不变（`status` / `mqttConnected` / `mqttLastError` / `messagesHandled`），只是不再作为容器健康判据。
 

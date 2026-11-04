@@ -92,7 +92,10 @@ async def dispose_engine() -> None:
 async def probe_database(
     target: Optional[AsyncEngine] = None, timeout_seconds: float = 3.0
 ) -> dict:
-    """真实执行一次 `SELECT 1`，返回可用性与耗时（供 `/api/health/ready`）。
+    """真实读取 `device` 表一行，返回可用性与耗时（供 `/api/health/ready`）。
+
+    不用 `SELECT 1`：后者不触碰库文件/数据块，数据库被独占锁或存储损坏时仍可能通过，
+    会让就绪探针变成"只验证连接对象存在"。读取真实表既能验证连接，也能验证 schema 可读。
 
     超时与异常都视为「数据库不可用」；错误文本经过脱敏，避免把连接串写进响应。
     SQLite 下同样会打开连接并执行查询，因此开发环境也能验证这条链路。
@@ -104,7 +107,7 @@ async def probe_database(
 
     async def _query() -> None:
         async with target_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+            await conn.execute(text("SELECT 1 FROM device LIMIT 1"))
 
     try:
         await asyncio.wait_for(_query(), timeout=timeout_seconds)

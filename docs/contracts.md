@@ -155,7 +155,14 @@ Broker 的 1883（MQTT over TCP）与 9001（MQTT over WebSocket）**均关闭�
 ```
 
 - `state`：`received` / `progress` / `success` / `failed`
-- `progress`：0 ~ 100，仅 OTA 场景有值
+- `progress`：0 ~ 100，仅 OTA 场景有值；`success` 回执即使未带 100，网关也按 100 记录
+- **终态不可回退（v1.23.0）**：`success` / `failed` 一旦写入，后续乱序、重复或迟到回执
+  不再改变状态与进度；OTA 任务的 `success` / `failed` 汇总随之固定。需要重试时创建新指令。
+- **超时兜底（v1.23.0）**：指令超过 `COMMAND_TIMEOUT_SECONDS`（默认 300s）仍停在
+  `issued` / `received` / `progress`，后台巡检将其置为 `failed`，`message` 写明超时秒数；
+  任务不会再永久停在 running。阈值可通过环境变量覆盖，生产建议不小于单次 OTA 最长耗时。
+- **归属校验（v1.23.0）**：回执只能推进 `device/{deviceId}/cmd` 对应设备的指令；
+  跨设备回执被忽略并记 warning，避免设备 B 改写设备 A 的指令。
 
 ### 2.5 系统告警 `device/system/alert`
 
@@ -417,9 +424,22 @@ fire-and-forget，不阻塞告警主链路。
 | --- | --- | --- |
 | POST | `/api/devices/{deviceId}/commands` | 下发指令，入参 `{type, payload}`，网关于 MQTT 发布到 `cmd` Topic |
 | GET | `/api/devices/{deviceId}/commands` | 指令历史（含回执状态/进度） |
-| POST | `/api/ota/tasks` | 创建 OTA 任务，入参 `{deviceIds[], targetVersion, url, description}` |
+| POST | `/api/ota/tasks` | 创建 OTA 任务，入参 `{deviceIds[], targetVersion, url, description}`；任一设备不存在返回 400 且不创建任务 |
 | GET | `/api/ota/tasks` | OTA 任务列表（含每台设备升级状态） |
 | GET | `/api/ota/tasks/{taskId}` | OTA 任务详情 |
+
+**任务状态口径（v1.23.0）**：任务不单独存 `status` 字段，以
+`total` / `success` / `failed` 与每台设备的 `state` / `progress` 表达进度：
+
+| 情形 | 汇总 | 设备状态 |
+| --- | --- | --- |
+| 已下发、设备未回执 | `success=0, failed=0` | `issued` |
+| 升级中 | `success=0, failed=0` | `received` / `progress` |
+| 全部成功 | `success=total, failed=0` | `success`（progress=100） |
+| 任一失败（含设备回执 failed、下发失败、超时） | `failed≥1` | `failed` |
+| 部分成功 | `success + failed == total` | 各自终态 |
+
+终态一经写入即稳定；`success`/`failed` 之和达到 `total` 时任务不再接受状态变化。
 
 ### 3.8 统计 / 健康
 
@@ -428,7 +448,7 @@ fire-and-forget，不阻塞告警主链路。
 | GET | `/api/stats/overview` | 设备总数/在线数/今日上报数/未确认告警数 |
 | GET | `/api/system/status` | 系统状态快照（仅 admin）：`gateway` 运行时长、`mqtt` 连接与消费量、`storage` 容量、`scheduler` 后台任务参数、`notify` Webhook 是否启用（地址脱敏） |
 | GET | `/api/health` | 存活探针：进程存活即 200，不查库/不查 Broker（无需鉴权） |
-| GET | `/api/health/ready` | 就绪探针（v1.20.0）：真实 `SELECT 1` + MQTT 连接状态；未就绪返回 503 与各组件明细（无需鉴权） |
+| GET | `/api/health/ready` | 就绪探针（v1.20.0，v1.23.0 加强）：真实读取 `device` 表 + MQTT 连接状态；未就绪返回 503 与各组件明细（无需鉴权） |
 | GET | `/metrics` | Prometheus 文本指标（v1.20.0）：反代只允许内网来源，网关 8000 端口不对外发布 |
 
 **请求追踪（v1.20.0）**：所有 HTTP 响应都带 `X-Request-Id`；若请求方传入合法的
@@ -656,12 +676,12 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | device_id | varchar(64) | 目标设备 |
 | type | varchar(16) | calibrate / ota / reboot / config |
 | payload | jsonb | 指令参数 |
-| state | varchar(16) | issued / received / progress / success / failed |
-| progress | int | 0 ~ 100 |
-| message | varchar(255) | 回执描述 |
+| state | varchar(16) | issued / received / progress / success / failed（后两者为不可回退终态） |
+| progress | int | 0 ~ 100；success 固定 100 |
+| message | varchar(255) | 回执描述；超时巡检写入「设备超时未回执（超过 N 秒）」 |
 | ota_task_id | varchar(64) NULL | 归属 OTA 任务 |
 | operator | varchar(64) | 下发人 |
-| created_at / updated_at | timestamptz | 时间戳 |
+| created_at / updated_at | timestamptz | 时间戳；`updated_at` 是超时巡检的判据（每次有效回执刷新） |
 
 ### `ota_task`
 

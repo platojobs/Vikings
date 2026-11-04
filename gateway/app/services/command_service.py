@@ -71,6 +71,10 @@ async def issue_command(
         logger.error("指令下发失败 cmd=%s device=%s err=%s", cmd.cmd_id, device_id, exc)
         cmd.state = "failed"
         cmd.message = "MQTT 下发失败: " + str(exc)[:200]
+        await session.flush()
+        if ota_task_id:
+            # 下发失败也是终态，必须立即计入任务 failed，否则任务会永远显示 running
+            await refresh_task_summary(session, ota_task_id)
         await session.commit()
         return cmd, "MQTT 下发失败，请检查 Broker 连接"
 
@@ -78,24 +82,50 @@ async def issue_command(
     return cmd, None
 
 
-async def apply_ack(session: AsyncSession, msg: CommandAckMessage) -> Optional[DeviceCommand]:
-    """处理设备回执：推进状态机与 OTA 进度，并同步任务汇总。"""
+async def apply_ack(
+    session: AsyncSession,
+    msg: CommandAckMessage,
+    *,
+    device_id: Optional[str] = None,
+) -> Optional[DeviceCommand]:
+    """处理设备回执：推进状态机与 OTA 进度，并同步任务汇总。
+
+    `device_id` 由 MQTT 主题解析而来，用于校验回执只能推进自己的指令；
+    不传时保持旧行为（仅单测/内部调用），网关实际处理始终传入。
+    """
     cmd = await session.get(DeviceCommand, msg.cmd_id)
     if cmd is None:
-        logger.warning("收到未知指令回执 cmd=%s device=%s", msg.cmd_id, msg.device_id)
+        logger.warning("收到未知指令回执 cmd=%s device=%s", msg.cmd_id, device_id or "-")
+        return None
+    if device_id and cmd.device_id != device_id:
+        logger.warning(
+            "回执设备与指令归属不一致，已忽略 cmd=%s expected=%s actual=%s",
+            msg.cmd_id,
+            cmd.device_id,
+            device_id,
+        )
         return None
 
-    # 状态只允许前进，防止乱序回执把 success 回退成 progress
-    state_rank = {"issued": 0, "received": 1, "progress": 2, "success": 3, "failed": 3}
-    if state_rank.get(msg.state, 0) >= state_rank.get(cmd.state, 0) or msg.state == "failed":
-        cmd.state = msg.state
-    cmd.progress = max(cmd.progress, msg.progress)
-    if msg.message:
-        cmd.message = msg.message
-    cmd.updated_at = _now()
-    await session.flush()
+    previous_state = cmd.state
+    # 终态不可回退：success/failed 之后的乱序或重复回执不再改状态。
+    # 超时巡检写入的 failed 同样保持终态，重试应创建新指令而不是复活旧指令。
+    if previous_state not in ("success", "failed"):
+        # 状态只允许前进，防止乱序回执把 success 回退成 progress
+        state_rank = {"issued": 0, "received": 1, "progress": 2, "success": 3, "failed": 3}
+        if state_rank.get(msg.state, 0) >= state_rank.get(previous_state, 0):
+            cmd.state = msg.state
+        # success 即使设备没带 progress=100，也按已完成处理，避免状态与进度错位
+        if cmd.state == "success":
+            cmd.progress = 100
+        else:
+            cmd.progress = max(cmd.progress, msg.progress)
+        if msg.message:
+            cmd.message = msg.message
+        cmd.updated_at = _now()
+        await session.flush()
 
-    if msg.type == "ota" and msg.state == "success":
+    changed = cmd.state != previous_state
+    if changed and msg.type == "ota" and cmd.state == "success":
         # 升级成功后同步设备固件版本，后台列表页展示最新版本
         device = await session.get(Device, cmd.device_id)
         target_version = (cmd.payload or {}).get("targetVersion")
@@ -103,14 +133,14 @@ async def apply_ack(session: AsyncSession, msg: CommandAckMessage) -> Optional[D
             device.firmware_version = str(target_version)[:32]
             await session.flush()
 
-    if msg.type == "ota" and cmd.ota_task_id and msg.state in ("success", "failed"):
+    if changed and msg.type == "ota" and cmd.ota_task_id and cmd.state in ("success", "failed"):
         # 必须先 flush 再汇总，否则统计查询读到的还是旧状态
-        await _refresh_task_summary(session, cmd.ota_task_id)
+        await refresh_task_summary(session, cmd.ota_task_id)
 
     return cmd
 
 
-async def _refresh_task_summary(session: AsyncSession, task_id: str) -> None:
+async def refresh_task_summary(session: AsyncSession, task_id: str) -> None:
     """重算 OTA 任务的成功/失败汇总。"""
     task = await session.get(OtaTask, task_id)
     if task is None:
@@ -142,13 +172,25 @@ async def create_ota_task(
     description: Optional[str],
     operator: str,
 ) -> OtaTaskOut:
-    """创建 OTA 任务：先建任务，再逐台设备下发 ota 指令。"""
+    """创建 OTA 任务：先校验设备存在，再建任务并逐台下发 ota 指令。
+
+    设备不存在时直接抛 ValueError，而不是建出一个永远凑不齐 total 的僵尸任务
+    （不存在的设备不会产生指令行，汇总永远停在 success=0/failed=0）。
+    """
+    ordered_ids = list(dict.fromkeys(device_ids))
+    existing = set(
+        (await session.execute(select(Device.device_id).where(Device.device_id.in_(ordered_ids)))).scalars().all()
+    )
+    missing = [device_id for device_id in ordered_ids if device_id not in existing]
+    if missing:
+        raise ValueError("设备不存在: " + ", ".join(missing[:5]))
+
     task = OtaTask(
         task_id="ota-" + uuid.uuid4().hex[:12],
         target_version=target_version,
         url=url,
         description=description,
-        total=len(device_ids),
+        total=len(ordered_ids),
         success=0,
         failed=0,
         created_at=_now(),
@@ -158,7 +200,7 @@ async def create_ota_task(
 
     payload = {"targetVersion": target_version, "url": url}
     error_msgs: List[str] = []
-    for device_id in device_ids:
+    for device_id in ordered_ids:
         _, err = await issue_command(
             session, publisher, device_id, "ota", payload, operator, ota_task_id=task.task_id
         )

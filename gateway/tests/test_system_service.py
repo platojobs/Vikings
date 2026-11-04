@@ -4,19 +4,17 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app import models  # noqa: F401  注册 ORM 元数据
-from app.database import Base
 from app.models import Device, DeviceAlert, SensorRecord
 from app.services import system_service
+from db_utils import create_test_engine
 
 
 def _run(tmp_path, scenario):
     async def wrapper():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path/'test.db'}")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        engine = await create_test_engine(tmp_path)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as session:
             await scenario(session)

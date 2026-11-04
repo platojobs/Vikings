@@ -45,10 +45,11 @@ jobs:
         run: pytest -q
 
   postgres:
-    name: PostgreSQL 迁移与数据生命周期
+    name: PostgreSQL 迁移、生命周期与核心用例
     runs-on: ubuntu-latest
     # 真实 PostgreSQL 验证 SQLite 覆盖不到的方言差异（索引/时间类型/DDL 事务）。
-    # 只跑迁移与生命周期测试，不重复跑全量 pytest，避免 CI 明显变慢。
+    # 除迁移/生命周期外，再跑告警、设备、认证、HTTP 与指令/OTA 状态机这批核心用例；
+    # 其余用例仍由 gateway 作业（SQLite，更快）覆盖，避免两个作业重复全量。
     timeout-minutes: 10
     defaults:
       run:
@@ -92,6 +93,16 @@ jobs:
           alembic check
       - name: 数据生命周期与索引（真实 PostgreSQL）
         run: pytest tests/test_data_lifecycle.py -q
+      - name: 核心用例：告警/设备/认证/HTTP/指令与 OTA（真实 PostgreSQL）
+        run: |
+          pytest -q \
+            tests/test_alert_service.py \
+            tests/test_device_service.py \
+            tests/test_device_group_event.py \
+            tests/test_system_service.py \
+            tests/test_auth_protection.py \
+            tests/test_http_regression.py \
+            tests/test_command_service.py
 
   web:
     name: Vue 后台（单元测试 + 类型检查 + 构建）

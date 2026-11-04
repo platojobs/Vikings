@@ -6,7 +6,9 @@
 > 状态更新：P0-2 于 v1.16.0 完成、P0-3 于 v1.17.0 完成、P0-1 于 v1.18.0 完成；
 > P1-2（数据生命周期 + 备份恢复）与 P1-3（迁移机制）于 v1.19.0 合并完成；
 > P1-1（可观测性）于 v1.20.0 完成；
-> P1-4（Web 批量确认）、P2-2（处置备注）、P2-1（级别口径统一）于 v1.21.0 合并完成。
+> P1-4（Web 批量确认）、P2-2（处置备注）、P2-1（级别口径统一）于 v1.21.0 合并完成；
+> P1-5（移动端可发布产物与依赖治理）于 v1.22.0 完成；
+> P1-7（OTA E2E、故障注入、Postgres 扩容、真机清单）于 v1.23.0 完成。
 > P0 阻断项已全部关闭。
 
 ## 总体结论
@@ -17,8 +19,10 @@
 
 - 所有写操作都有审计：`grep audit_service.log(` 覆盖登录、设备、告警、指令、OTA、阈值、账号，动作常量集中在 `gateway/app/services/audit_service.py`；
 - 已有 `/api/health` 存活探针并暴露 Broker 连接状态（`gateway/app/api/routes/stats.py:22-35`）；
-- 自动化基线真实可跑：gateway `pytest` 87 条、Flutter 67 条、Web 7 条、真实 Broker E2E 25/25；
-- OTA 代码链路完整（任务创建 → 指令下发 → 模拟器进度回执），只是缺 E2E 覆盖（`gateway/app/api/routes/ota.py:14-47`、`scripts/simulate_device.py:111-116`）。
+- 自动化基线真实可跑：gateway `pytest` 118 条、Flutter 71 条、Web 17 条、真实 Broker E2E 35/35；
+- OTA 已从「代码链路完整但无 E2E」补齐为真实端到端覆盖：任务创建 → 网关下发 →
+  模拟设备 received/progress/success → REST 汇总与固件版本一致 → 审计可查
+  （`scripts/e2e/e2e_acceptance.py` 的 `ota_*` 与 `gateway_restart_*` / `db_outage_*`）。
 
 ---
 
@@ -314,7 +318,7 @@
   - `README.md` 顶部新增「生产部署（v1.18.0）」区块，指向以上两份文档。
   - P1-2 的定时备份与恢复演练仍待补，文档中已给出当前可用的 `pg_dump`/卷备份命令。
 
-### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证
+### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证 ✅ 已完成（v1.23.0）
 
 - **现状证据**
   - 本地真实执行：gateway `pytest -q` 87 条、`flutter test` 67 条、`npm run test` 7 条、E2E 25/25 PASS。
@@ -325,6 +329,52 @@
 - **建议做法**：E2E 增加 OTA 任务（创建 → 模拟器进度 → 成功/版本更新）；CI 增加 Postgres service 跑一遍 pytest 与迁移；为 DB 断连、Broker 断连补网关降级测试；发布前保留一份真机手工清单（弱网、切后台、权限拒绝、推送）。
 - **预估工作量**：2~3 人日。
 - **依赖关系**：OTA E2E 依赖 P1-5 的模拟器/发布环境无关，可直接做；Postgres CI 依赖 P1-3 迁移骨架。
+
+- **完成证据（v1.23.0）**
+  - **OTA 端到端真实跑通**：E2E 新增 `ota_full_chain` / `ota_audit` / `ota_device_failure` /
+    `ota_timeout_terminal`。主链路为「REST 创建任务 → 网关发布 `device/{id}/cmd` →
+    `simulate_device.py` 回执 received 与 progress[10,30,55,80] → success(100) →
+    REST `success=1 failed=0`、设备 `firmware_version=1.1.0` → 审计 `ota.create` 可查」。
+  - **发现并修复产品缺陷（4 处，先修代码再补测试）**
+    1. 无回执指令永久停在 `issued/progress`：新增后台「指令超时巡检」
+       （`gateway/app/background_tasks.py::sweep_stale_commands`，
+       `COMMAND_TIMEOUT_SECONDS`/`COMMAND_SWEEP_INTERVAL_SECONDS`），把超时指令置 `failed`
+       并刷新 OTA 汇总。回归差异：E2E `ota_timeout_terminal` 在巡检关闭时
+       `15s 内未达成...任务 success=0 failed=0 state=issued`（FAIL），开启后 PASS。
+    2. 终态可被迟到回执覆盖：原 `apply_ack` 允许 `failed` 无条件覆盖 `success`。
+       现为终态不可回退；`test_terminal_state_does_not_regress_on_late_ack` 在旧逻辑下
+       `assert 'failed' == 'success'` 失败，修复后通过。
+    3. 下发失败不计入任务：`issue_command` MQTT 发布异常只把指令置 failed，任务汇总仍为 0；
+       现立即刷新汇总（`test_dispatch_failure_counts_as_task_failed`）。
+    4. 回执可跨设备推进：`apply_ack` 未校验主题归属；现按 `device_id` 校验，
+       跨设备回执忽略（`test_ack_cannot_advance_another_devices_command`）。
+       另：不存在设备的 OTA 任务不再产生"永远凑不齐 total"的僵尸任务，返回 400。
+  - **故障注入（真实断言，不是只断言没崩）**
+    - `gateway_stop_mid_ota` + `gateway_restart_recover`：进度 30% 时停网关；停机期间
+      progress=60 / success / seq=7777 明确丢弃；同一临时库重启后进度仍为 30%、
+      success/failed 为 0；设备补发 success 后任务转 `success=1`、固件 1.3.0，
+      seq=7778 重新入库（自愈）。
+    - `device_reconnect`：Broker 全程在线，设备主动 offline→断开→同凭证重连 online；
+      重连后新下发 config 指令仍能收到并回执 success。
+    - `db_outage_recovery`：SQLite 独占锁期间 `/api/health` 200、`/ready` 503 且
+      `components.database.ok=false`、网关进程存活；释放后 `/ready` 200、REST 可读。
+    - Broker 停机/降级沿用既有 `degrade_disconnect` / `recover_*` 用例。
+  - **CI Postgres 扩容**：`postgres` 作业在迁移/往返/lifecycle 之外，新增
+    告警、设备、设备分组事件、系统、认证、HTTP、指令/OTA 状态机共 56 条核心用例
+    （`TEST_POSTGRES_URL` 下每个用例 TRUNCATE 隔离）。本地按 CI 步骤实测：
+    迁移往返 + lifecycle 4 条 + 核心 56 条 = 60 passed，总耗时 6.04s
+    （其中 56 条核心用例 2.90s，远低于 10min 上限）。
+    其余用例仍留在 gateway（SQLite）作业，避免两个作业重复全量。
+  - **测试隔离**：E2E 沿用临时 SQLite + 临时 Broker 数据目录；新增 4 个设备探针在
+    cleanup 中断开，数据库故障锁在 finally 释放；连续两次全量 E2E 均为 35/35 PASS
+    （39.5s / 40.3s），结束后 1883/9001/8000/5173 全部空闲、无 `vikings-e2e-*` 残留
+    （仅本次手工留存的两份运行日志在 `/tmp`，不含数据库或 Broker 数据目录）。
+  - **真机清单**：新增 `docs/device-acceptance.md`，覆盖设备接入、凭证签发/轮换、
+    指令下发、OTA、告警确认、断网/弱网、后台省电、异常提示，每项含操作与通过标准，
+    并挂到 README 文档索引。
+  - **回归**：gateway `pytest` 118 passed（4.92s）；`flutter analyze` 无问题（3.0s）；
+    `flutter test` 71 passed；`web npm run test` 17 passed（3.35s）；
+    `web npm run build` 成功（4.30s）；E2E 35/35 PASS（两次）。
 
 ---
 

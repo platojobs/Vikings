@@ -5,16 +5,17 @@ import asyncio
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app import main
 from app.api.routes import auth as auth_route
 from app.config import Settings
-from app.database import Base, get_session
+from app.database import get_session
 from app.models import AppUser
 from app.security import ROLE_ADMIN, ROLE_OPERATOR, hash_password
 from app.services import user_service
 from app.services.login_guard import LoginRateLimiter
+from db_utils import create_test_engine
 
 
 def _secure_production_settings(**overrides) -> Settings:
@@ -35,8 +36,16 @@ def _secure_production_settings(**overrides) -> Settings:
 
 
 def test_production_default_secrets_abort_startup(monkeypatch):
-    """APP_ENV=production 且仍是默认 JWT/口令/SQLite 时，lifespan 直接拒绝启动。"""
-    insecure = Settings(_env_file=None, app_env="production")
+    """APP_ENV=production 且仍是默认 JWT/口令/SQLite 时，lifespan 直接拒绝启动。
+
+    显式指定默认 SQLite 连接串：CI 的 Postgres 作业会注入 DATABASE_URL，
+    若不显式设置，这条用例会被环境变量「意外修好」，失去原本的断言价值。
+    """
+    insecure = Settings(
+        _env_file=None,
+        app_env="production",
+        database_url="sqlite+aiosqlite:///./data/iot.db",
+    )
     monkeypatch.setattr(main, "settings", insecure)
 
     async def boot():
@@ -72,9 +81,7 @@ def test_development_keeps_defaults_with_warnings():
 
 
 async def _seed_users_and_read(tmp_path, cfg) -> tuple[list[str], list[str]]:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path/'bootstrap.db'}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine = await create_test_engine(tmp_path, "bootstrap.db")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as session:
         created = await user_service.ensure_bootstrap_users(session, cfg)
@@ -132,12 +139,13 @@ class _LoginClient:
     """临时 SQLite + FastAPI 路由，只替换会话，不启动 MQTT。"""
 
     def __init__(self, tmp_path):
-        self.engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path/'login.db'}")
-        self.factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.tmp_path = tmp_path
+        self.engine = None
+        self.factory = None
 
     async def __aenter__(self):
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        self.engine = await create_test_engine(self.tmp_path, "login.db")
+        self.factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
         async def override_session():
             async with self.factory() as session:
@@ -261,9 +269,7 @@ def test_rate_limit_is_per_ip_and_account(tmp_path, monkeypatch):
 
 def test_weak_passwords_are_rejected_for_create_and_reset(tmp_path):
     async def scenario():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path/'weak.db'}")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        engine = await create_test_engine(tmp_path, "weak.db")
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
             created, error = await user_service.create_user(
