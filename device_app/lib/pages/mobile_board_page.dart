@@ -21,13 +21,18 @@ import 'login_page.dart';
 /// - 保留本地设备模拟器为默认入口，两套 MQTT 连接互不影响；
 /// - 未登录、后端不可达、token 失效、实时断线均给出可读提示，不白屏、不崩溃。
 class MobileBoardPage extends StatefulWidget {
-  const MobileBoardPage({super.key});
+  const MobileBoardPage({super.key, this.active = true});
+
+  /// 页面是否处于前台可见。切到设备模拟或 App 进入后台时置为 false，
+  /// 用于断开实时连接、停止轮询省电。
+  final bool active;
 
   @override
   State<MobileBoardPage> createState() => _MobileBoardPageState();
 }
 
-class _MobileBoardPageState extends State<MobileBoardPage> {
+class _MobileBoardPageState extends State<MobileBoardPage>
+    with WidgetsBindingObserver {
   final AppStorage _storage = AppStorage();
 
   AuthSession? _session;
@@ -45,15 +50,45 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
 
   BoardRealtimeService? _realtime;
   StreamSubscription<RealtimeEvent>? _eventSub;
+  Timer? _pollTimer;
+
+  /// 自定义实时地址；为空时按网关地址自动推导。
+  String _realtimeUrlOverride = '';
+
+  /// App 生命周期可见性（后台时断开实时）。
+  bool _appVisible = true;
+
+  static const Duration _pollInterval = Duration(seconds: 15);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _bootstrap();
   }
 
   @override
+  void didUpdateWidget(covariant MobileBoardPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.active != widget.active) {
+      _syncRealtimeLifecycle();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final visible = state == AppLifecycleState.resumed;
+    if (visible == _appVisible) {
+      return;
+    }
+    _appVisible = visible;
+    _syncRealtimeLifecycle();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pollTimer?.cancel();
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
     _realtime = null;
@@ -63,8 +98,10 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
   Future<void> _bootstrap() async {
     String baseUrl = ApiConfig.defaultBaseUrl;
     AuthSession? session;
+    String? realtimeUrl;
     try {
       baseUrl = await _storage.loadBaseUrl() ?? ApiConfig.defaultBaseUrl;
+      realtimeUrl = await _storage.loadRealtimeUrl();
       session = await _storage.loadSession();
     } catch (_) {
       // 本地存储不可用时退回默认地址与未登录态，保证页面仍可交互
@@ -74,23 +111,41 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     }
     setState(() {
       _baseUrl = baseUrl;
+      _realtimeUrlOverride = realtimeUrl ?? '';
       _session = session;
       _booting = false;
     });
     if (session != null) {
       await _loadData();
-      _startRealtime();
+      _syncRealtimeLifecycle();
     }
   }
 
   // ---------------- 实时链路 ----------------
+
+  /// 页面可见且有登录态时才保持连接，否则断开省电。
+  void _syncRealtimeLifecycle() {
+    final shouldRun = widget.active && _appVisible && _session != null;
+    if (!shouldRun) {
+      _stopRealtime();
+      _stopPolling();
+      return;
+    }
+    if (_realtime == null) {
+      _startRealtime();
+    }
+  }
+
+  String get _effectiveRealtimeUrl => _realtimeUrlOverride.isNotEmpty
+      ? _realtimeUrlOverride
+      : ApiConfig.realtimeUrl(_baseUrl);
 
   void _startRealtime() {
     if (_session == null) {
       return;
     }
     _stopRealtime();
-    final url = ApiConfig.realtimeUrl(_baseUrl);
+    final url = _effectiveRealtimeUrl;
     if (url.isEmpty) {
       return;
     }
@@ -101,6 +156,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     );
     _realtime = service;
     _eventSub = service.events.listen(_onRealtimeEvent);
+    service.state.addListener(_onRealtimeStateChanged);
     service.start();
   }
 
@@ -110,7 +166,47 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     final service = _realtime;
     _realtime = null;
     if (service != null) {
+      service.state.removeListener(_onRealtimeStateChanged);
       unawaited(service.dispose());
+    }
+  }
+
+  /// 实时不可用时切到 REST 轮询兜底，恢复连接后自动停止轮询。
+  void _onRealtimeStateChanged() {
+    final state = _realtime?.state.value;
+    if (state == null) {
+      return;
+    }
+    if (state == RealtimeState.connected) {
+      _stopPolling();
+    } else if (state.requiresPollingFallback &&
+        widget.active &&
+        _appVisible &&
+        _session != null) {
+      _startPolling();
+    }
+  }
+
+  void _startPolling() {
+    if (_pollTimer != null || !mounted) {
+      return;
+    }
+    _pollTimer = Timer.periodic(_pollInterval, (_) {
+      if (!_loading) {
+        _loadData(silent: true);
+      }
+    });
+    setState(() {});
+  }
+
+  void _stopPolling() {
+    if (_pollTimer == null) {
+      return;
+    }
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -200,6 +296,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
 
   Future<void> _handleExpired() async {
     _stopRealtime();
+    _stopPolling();
     await _storage.clearSession();
     if (!mounted) {
       return;
@@ -217,6 +314,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
 
   Future<void> _logout() async {
     _stopRealtime();
+    _stopPolling();
     await _storage.clearSession();
     if (!mounted) {
       return;
@@ -232,28 +330,46 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
   }
 
   Future<void> _editGateway() async {
-    final controller = TextEditingController(text: _baseUrl);
-    final value = await showDialog<String>(
+    final gatewayController = TextEditingController(text: _baseUrl);
+    final realtimeController = TextEditingController(
+      text: _realtimeUrlOverride,
+    );
+    final fallback = ApiConfig.realtimeUrl(_baseUrl);
+    final value = await showDialog<_GatewaySettings>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('网关地址'),
+        title: const Text('网关与实时地址'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             TextField(
-              controller: controller,
+              controller: gatewayController,
               autofocus: true,
               decoration: const InputDecoration(
+                labelText: '网关地址',
                 hintText: 'http://192.168.1.8:8000',
                 border: OutlineInputBorder(),
               ),
               keyboardType: TextInputType.url,
             ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: realtimeController,
+              decoration: InputDecoration(
+                labelText: '实时地址（可留空）',
+                hintText: fallback.isEmpty
+                    ? 'ws://192.168.1.8:9001'
+                    : fallback,
+                border: const OutlineInputBorder(),
+              ),
+              keyboardType: TextInputType.url,
+            ),
             const SizedBox(height: 8),
-            const Text(
-              '真机需填电脑局域网 IP；127.0.0.1 在手机上指向手机自身。',
-              style: TextStyle(fontSize: 12, color: Colors.black54),
+            Text(
+              '真机需填电脑局域网 IP；实时地址留空则按网关主机自动推导 '
+              'ws://<网关主机>:9001。',
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
             ),
           ],
         ),
@@ -263,29 +379,45 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () =>
-                Navigator.of(dialogContext).pop(controller.text.trim()),
+            onPressed: () => Navigator.of(dialogContext).pop(
+              _GatewaySettings(
+                baseUrl: gatewayController.text.trim(),
+                realtimeUrl: realtimeController.text.trim(),
+              ),
+            ),
             child: const Text('保存'),
           ),
         ],
       ),
     );
-    controller.dispose();
+    gatewayController.dispose();
+    realtimeController.dispose();
     if (value == null || !mounted) {
       return;
     }
-    if (!ApiConfig.isValid(value)) {
+    if (!ApiConfig.isValid(value.baseUrl)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('网关地址无效，未保存')),
       );
       return;
     }
-    final normalized = ApiConfig.normalize(value);
+    if (value.realtimeUrl.isNotEmpty &&
+        !ApiConfig.isValidRealtimeUrl(value.realtimeUrl)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('实时地址需以 ws:// 或 wss:// 开头，未保存')),
+      );
+      return;
+    }
+    final normalized = ApiConfig.normalize(value.baseUrl);
     await _storage.saveBaseUrl(normalized);
+    await _storage.saveRealtimeUrl(value.realtimeUrl);
     if (!mounted) {
       return;
     }
-    setState(() => _baseUrl = normalized);
+    setState(() {
+      _baseUrl = normalized;
+      _realtimeUrlOverride = value.realtimeUrl;
+    });
     if (_session != null) {
       await _loadData();
       _startRealtime();
@@ -301,7 +433,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
       _booting = false;
     });
     _loadData();
-    _startRealtime();
+    _syncRealtimeLifecycle();
   }
 
   SensorReading? _readingFor(String deviceId) {
@@ -435,7 +567,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     );
   }
 
-  /// 实时链路状态条：连接中 / 已连接 / 重连中，断线时不阻塞 REST 数据展示。
+  /// 实时链路状态条：已连接 / 连接中 / 重连中；实时不可用时提示已切换轮询。
   Widget _buildRealtimeBar() {
     final service = _realtime;
     if (service == null) {
@@ -444,6 +576,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     return ValueListenableBuilder<RealtimeState>(
       valueListenable: service.state,
       builder: (context, state, _) {
+        final polling = _pollTimer != null;
         final color = switch (state) {
           RealtimeState.connected => Colors.green,
           RealtimeState.connecting => Colors.blueGrey,
@@ -465,6 +598,9 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
                   shape: BoxShape.circle,
                 ),
               );
+        final baseText = polling
+            ? '${state.label} · 已切换轮询（每 15 秒）'
+            : state.label;
         return Row(
           children: [
             dot,
@@ -481,7 +617,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
                   final text = state == RealtimeState.reconnecting &&
                           failure != null
                       ? '$failure${attempts > 0 ? '（第 $attempts 次）' : ''}'
-                      : state.label;
+                      : baseText;
                   return Text(
                     text,
                     style: TextStyle(fontSize: 12, color: color),
@@ -947,6 +1083,14 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
       ),
     );
   }
+}
+
+/// 设置弹窗返回值：网关地址 + 自定义实时地址（空串表示自动推导）。
+class _GatewaySettings {
+  const _GatewaySettings({required this.baseUrl, required this.realtimeUrl});
+
+  final String baseUrl;
+  final String realtimeUrl;
 }
 
 String _formatTime(DateTime? time) {

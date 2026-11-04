@@ -104,6 +104,19 @@ void main() {
     expect(secure.values.containsKey('mobile.session'), isFalse);
   });
 
+  test('实时地址可配置并持久化，留空回退自动推导', () async {
+    final storage = AppStorage(secureStore: secure);
+
+    await storage.saveRealtimeUrl('ws://192.168.1.8:9001');
+    expect(await storage.loadRealtimeUrl(), 'ws://192.168.1.8:9001');
+
+    await storage.saveRealtimeUrl('   ');
+    expect(await storage.loadRealtimeUrl(), isNull);
+
+    expect(ApiConfig.isValidRealtimeUrl('ws://192.168.1.8:9001'), isTrue);
+    expect(ApiConfig.isValidRealtimeUrl('http://192.168.1.8:8000'), isFalse);
+  });
+
   test('网关地址归一化、校验与实时地址推导', () {
     expect(ApiConfig.normalize(' 192.168.1.8:8000/ '), 'http://192.168.1.8:8000');
     expect(ApiConfig.normalize('https://iot.example.com/'), 'https://iot.example.com');

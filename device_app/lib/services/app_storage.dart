@@ -43,6 +43,7 @@ class AppStorage {
 
   static const String _sessionKey = 'mobile.session';
   static const String _baseUrlKey = 'mobile.baseUrl';
+  static const String _realtimeUrlKey = 'mobile.realtimeUrl';
   static const String _selectedDeviceKey = 'mobile.selectedDevice';
 
   final SecureStore _secure;
@@ -56,6 +57,22 @@ class AppStorage {
   Future<void> saveBaseUrl(String baseUrl) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_baseUrlKey, baseUrl);
+  }
+
+  /// 自定义实时地址；空值表示按网关地址自动推导。
+  Future<String?> loadRealtimeUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString(_realtimeUrlKey);
+    return value == null || value.isEmpty ? null : value;
+  }
+
+  Future<void> saveRealtimeUrl(String url) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (url.trim().isEmpty) {
+      await prefs.remove(_realtimeUrlKey);
+    } else {
+      await prefs.setString(_realtimeUrlKey, url.trim());
+    }
   }
 
   Future<AuthSession?> loadSession() async {

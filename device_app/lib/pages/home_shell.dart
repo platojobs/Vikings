@@ -21,7 +21,11 @@ class _HomeShellState extends State<HomeShell> {
     return Scaffold(
       body: IndexedStack(
         index: _index,
-        children: const [DevicePage(), MobileBoardPage()],
+        children: [
+          const DevicePage(),
+          // 看板只在可见时保持实时连接，切走后断开省电
+          MobileBoardPage(active: _index == 1),
+        ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,

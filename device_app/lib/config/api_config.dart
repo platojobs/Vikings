@@ -49,6 +49,15 @@ class ApiConfig {
 
   String endpoint(String path) => '$baseUrl$path';
 
+  /// 校验自定义实时地址（ws / wss）。
+  static bool isValidRealtimeUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null || uri.host.isEmpty) {
+      return false;
+    }
+    return uri.scheme == 'ws' || uri.scheme == 'wss';
+  }
+
   /// 由网关地址推导 MQTT over WebSocket 地址。
   ///
   /// 手机端与浏览器一样无法直连 TCP 1883，实时链路固定走 Broker 的 9001

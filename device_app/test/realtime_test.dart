@@ -174,6 +174,31 @@ void main() {
       await service.dispose();
     });
 
+    test('连接失败后进入重连态并启用轮询降级', () async {
+      final service = BoardRealtimeService(
+        url: 'ws://127.0.0.1:9001',
+        retryBase: const Duration(milliseconds: 300),
+        transportFactory: (_, _) => _FakeTransport(failConnect: true),
+      );
+
+      service.start();
+      await _waitFor(() => service.state.value == RealtimeState.reconnecting);
+
+      expect(service.state.value.requiresPollingFallback, isTrue);
+      expect(service.failure.value, contains('模拟连接失败'));
+      expect(service.attempts.value, 1);
+
+      await service.dispose();
+    });
+
+    test('轮询降级判定：仅连接态不降级，其余状态均需轮询', () {
+      expect(RealtimeState.connected.requiresPollingFallback, isFalse);
+      expect(RealtimeState.connecting.requiresPollingFallback, isFalse);
+      expect(RealtimeState.reconnecting.requiresPollingFallback, isTrue);
+      expect(RealtimeState.stopped.requiresPollingFallback, isTrue);
+      expect(RealtimeState.idle.requiresPollingFallback, isFalse);
+    });
+
     test('连接后掉线会重新建连，并持续投递实时事件', () async {
       final transports = <_FakeTransport>[];
       final service = BoardRealtimeService(

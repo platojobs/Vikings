@@ -16,6 +16,10 @@ extension RealtimeStateLabel on RealtimeState {
     RealtimeState.reconnecting => '实时重连中…',
     RealtimeState.stopped => '实时已断开',
   };
+
+  /// 是否需要 REST 轮询兜底：已连接时不需要，其余状态都视为实时不可用。
+  bool get requiresPollingFallback =>
+      this == RealtimeState.reconnecting || this == RealtimeState.stopped;
 }
 
 /// 移动看板的实时数据服务。
