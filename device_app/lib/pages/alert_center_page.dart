@@ -8,6 +8,7 @@ import '../models/mobile_api_models.dart';
 import '../models/realtime_payload.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
+import '../services/session_refresh.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
 import 'login_page.dart';
@@ -61,6 +62,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   static const List<String> _levelOptions = <String>['warning', 'critical'];
 
   late final AppStorage _storage;
+  late final SessionRefreshCoordinator _refresher;
   late final AlertApiClientFactory _createApiClient;
   late final AlertRealtimeFactory _createRealtime;
 
@@ -112,9 +114,17 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   void initState() {
     super.initState();
     _storage = widget.storage ?? AppStorage();
+    _refresher = SessionRefreshCoordinator(
+      storage: _storage,
+      baseUrl: () => _baseUrl,
+      readSession: () => _session,
+      onRefreshed: _onSessionRefreshed,
+      clientBuilder: widget.apiClientFactory,
+    );
     _createApiClient =
         widget.apiClientFactory ??
-        (String baseUrl) => ApiClient(baseUrl: baseUrl);
+        (String baseUrl) =>
+            ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
         widget.realtimeServiceFactory ??
         (String url) => BoardRealtimeService(
@@ -208,10 +218,21 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     unawaited(_reload());
   }
 
-  /// 401：停止实时与轮询，回到登录页并保留可读提示。
+  /// 单飞 refresh 成功：更新内存会话，后续请求使用新 access。
+  void _onSessionRefreshed(AuthSession session) {
+    if (!mounted) return;
+    setState(() {
+      _session = session;
+      _error = null;
+    });
+  }
+
+  /// 401：refresh 也失败时停止实时与轮询，清会话并回登录页。
   void _handleUnauthorized() {
     _stopRealtime();
     _stopPolling();
+    // 与看板一致：清掉 Keychain/Keystore 中的 access + refresh，避免下次启动免登录
+    unawaited(_storage.clearSession());
     if (!mounted) {
       return;
     }

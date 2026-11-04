@@ -36,7 +36,13 @@ export interface UserInfo {
 }
 
 export interface LoginResult {
+  /** 短 TTL 访问令牌（默认 20 分钟），用于 Authorization: Bearer */
   token: string
+  /** 可吊销刷新令牌；单次使用，刷新成功后返回新的 refresh_token */
+  refresh_token?: string
+  token_type?: string
+  /** 访问令牌有效期（秒），由服务端下发 */
+  expires_in?: number
   user: UserInfo
 }
 

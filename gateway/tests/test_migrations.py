@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0003_alert_ack_metadata"
+HEAD = "0004_refresh_tokens"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
@@ -112,6 +112,7 @@ def test_upgrade_on_empty_database(tmp_path):
         "rule_config",
         "audit_log",
         "app_user",
+        "refresh_token",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
     assert ACK_COLUMNS <= _alert_columns(db_path)
@@ -163,12 +164,14 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
 
     down = _run_alembic(db_path, "downgrade", "-1")
     assert down.returncode == 0, down.stderr
-    assert _alembic_version(db_path) == "0002_lifecycle_indexes"
-    assert not (ACK_COLUMNS & _alert_columns(db_path)), "downgrade 必须移除处置列"
+    assert _alembic_version(db_path) == "0003_alert_ack_metadata"
+    assert "refresh_token" not in _table_names(db_path), "downgrade 必须移除刷新令牌表"
+    assert ACK_COLUMNS <= _alert_columns(db_path), "downgrade -1 不得影响告警处置列"
 
     up = _run_alembic(db_path, "upgrade", "head")
     assert up.returncode == 0, up.stderr
     assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert "refresh_token" in _table_names(db_path)
     assert _alembic_version(db_path) == HEAD
 
 

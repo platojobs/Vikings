@@ -5,20 +5,31 @@ import 'package:http/http.dart' as http;
 
 import '../models/mobile_api_models.dart';
 
-/// 移动看板的 REST 客户端：只读复用网关既有接口，后端零改动。
+/// 401 时的续期抽象：由页面持有单飞协调器，ApiClient 不关心并发与存储。
+abstract class SessionRefresher {
+  /// 用失效的 access 触发一次续期；成功返回新会话，失败返回 null。
+  Future<AuthSession?> refresh(String staleAccessToken);
+}
+
+/// 移动看板的 REST 客户端：只读复用网关既有接口。
 ///
 /// 统一处理三类可预期故障并给出可读文案：
-/// 401（token 失效）、超时、网络不可达；业务错误沿用网关 message。
+/// 401（token 失效，先尝试单飞 refresh 再重放一次）、超时、网络不可达；
+/// 业务错误沿用网关 message。
 class ApiClient {
   ApiClient({
     required this.baseUrl,
     http.Client? httpClient,
     this.timeout = const Duration(seconds: 8),
+    this.refresher,
   }) : _client = httpClient ?? http.Client();
 
   final String baseUrl;
   final Duration timeout;
   final http.Client _client;
+
+  /// 为空时保持旧行为：401 直接抛 unauthorized，由页面清会话回登录页。
+  final SessionRefresher? refresher;
 
   void close() => _client.close();
 
@@ -31,15 +42,41 @@ class ApiClient {
       '/api/auth/login',
       body: <String, dynamic>{'username': username, 'password': password},
     );
+    return _sessionFrom(data, fallbackUsername: username);
+  }
+
+  /// 用 refresh 换取新（access, refresh）；网关会轮换并让旧 refresh 失效。
+  Future<AuthSession> refreshSession({required String refreshToken}) async {
+    final data = await _send(
+      'POST',
+      '/api/auth/refresh',
+      body: <String, dynamic>{'refresh_token': refreshToken},
+      allowRefresh: false,
+    );
+    return _sessionFrom(data);
+  }
+
+  /// 登出：吊销服务端 refresh（幂等）；本地清理由调用方负责。
+  Future<void> logoutSession({required String refreshToken}) async {
+    await _send(
+      'POST',
+      '/api/auth/logout',
+      body: <String, dynamic>{'refresh_token': refreshToken},
+      allowRefresh: false,
+    );
+  }
+
+  AuthSession _sessionFrom(dynamic data, {String fallbackUsername = ''}) {
     if (data is! Map<String, dynamic>) {
-      throw const ApiException(ApiErrorKind.invalidResponse, '登录响应缺少 data');
+      throw const ApiException(ApiErrorKind.invalidResponse, '认证响应缺少 data');
     }
     final user = data['user'];
     return AuthSession(
       token: data['token']?.toString() ?? '',
+      refreshToken: data['refresh_token']?.toString() ?? '',
       username: user is Map
-          ? user['username']?.toString() ?? username
-          : username,
+          ? user['username']?.toString() ?? fallbackUsername
+          : fallbackUsername,
       role: user is Map ? user['role']?.toString() ?? 'viewer' : 'viewer',
     );
   }
@@ -293,33 +330,53 @@ class ApiClient {
     String? token,
     Map<String, dynamic>? body,
     Map<String, String>? query,
+    bool allowRefresh = true,
   }) async {
     final uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
-    final headers = <String, String>{
-      'Accept': 'application/json',
-      if (body != null) 'Content-Type': 'application/json',
-      if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token',
-    };
 
-    http.Response? response;
-    try {
-      if (method == 'POST') {
-        response = await _client
-            .post(uri, headers: headers, body: jsonEncode(body ?? const {}))
-            .timeout(timeout);
-      } else {
-        response = await _client.get(uri, headers: headers).timeout(timeout);
+    for (var attempt = 0; ; attempt += 1) {
+      final headers = <String, String>{
+        'Accept': 'application/json',
+        if (body != null) 'Content-Type': 'application/json',
+        if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token',
+      };
+
+      http.Response response;
+      try {
+        if (method == 'POST') {
+          response = await _client
+              .post(uri, headers: headers, body: jsonEncode(body ?? const {}))
+              .timeout(timeout);
+        } else {
+          response = await _client.get(uri, headers: headers).timeout(timeout);
+        }
+      } on TimeoutException {
+        throw const ApiException(ApiErrorKind.timeout, '网关响应超时，请检查网络后重试');
+      } on http.ClientException catch (error) {
+        throw ApiException(ApiErrorKind.network, error.message);
+      } catch (_) {
+        // 覆盖 SocketException 等平台底层网络异常，统一收敛为可读提示
+        throw const ApiException(ApiErrorKind.network, '无法连接网关，请确认地址、后端进程与网络连通性');
       }
-    } on TimeoutException {
-      throw const ApiException(ApiErrorKind.timeout, '网关响应超时，请检查网络后重试');
-    } on http.ClientException catch (error) {
-      throw ApiException(ApiErrorKind.network, error.message);
-    } catch (_) {
-      // 覆盖 SocketException 等平台底层网络异常，统一收敛为可读提示
-      throw const ApiException(ApiErrorKind.network, '无法连接网关，请确认地址、后端进程与网络连通性');
+
+      try {
+        // 解码/业务异常只在传输成功后才产生，交给调用方按 ApiErrorKind 处理
+        return _decode(response);
+      } on ApiException catch (error) {
+        final canRetry =
+            error.kind == ApiErrorKind.unauthorized &&
+            attempt == 0 &&
+            allowRefresh &&
+            refresher != null &&
+            token != null &&
+            token.isNotEmpty;
+        if (!canRetry) rethrow;
+        // 单飞协调器保证并发 401 只发一次 refresh；失败则返回 null → 保留 401 语义
+        final renewed = await refresher!.refresh(token);
+        if (renewed == null || renewed.token.isEmpty) rethrow;
+        token = renewed.token;
+      }
     }
-    // 解码/业务异常只在传输成功后才产生，交给调用方按 ApiErrorKind 处理
-    return _decode(response);
   }
 
   dynamic _decode(http.Response response) {

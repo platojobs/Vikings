@@ -11,3 +11,11 @@ export function login(body: LoginBody): Promise<LoginResult> {
 export function fetchMe(): Promise<AppUser> {
   return request<AppUser>('/api/auth/me')
 }
+
+/** 登出：服务端吊销当前 refresh（幂等），随后客户端清本地会话 */
+export function logout(refreshToken: string): Promise<{ revoked: boolean }> {
+  return request<{ revoked: boolean }>('/api/auth/logout', {
+    method: 'POST',
+    body: { refresh_token: refreshToken },
+  })
+}

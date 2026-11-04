@@ -13,6 +13,9 @@ from app.models import AuditLog
 
 # 审计动作枚举（与前端展示文案对应）
 ACTION_LOGIN = "login"
+ACTION_LOGOUT = "logout"
+ACTION_SESSION_REVOKE = "session.revoke"
+ACTION_REFRESH_REUSE = "auth.refresh_reuse"
 ACTION_COMMAND_CREATE = "command.create"
 ACTION_OTA_CREATE = "ota.create"
 ACTION_ALERT_ACK = "alert.ack"

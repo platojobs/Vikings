@@ -134,6 +134,58 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env resta
 - 也可以把证书交给外部负载均衡/云厂商终止 TLS，此时反代仅监听内网，需自行调整 `proxy` 的 ports；
 - 私钥不得入库；`infra/prod/nginx/certs/` 已在 `.gitignore` 中。
 
+### 4.3 安全响应头与 CSP（v1.24.0）
+
+**分工**：所有安全响应头都由反代 `infra/prod/nginx/conf.d/default.conf` 的 443 server 统一添加，
+应用（FastAPI 与 Vue 静态站）不再重复添加。重复会出问题：浏览器遇到两条 CSP 时按**交集**执行，
+两份策略很难保持一致，常见结果是「本地开发正常、上反代就被拦」。
+
+| 头 | 值 | 说明 |
+| --- | --- | --- |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | 仅 HTTPS 有效；`includeSubDomains` 的取舍见下 |
+| `X-Content-Type-Options` | `nosniff` | 禁止 MIME 嗅探 |
+| `X-Frame-Options` | `DENY` | 禁止被 iframe 嵌入 |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | 跨源只带 origin |
+| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` | 关闭不需要的浏览器能力 |
+| `Content-Security-Policy` | 见下方 | 与页面实际加载的资源逐项对齐 |
+
+**CSP 现值与该放行项的理由**：
+
+```
+default-src 'self';
+img-src 'self' data: blob:;
+style-src 'self' 'unsafe-inline';
+font-src 'self' data:;
+worker-src 'self' blob:;
+connect-src 'self';
+object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+```
+
+- `style-src 'unsafe-inline'`：Element Plus 大量使用内联 `style` 属性，去掉会整页样式失效；
+- `worker-src 'self' blob:`：ECharts 用 `blob:` Worker 做渐进渲染。**实测**不加时仪表盘
+  报 `Creating a worker from 'blob:...' violates default-src`（`default-src` 会作为 `worker-src` 的兜底），
+  图表渲染被阻断；
+- `connect-src 'self'`：REST 与 `wss://<host>/mqtt` 均为同源，一条即可覆盖 MQTT over WebSocket。
+  若把 `VITE_API_BASE` / `VITE_MQTT_WS` 改成跨域地址，必须把对应源（含 `wss://`）加入 `connect-src`，
+  否则前端请求会被拦，且只在真实浏览器里才看得到；
+- `script-src` 未单独放宽：Vite 产物无内联脚本，Element Plus 也不需要 `unsafe-eval`。
+
+**HSTS `includeSubDomains` 取舍**：本部署证书覆盖主域 + 所有子域，开启可防子域降级；
+若未来存在只能跑 HTTP 的子域（旧设备管理页等），浏览器会直接拒绝访问，
+必须先清理该子域或换独立域名。自签证书阶段浏览器不会持久化 HSTS，去掉公网也不受影响。
+
+**验证方式（不是只加头）**：用真实 Chrome（自签证书下加启动参数 `--ignore-certificate-errors`）
+打开登录页 → 仪表盘 → 设备列表，采集 `Log.entryAdded` 中的 CSP 报告，三个阶段必须为 0；
+同时确认 `wss://<host>/mqtt` 建立成功。v1.24.0 的实测结果与脚本见
+[docs/releases/v1.24.0.md](./releases/v1.24.0.md)。
+
+**自签证书下的注意事项**：
+
+- 浏览器默认不信任自签证书，HSTS 不会持久化；这不影响其它安全头与 CSP 的实际生效；
+- 若用 `NODE_TLS_REJECT_UNAUTHORIZED=0` 之类的脚本验证，只是跳过证书校验，不要写进生产脚本；
+- 混合内容（HTTPS 页面加载 `http://` 或 `ws://` 资源）会被浏览器直接拦截，与 CSP 无关，
+  生产构建必须用 `VITE_MQTT_WS=/mqtt`（由页面同源推导出 `wss://`）。
+
 ---
 
 ## 5. 环境变量

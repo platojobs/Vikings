@@ -4,8 +4,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
-import { fetchMe } from '@/api/auth'
-import { clearAuth, getStoredUser, getToken, setAuth } from '@/utils/auth'
+import { fetchMe, logout as logoutApi } from '@/api/auth'
+import { clearAuth, getRefreshToken, getStoredUser, getToken, setAuth } from '@/utils/auth'
 import { onStatusChange } from '@/services/mqtt'
 import { setRole } from '@/utils/permissions'
 import { userRoleLabel, userRoleTagType } from '@/utils/labels'
@@ -55,6 +55,15 @@ async function handleLogout(): Promise<void> {
     })
   } catch {
     return
+  }
+  // 先尽力吊销服务端 refresh（网络异常不阻塞本地退出），再清本地 access/refresh
+  const refreshToken = getRefreshToken()
+  if (refreshToken) {
+    try {
+      await logoutApi(refreshToken)
+    } catch {
+      // 登出接口失败（离线/已失效）时仍继续本地清理
+    }
   }
   clearAuth()
   await router.replace('/login')

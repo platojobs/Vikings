@@ -82,7 +82,11 @@ class Settings(BaseSettings):
 
     # ---- 鉴权 ----
     jwt_secret: str = "change-me-in-production"
-    jwt_expire_minutes: int = 720
+    # 访问令牌 TTL（秒）：默认 20 分钟。吊销 refresh 后已签发的 access 在剩余 TTL
+    # 内仍可用，缩短该值是缩小窗口的主要手段（见 docs/contracts.md 3.1）。
+    access_token_ttl_seconds: int = 1200
+    # 刷新令牌 TTL（天）：默认 14 天；服务端持久化，可被登出/改密/管理员吊销。
+    refresh_token_ttl_days: int = 14
     admin_username: str = "admin"
     admin_password: str = "admin123"
     # 口令最小长度（新建/重置账号时校验，既有账号不受影响）

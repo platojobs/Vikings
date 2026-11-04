@@ -39,27 +39,39 @@ DateTime? _asTime(Object? value) =>
     value is String ? DateTime.tryParse(value) : null;
 
 /// 登录成功后的会话，token 持久化在本地。
+///
+/// v1.24.0 起同时保存短 TTL access 与可轮换 refresh；旧版本本地会话没有
+/// [refreshToken]，遇到 401 时无法自动续期，按原逻辑清会话回登录页。
 class AuthSession {
   const AuthSession({
     required this.token,
     required this.username,
     required this.role,
+    this.refreshToken = '',
   });
 
+  /// 访问令牌（默认 20 分钟），随每次 REST 请求发送。
   final String token;
+
+  /// 刷新令牌（默认 14 天），只在 /api/auth/refresh|logout 使用，单次有效。
+  final String refreshToken;
   final String username;
   final String role;
 
   bool get canIssueCommand => role == 'admin' || role == 'operator';
 
+  bool get canRefresh => refreshToken.isNotEmpty;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'token': token,
+    'refresh_token': refreshToken,
     'username': username,
     'role': role,
   };
 
   factory AuthSession.fromJson(Map<String, dynamic> json) => AuthSession(
     token: _asString(json['token']),
+    refreshToken: _asString(json['refresh_token']),
     username: _asString(json['username']),
     role: _asString(json['role'], 'viewer'),
   );

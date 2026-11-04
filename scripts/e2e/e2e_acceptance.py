@@ -131,6 +131,9 @@ class Context:
         self.gateway_python: Optional[str] = None
         self.client: Optional[httpx.Client] = None
         self.token = ""
+        # ---- P2-4 / v1.24.0：短 TTL access + 可吊销 refresh ----
+        self.refresh_token = ""
+        self.access_refresh_count = 0
         self.device_id = f"e2e-{uuid.uuid4().hex[:8]}"
         # 第二个设备：专门用于验证跨设备 ACL 与凭证轮换，不参与业务链路
         self.probe_device_id = f"e2e-probe-{uuid.uuid4().hex[:8]}"
@@ -361,6 +364,11 @@ def start_gateway(ctx: Context, *, reuse_db: bool = False) -> str:
                 ),
                 "ADMIN_USERNAME": ctx.args.username,
                 "ADMIN_PASSWORD": ctx.args.password,
+                # v1.24.0：把 access TTL 压到 5s，让验收真实经历「access 过期 →
+                # 自动 refresh → 原请求重放」；refresh TTL 仍为默认 14 天
+                "ACCESS_TOKEN_TTL_SECONDS": os.environ.get(
+                    "E2E_ACCESS_TOKEN_TTL_SECONDS", "5"
+                ),
             }
         )
         ctx.gateway_env = env
@@ -513,12 +521,42 @@ class WsCollector:
 # ---------------------------------------------------------------------------
 # REST 与业务步骤
 # ---------------------------------------------------------------------------
+def refresh_access_token(ctx: Context) -> bool:
+    """E2E 客户端侧自动续期：用 refresh 换新 access，成功返回 True。"""
+    assert ctx.client is not None
+    if not ctx.refresh_token:
+        return False
+    resp = ctx.client.post(
+        "/api/auth/refresh", json={"refresh_token": ctx.refresh_token}
+    )
+    if resp.status_code != 200:
+        return False
+    data = (resp.json() or {}).get("data") or {}
+    token = data.get("token")
+    refresh_token = data.get("refresh_token")
+    if not token or not refresh_token:
+        return False
+    ctx.token = str(token)
+    ctx.refresh_token = str(refresh_token)
+    ctx.access_refresh_count += 1
+    return True
+
+
 def api(ctx: Context, method: str, path: str, **kwargs: Any) -> Any:
     assert ctx.client is not None
+    allow_refresh = kwargs.pop("_allow_refresh", True)
     headers = kwargs.pop("headers", {})
     if ctx.token:
         headers["Authorization"] = f"Bearer {ctx.token}"
     resp = ctx.client.request(method, path, headers=headers, **kwargs)
+    if (
+        resp.status_code == 401
+        and allow_refresh
+        and not path.startswith("/api/auth/")
+        and refresh_access_token(ctx)
+    ):
+        # 与 Web/移动端一致：refresh 成功后用新 access 重放原请求一次
+        return api(ctx, method, path, _allow_refresh=False, **kwargs)
     try:
         body = resp.json()
     except ValueError as exc:
@@ -542,10 +580,16 @@ def login(ctx: Context) -> str:
         json={"username": ctx.args.username, "password": ctx.args.password},
     )
     ctx.token = str(data["token"])
+    ctx.refresh_token = str(data.get("refresh_token") or "")
+    if not ctx.refresh_token:
+        raise RuntimeError("登录响应缺少 refresh_token（网关未启用 v1.24.0 认证生命周期）")
     role = (data.get("user") or {}).get("role")
     if role != "admin":
         raise RuntimeError(f"验收需要 admin 账号，当前 role={role}")
-    return f"admin 登录成功（token 长度 {len(ctx.token)}）"
+    return (
+        f"admin 登录成功（access TTL={data.get('expires_in')}s、"
+        f"token 长度 {len(ctx.token)}、refresh 长度 {len(ctx.refresh_token)}）"
+    )
 
 
 class _MqttProbe:
@@ -1994,6 +2038,111 @@ def recover_real_data(ctx: Context) -> str:
 # ---------------------------------------------------------------------------
 # 清理与入口
 # ---------------------------------------------------------------------------
+AUTH_TEST_PASSWORD = "Session!Pass2026"
+AUTH_TEST_PASSWORD_2 = "Changed!Pass2026"
+
+
+def _login_as(ctx: Context, username: str, password: str) -> Dict[str, Any]:
+    """独立账号登录，不覆盖 ctx.token（管理员会话仍需用于后续吊销操作）。"""
+    assert ctx.client is not None
+    resp = ctx.client.post(
+        "/api/auth/login", json={"username": username, "password": password}
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"账号 {username} 登录失败：HTTP {resp.status_code} {resp.text}")
+    data = (resp.json() or {}).get("data") or {}
+    if not data.get("token") or not data.get("refresh_token"):
+        raise RuntimeError(f"账号 {username} 登录响应缺少 access/refresh")
+    return data
+
+
+def _refresh_code(ctx: Context, refresh_token: str) -> int:
+    assert ctx.client is not None
+    return ctx.client.post(
+        "/api/auth/refresh", json={"refresh_token": refresh_token}
+    ).status_code
+
+
+def verify_auth_lifecycle(ctx: Context) -> str:
+    """v1.24.0：真实走过 refresh 轮换、登出、管理员吊销、改密吊销。
+
+    前置：access TTL 被压到 5s，主流程中出现过「401 → 自动 refresh → 重放」。
+    """
+    assert ctx.client is not None
+    if ctx.access_refresh_count <= 0:
+        raise RuntimeError("主流程未触发 access 过期自动续期，短 TTL 未生效")
+    renewed = ctx.access_refresh_count
+
+    username = f"e2e-auth-{uuid.uuid4().hex[:6]}"
+    api(
+        ctx,
+        "POST",
+        "/api/users",
+        json={"username": username, "password": AUTH_TEST_PASSWORD, "role": "viewer"},
+    )
+
+    # 1) 管理员吊销：同一账号两个会话全部失效
+    s1 = _login_as(ctx, username, AUTH_TEST_PASSWORD)
+    s2 = _login_as(ctx, username, AUTH_TEST_PASSWORD)
+    revoked = api(ctx, "POST", f"/api/users/{username}/sessions/revoke")
+    if int(revoked.get("revoked") or 0) < 2:
+        raise RuntimeError(f"管理员吊销条数不足：{revoked}")
+    for item in (s1, s2):
+        if _refresh_code(ctx, item["refresh_token"]) != 401:
+            raise RuntimeError("管理员吊销后 refresh 仍可续期")
+
+    # 2) 明确窗口：吊销 refresh 不会让已签发 access 立即失效
+    me = ctx.client.get(
+        "/api/auth/me", headers={"Authorization": f"Bearer {s1['token']}"}
+    )
+    if me.status_code != 200:
+        raise RuntimeError(
+            f"吊销 refresh 后 access 应立即返回 200（剩余 TTL 内仍有效），实际 {me.status_code}"
+        )
+
+    # 3) 轮换单次使用 + 重放检测
+    s3 = _login_as(ctx, username, AUTH_TEST_PASSWORD)
+    rotated = ctx.client.post(
+        "/api/auth/refresh", json={"refresh_token": s3["refresh_token"]}
+    )
+    if rotated.status_code != 200:
+        raise RuntimeError(f"正常 refresh 失败：HTTP {rotated.status_code}")
+    new_refresh = ((rotated.json() or {}).get("data") or {}).get("refresh_token")
+    if not new_refresh or new_refresh == s3["refresh_token"]:
+        raise RuntimeError("refresh 未轮换（新令牌缺失或与旧令牌相同）")
+    if _refresh_code(ctx, s3["refresh_token"]) != 401:
+        raise RuntimeError("轮换后的旧 refresh 仍可用")
+    if _refresh_code(ctx, new_refresh) != 401:
+        raise RuntimeError("重放旧 refresh 后未按策略吊销该账号全部会话")
+
+    # 4) 登出：当前 refresh 立即失效
+    s4 = _login_as(ctx, username, AUTH_TEST_PASSWORD)
+    out = ctx.client.post(
+        "/api/auth/logout", json={"refresh_token": s4["refresh_token"]}
+    )
+    if out.status_code != 200 or not (out.json() or {}).get("data", {}).get("revoked"):
+        raise RuntimeError(f"登出未吊销 refresh：HTTP {out.status_code} {out.text}")
+    if _refresh_code(ctx, s4["refresh_token"]) != 401:
+        raise RuntimeError("登出后 refresh 仍可续期")
+
+    # 5) 改密：该用户全部 refresh 自动吊销
+    s5 = _login_as(ctx, username, AUTH_TEST_PASSWORD)
+    api(
+        ctx,
+        "PATCH",
+        f"/api/users/{username}",
+        json={"password": AUTH_TEST_PASSWORD_2},
+    )
+    if _refresh_code(ctx, s5["refresh_token"]) != 401:
+        raise RuntimeError("改密后旧 refresh 仍可续期")
+
+    api(ctx, "DELETE", f"/api/users/{username}")
+    return (
+        f"自动续期 {renewed} 次；管理员吊销 {revoked['revoked']} 条；"
+        f"轮换/重放/登出/改密均按 401 拒绝；吊销后 access 剩余 TTL 内仍 200（已文档化）"
+    )
+
+
 def cleanup(ctx: Context) -> None:
     started = time.monotonic()
     notes: List[str] = []
@@ -2120,6 +2269,8 @@ def main() -> int:
         rep.run("recover_broker", lambda: recover_broker(ctx))
         rep.run("recover_ws", lambda: recover_ws(ctx))
         rep.run("recover_real_data", lambda: recover_real_data(ctx))
+        # 最后跑认证生命周期：会创建/删除临时账号并吊销会话，不影响前面业务链路
+        rep.run("auth_token_lifecycle", lambda: verify_auth_lifecycle(ctx))
     except Exception as exc:  # noqa: BLE001 - 顶层兜底，确保清理与汇总
         print(f"\n执行中断：{exc}", file=sys.stderr)
     finally:

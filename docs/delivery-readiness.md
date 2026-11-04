@@ -420,12 +420,29 @@
 - **做法**：设备筛选改远程搜索/下拉分页；批量确认在客户端自动分批并汇总 `acked/not_found`。
 - **预估**：1 人日。**依赖**：无。
 
-### P2-4 认证生命周期与 API 安全头不完整
+### P2-4 认证生命周期与 API 安全头不完整 ✅ 已完成（v1.24.0）
 
-- **现状证据**：`gateway/app/config.py:34` 固定 720 分钟；无 refresh/ logout/吊销；`gateway/app/main.py` 的 CORS 白名单按 `cors_origins` 配置，但无 CSP/HSTS/安全响应头。
-- **缺口**：token 泄露后 12 小时内无法失效；浏览器侧缺纵深防御。
-- **做法**：短 TTL + refresh token + 服务端 token 版本号（吊销）；反代加 HSTS/CSP/X-Frame-Options；CORS 生产按域名收紧。
-- **预估**：1~2 人日。**依赖**：P0-1 反代、P0-2 token 策略。
+- **原现状**：access 固定 720 分钟；无 refresh/登出/吊销；反代已下发基础安全头，但 CSP 未按实际页面验证。
+- **已完成**：
+  1. access 默认 20 分钟（`ACCESS_TOKEN_TTL_SECONDS`），refresh 默认 14 天（`REFRESH_TOKEN_TTL_DAYS`）；
+  2. 新增 `refresh_token` 表（Alembic `0004_refresh_tokens`），只存 SHA-256 指纹，单次使用 + 轮换，
+     旧令牌重放会吊销该用户全部会话（审计 `auth.refresh_reuse`）；
+  3. 吊销入口：`POST /api/auth/logout`（当前 refresh）、`POST /api/users/{username}/sessions/revoke`
+     （管理员踢出全部会话）、改密/删号自动吊销；
+  4. Web（模块级 Promise 单飞）与移动端（`SessionRefreshCoordinator`）自动续期，refresh 失败清会话回登录页；
+  5. 反代补齐并实测 CSP（含 `worker-src 'self' blob:` 支持 ECharts、`connect-src 'self'` 覆盖 MQTT WSS）。
+- **证据**：
+  - 真实 Chrome（自签证书 + 本机 HTTPS 反代注入与 nginx 完全一致的 6 个安全头）四阶段：
+    登录页 / 仪表盘 / 设备列表 / refresh 失效回登录页，CSP 违规均为 **0**；
+    仪表盘 2 个并发 401 → 恰好 **1 次** refresh → 原请求重放 200；`wss://<host>/mqtt` 建立成功；
+  - 单测：Web 5 个并发 401 仅 1 次 refresh（`web/src/api/http.spec.ts`）；
+    移动端 5 个并发 401 仅 1 次 refresh（`device_app/test/session_refresh_test.dart`）；
+  - 后端：`test_auth_lifecycle.py` 7 用例（轮换/重放/登出/改密/管理员吊销/过期/未知）；
+  - E2E 两次：36 PASS / 0 FAIL（37.6s、40.1s），覆盖自动续期 5 次、管理员吊销、轮换、登出、改密、
+    「吊销后 access 在剩余 TTL 内仍 200」的窗口；
+  - 迁移：空库 upgrade、既有库 upgrade、`downgrade -1` 往返（`test_migrations.py`）。
+- **明确未覆盖**：吊销后已签发 access 的残留窗口（≤ access TTL）不做逐请求黑名单校验；
+  移动端未做真机 Keychain/Keystore 验证（沿用既有发布验证边界）。
 
 ### P2-5 CI/运维体验细节
 
@@ -465,5 +482,6 @@
 - `v1.20.0`：P1-1（结构化日志、请求 ID、分层健康检查、Prometheus 指标与告警规则）✅ 已完成；
 - `v1.21.0`：P1-4 + P2-2 + P2-1（Web 批量确认、处置备注、级别口径统一）✅ 已完成；
 - `v1.22.0`：P1-5（移动端 release 签名、CI 制品、构建号策略、依赖治理）✅ 已完成；
-- 下一批：P1-7 剩余测试补强（OTA E2E、故障注入、真机清单）；
-- P2 项穿插或单独小版本。
+- `v1.23.0`：P1-7（OTA 全链路 E2E、故障注入、Postgres 作业扩容、真机验收清单）✅ 已完成；
+- `v1.24.0`：P2-4（access/refresh 生命周期、三类吊销、客户端自动续期、反代安全头与 CSP 实测）✅ 已完成；
+- 下一批：P2-3 移动端规模化上限、P2-5 CI/运维体验细节。

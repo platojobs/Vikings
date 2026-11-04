@@ -75,8 +75,12 @@ def validate_password_strength(password: str, min_length: int = 8) -> Optional[s
 
 
 def create_access_token(username: str, role: str = ROLE_ADMIN) -> str:
-    """签发 JWT，携带用户名与角色。"""
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
+    """签发短 TTL 访问令牌（JWT），携带用户名与角色。
+
+    v1.24.0 起默认 TTL 20 分钟（`ACCESS_TOKEN_TTL_SECONDS`）。JWT 本身无状态，
+    吊销 refresh 不会让已签发的 access 立即失效，见 docs/contracts.md 的说明。
+    """
+    expire = datetime.now(timezone.utc) + timedelta(seconds=settings.access_token_ttl_seconds)
     payload = {"sub": username, "role": role, "exp": expire}
     return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
 

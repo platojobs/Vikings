@@ -33,7 +33,9 @@ class KeychainSecureStore implements SecureStore {
 
 /// 移动看板的本地存储。
 ///
-/// - 登录会话（含 token）写入系统安全存储：iOS Keychain / Android Keystore；
+/// - 登录会话（access + refresh）用**同一个 key**（`mobile.session`）整包写入
+///   系统安全存储：iOS Keychain / Android Keystore。两者同属一份登录凭据、
+///   生命周期由同一次轮换原子更新，拆 key 只会增加一次写失败即不一致的风险；
 /// - 网关地址与选中设备属于非敏感配置，保留在 shared_preferences；
 /// - 兼容旧版本（v1.7.0）把会话明文写在 shared_preferences 的情况：
 ///   读取时若安全存储为空，则取出旧值迁移过去并立即删除明文。

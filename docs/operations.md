@@ -191,6 +191,36 @@ python3 scripts/mqtt_credentials.py issue --subject device:dev-0100 \
 $COMPOSE restart mosquitto
 ```
 
+### 3.5 强制某用户下线（账号会话吊销，v1.24.0）
+
+适用场景：员工离职、账号疑似被盗、需要立即踢掉某账号的全部浏览器/手机会话。
+
+```bash
+# 1) 管理员登录拿 access（任何 admin 账号）
+TOKEN=$(curl -sk -X POST https://<host>/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<管理员口令>"}' | jq -r '.data.token')
+
+# 2) 吊销目标用户的全部 refresh（返回 {username, revoked:<条数>}）
+curl -sk -X POST https://<host>/api/users/alice/sessions/revoke \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**生效边界（务必如实告知用户）**：
+
+- `revoked` 条数对应被吊销的 refresh；目标用户下一次刷新即失败，客户端随之回登录页；
+- **已签发的 access 仍可用到自身过期**，最长 `ACCESS_TOKEN_TTL_SECONDS`（默认 20 分钟）；
+  需要更快生效时，把该值临时调到 300~900 并滚动重启网关（代价是刷新频率上升）；
+- 改口令（`PATCH /api/users/{username}`）会自动吊销该用户全部 refresh，并在响应里返回
+  `sessionsRevoked` 条数；删除账号同样会吊销；
+- 这些操作都写审计：`session.revoke`（管理员吊销）、`logout`（登出）、
+  `user.update`（改密/角色变更，含 `sessionsRevoked`），可在「审计日志」页按 target 用户过滤核对；
+- 若怀疑 refresh 被重放，网关会自动吊销该用户全部会话并写 `auth.refresh_reuse`，
+  无需人工干预，但应排查令牌泄露渠道。
+
+> 反代层无法单独吊销单个用户，请勿用「重启网关」当作下线手段：重启只会清空进程内登录限流计数，
+> 对已签发 JWT 没有影响。
+
 ---
 
 ## 4. 数据库迁移（Alembic）

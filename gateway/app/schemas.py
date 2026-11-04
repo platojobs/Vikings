@@ -108,8 +108,30 @@ class UserInfo(BaseModel):
 
 
 class LoginResponse(BaseModel):
+    """登录 / 刷新响应（v1.24.0）。
+
+    `token` 仍是短 TTL 访问令牌，保留字段名以兼容既有客户端；
+    `refresh_token` 为一次性轮换凭证，客户端必须单独保存，不得随每次请求发送。
+    """
+
     token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
     user: UserInfo
+
+
+class RefreshRequest(BaseModel):
+    """POST /api/auth/refresh 与 /api/auth/logout 的入参。"""
+
+    refresh_token: str = Field(min_length=8, max_length=256)
+
+
+class SessionRevokeOut(BaseModel):
+    """管理员吊销某用户全部会话的结果。"""
+
+    username: str
+    revoked: int
 
 
 class DeviceOut(BaseModel):

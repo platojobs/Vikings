@@ -9,6 +9,7 @@ import '../models/mobile_api_models.dart';
 import '../models/realtime_payload.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
+import '../services/session_refresh.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
 import '../widgets/command_dialog.dart';
@@ -57,6 +58,7 @@ typedef BoardRealtimeFactory = BoardRealtimeService Function(String url);
 class _MobileBoardPageState extends State<MobileBoardPage>
     with WidgetsBindingObserver {
   late final AppStorage _storage;
+  late final SessionRefreshCoordinator _refresher;
   late final BoardApiClientFactory _createApiClient;
   late final BoardRealtimeFactory _createRealtime;
 
@@ -138,9 +140,18 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   void initState() {
     super.initState();
     _storage = widget.storage ?? AppStorage();
+    _refresher = SessionRefreshCoordinator(
+      storage: _storage,
+      baseUrl: () => _baseUrl,
+      readSession: () => _session,
+      onRefreshed: _onSessionRefreshed,
+      // 测试注入的 fake 同时作为刷新客户端，避免单测触发真实网络
+      clientBuilder: widget.apiClientFactory,
+    );
     _createApiClient =
         widget.apiClientFactory ??
-        (String baseUrl) => ApiClient(baseUrl: baseUrl);
+        (String baseUrl) =>
+            ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
         widget.realtimeServiceFactory ??
         (String url) => BoardRealtimeService(
@@ -845,6 +856,15 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     return error.userMessage;
   }
 
+  /// 单飞 refresh 成功：同步内存会话，列表继续用新 access 重放原请求。
+  void _onSessionRefreshed(AuthSession session) {
+    if (!mounted) return;
+    setState(() {
+      _session = session;
+      _notice = null;
+    });
+  }
+
   Future<void> _handleExpired() async {
     _stopRealtime();
     _stopPolling();
@@ -877,6 +897,17 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   Future<void> _logout() async {
     _stopRealtime();
     _stopPolling();
+    final refreshToken = _session?.refreshToken ?? '';
+    if (refreshToken.isNotEmpty) {
+      // 先吊销服务端 refresh（离线/失败不阻塞本地退出），再清本地会话
+      try {
+        await _createApiClient(_baseUrl).logoutSession(
+          refreshToken: refreshToken,
+        );
+      } catch (_) {
+        // 服务端不可达时仍允许本地退出
+      }
+    }
     await _storage.clearSession();
     if (!mounted) {
       return;

@@ -10,8 +10,8 @@
  */
 
 import mqtt, { type MqttClient } from 'mqtt'
-import { getToken } from '@/utils/auth'
-import type { ApiEnvelope, MqttCredential } from '@/types'
+import { request } from '@/api/http'
+import type { MqttCredential } from '@/types'
 
 type MessageHandler = (payload: unknown, topic: string) => void
 type StatusHandler = (connected: boolean) => void
@@ -70,30 +70,10 @@ function ensureClient(): void {
 async function initClient(): Promise<void> {
   let credential: MqttCredential
   try {
-    const token = getToken()
-    if (!token) {
-      throw new Error('未登录，无法换取 MQTT 只读凭证')
-    }
-    const apiBase = (
-      import.meta.env.VITE_API_BASE ||
-      (import.meta.env.PROD ? '' : 'http://127.0.0.1:8000')
-    ).replace(/\/+$/, '')
-    const response = await fetch(
-      `${apiBase}/api/auth/mqtt-credentials?client=web`,
-      {
-        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-      },
-    )
-    const payload = (await response.json()) as ApiEnvelope<MqttCredential> & {
-      message?: string
-      detail?: string
-    }
-    if (!response.ok || payload.code !== 0 || !payload.data) {
-      throw new Error(
-        payload.message || payload.detail || `凭证接口失败（HTTP ${response.status}）`,
-      )
-    }
-    credential = payload.data
+    // 走统一 HTTP 封装：access 过期时自动单飞刷新，避免长连接重连时被 401 挡住
+    credential = await request<MqttCredential>('/api/auth/mqtt-credentials?client=web', {
+      silent: true,
+    })
   } catch (error) {
     // 未登录 / 凭证未配置时不匿名连接：置为未连接，稍后重试（登录页本身不需要 MQTT）
     initStarted = false

@@ -26,6 +26,7 @@ from app.models import (  # noqa: F401  仅用于让静态检查知道模型已�
     DeviceAlert,
     DeviceCommand,
     OtaTask,
+    RefreshToken,
     RuleConfig,
     SensorRecord,
 )

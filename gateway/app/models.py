@@ -193,6 +193,31 @@ class AuditLog(Base):
     )
 
 
+class RefreshToken(Base):
+    """刷新令牌表：服务端保存令牌指纹（不存明文），支持登出/改密/管理员吊销。
+
+    轮换语义：每次刷新都会把旧行标记为 revoked（reason=rotated）并签发新行，
+    旧令牌不可再次使用；过期行保留用于审计，不做物理删除。
+    """
+
+    __tablename__ = "refresh_token"
+    __table_args__ = (
+        Index("idx_refresh_token_username", "username"),
+        Index("idx_refresh_token_expires", "expires_at"),
+    )
+
+    # 令牌指纹（SHA-256 hex），主键即唯一索引；明文只在响应中出现一次
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # revoked_reason: logout / rotated / password_change / admin_revoke / reuse_detected
+    revoked_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # 轮换后指向新令牌指纹，便于审计追链（不反向保存明文）
+    replaced_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
 class AppUser(Base):
     """后台账号表：角色驱动菜单与接口权限，口令只存 PBKDF2 哈希。"""
 

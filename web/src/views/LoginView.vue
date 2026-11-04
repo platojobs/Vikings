@@ -35,7 +35,7 @@ async function handleSubmit(): Promise<void> {
       username: form.username.trim(),
       password: form.password,
     })
-    setAuth(data.token, data.user)
+    setAuth(data.token, data.user, data.refresh_token)
     ElMessage.success('登录成功')
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard'
     await router.replace(redirect)

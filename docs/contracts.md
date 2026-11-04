@@ -221,9 +221,42 @@ Broker 的 1883（MQTT over TCP）与 9001（MQTT over WebSocket）**均关闭�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/auth/login` | 登录，入参 `{username, password}`，返回 `{token, user:{username, role}}` |
+| POST | `/api/auth/login` | 登录，入参 `{username, password}`，返回 `{token, refresh_token, token_type:"bearer", expires_in, user:{username, role}}` |
+| POST | `/api/auth/refresh` | 用 refresh 换新 access，入参 `{refresh_token}`，响应结构同登录；**轮换**：旧 refresh 立即失效 |
+| POST | `/api/auth/logout` | 吊销当前 refresh（幂等），入参 `{refresh_token}`，返回 `{revoked: bool}`；不要求 access，access 已过期也能登出 |
+| POST | `/api/users/{username}/sessions/revoke` | 管理员吊销该用户全部会话，返回 `{username, revoked}`（v1.24.0） |
 | GET | `/api/auth/me` | 返回数据库中的最新账号信息（角色被调整后前端刷新即可生效） |
 | GET | `/api/auth/mqtt-credentials?client=web\|mobile` | 登录后换取客户端只读 MQTT 凭证（v1.17.0） |
+
+**令牌生命周期（v1.24.0 / P2-4）**
+
+- access：无状态 JWT（HS256），TTL 由 `ACCESS_TOKEN_TTL_SECONDS` 控制，默认 **1200 秒（20 分钟）**；
+- refresh：随机 48 字节 urlsafe 明文，TTL 由 `REFRESH_TOKEN_TTL_DAYS` 控制，默认 **14 天**；
+  服务端**只存 SHA-256 指纹**（`refresh_token.token_hash` 为主键），明文仅在签发响应中出现一次；
+- **单次使用 + 轮换**：每次 refresh 都签发新 refresh 并把旧行标记为 `rotated`；
+  同一旧 refresh 第二次使用返回 401，并视为令牌泄露，**吊销该用户全部会话**（审计 `auth.refresh_reuse`）；
+  并发竞争下只有一方能原子占用旧令牌，竞争失败同样按重放处理（宁严勿松）；
+- **吊销范围**：登出只吊销当次 refresh；管理员吊销、改密、删除账号会吊销该用户全部 refresh；
+- **必须注意的残留窗口**：吊销只作用于 refresh。**已签发的 access 在自身 `exp` 前仍然可用**，
+  最长 `ACCESS_TOKEN_TTL_SECONDS`（默认 20 分钟）。本版本不宣称「吊销立即全局生效」；
+  缩小窗口的手段是压短 access TTL（代价：刷新频率与网关 DB 写入增加），
+  **没有**引入每请求黑名单校验（代价：每次 API 调用都要查 Redis/DB，破坏无状态校验并放大故障面）。
+  需要分钟级强下线时，把 `ACCESS_TOKEN_TTL_SECONDS` 调到 300~900 并接受相应的刷新开销。
+
+| 场景 | 状态码 | 响应 detail / 说明 |
+| --- | --- | --- |
+| 登录成功 | 200 | 签发 access + refresh，`expires_in` 为 access 秒数 |
+| 账号/口令错误、账号停用 | 401 | `用户名或密码错误` |
+| refresh 不存在 | 401 | `刷新令牌无效` |
+| refresh 已过期 | 401 | `刷新令牌已过期`（同时把该行标记 `expired`） |
+| refresh 已登出/改密/管理员吊销 | 401 | `刷新令牌已被吊销` |
+| 旧 refresh 被重放 | 401 | `刷新令牌已被使用，已吊销该账号全部会话` |
+| refresh 对应的账号被停用/删除 | 401 | `账号不存在或已停用`，并吊销该用户全部会话 |
+| 登出（无论令牌是否有效） | 200 | `{revoked: true/false}`，重复登出不报错 |
+
+客户端约定（Web 与移动端一致）：401 时先尝试一次 refresh 并重放原请求；
+refresh 失败则清空本地 access/refresh 并回登录页。并发 401 必须**单飞**（一个进程/页面只发一次 refresh），
+Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.10。
 
 后续请求头：`Authorization: Bearer <token>`。登录凭证校验数据库 `app_user` 表，
 口令以 PBKDF2-SHA256 哈希存储。角色与权限矩阵：
@@ -481,7 +514,7 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 
 | 用途 | 接口 | 参数 / 说明 |
 | --- | --- | --- |
-| 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, user}` |
+| 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, refresh_token, token_type, expires_in, user}` |
 | 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `group` / `hasAlert` / `withAlertCount=true` |
 | 分组概览 | `GET /api/devices/groups` | 分组 chips 数据源；空分组与「未分组」合并 |
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
@@ -491,8 +524,11 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
 
 统一鉴权头 `Authorization: Bearer <token>`；token 由登录接口下发，与 Web 后台一致。
-看板对 `401` 的处理：清除本地 token 并回到登录页；`403` 提示无权访问；
-超时与网络错误展示可读文案。v1.9.0 起额外调用 3.10.2 列出的两个写接口，
+v1.24.0 起登录同时返回 `refresh_token`：看板对 `401` 的处理改为「本页单飞 refresh 一次 → 重放原请求」，
+refresh 失败才清除 access/refresh 并回登录页；**并发请求共享同一次刷新**（`SessionRefreshCoordinator`），
+避免多个 401 触发刷新风暴。access 与 refresh 仍保存在同一个 Keychain/Keystore key（`mobile.session`）：
+两者同属一份会话、生命周期一致，分 key 会让「清一半」的异常状态更易出现。
+`403` 提示无权访问；超时与网络错误展示可读文案。v1.9.0 起额外调用 3.10.2 列出的两个写接口，
 写权限与 403 处理不复制 RBAC，直接沿用登录会话角色与网关响应。
 
 #### 3.10.1 移动看板实时订阅（v1.8.0）

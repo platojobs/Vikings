@@ -1,4 +1,11 @@
-"""认证路由：账号密码登录（查用户表 + PBKDF2 校验），签发携带角色的 JWT。"""
+"""认证路由：登录签发短 TTL access + 可吊销 refresh，并提供刷新/登出。
+
+生命周期（v1.24.0）：
+- access 默认 20 分钟（ACCESS_TOKEN_TTL_SECONDS），无状态 JWT；
+- refresh 默认 14 天（REFRESH_TOKEN_TTL_DAYS），服务端持久化指纹、单次使用并轮换；
+- 登出只吊销当前 refresh；管理员吊销/改密吊销该用户全部 refresh；
+- 已被吊销的 refresh 立即失效，但已签发的 access 仍可用到自身过期为止。
+"""
 
 from datetime import datetime, timezone
 
@@ -13,11 +20,12 @@ from app.schemas import (
     LoginRequest,
     LoginResponse,
     MqttClientCredentialOut,
+    RefreshRequest,
     UserInfo,
     UserOut,
 )
 from app.security import create_access_token, require_user
-from app.services import audit_service, mqtt_credential_service, user_service
+from app.services import audit_service, mqtt_credential_service, token_service, user_service
 from app.services.login_guard import LoginRateLimiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -61,6 +69,7 @@ async def login(
     login_limiter.reset(key)
     user.last_login_at = datetime.now(timezone.utc)
     token = create_access_token(user.username, role=user.role)
+    refresh_token = await token_service.issue_refresh_token(session, user.username)
     await audit_service.log(
         session,
         operator=user.username,
@@ -71,8 +80,75 @@ async def login(
     )
     await session.commit()
     return ApiResponse(
-        data=LoginResponse(token=token, user=UserInfo(username=user.username, role=user.role))
+        data=LoginResponse(
+            token=token,
+            refresh_token=refresh_token,
+            expires_in=settings.access_token_ttl_seconds,
+            user=UserInfo(username=user.username, role=user.role),
+        )
     )
+
+
+@router.post("/refresh", response_model=ApiResponse[LoginResponse])
+async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_session)):
+    """用 refresh 换新 access：旧 refresh 单次使用，成功后立即失效（轮换）。"""
+    try:
+        new_refresh, username = await token_service.rotate_refresh_token(
+            session, body.refresh_token
+        )
+    except token_service.RefreshTokenError as exc:
+        if exc.reused and exc.username:
+            await audit_service.log(
+                session,
+                operator="system",
+                action=audit_service.ACTION_REFRESH_REUSE,
+                target_type="app_user",
+                target_id=exc.username,
+                detail={"reason": token_service.REASON_REUSE},
+            )
+            await session.commit()
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    user = await user_service.get_user(session, username)
+    if user is None or not user.active:
+        # 账号已停用/删除：连刚签发的新令牌一起吊销，避免残留可用会话
+        await token_service.revoke_all_for_user(
+            session, username, token_service.REASON_ADMIN_REVOKE
+        )
+        await session.commit()
+        raise HTTPException(status_code=401, detail="账号不存在或已停用")
+
+    access = create_access_token(user.username, role=user.role)
+    await session.commit()
+    return ApiResponse(
+        data=LoginResponse(
+            token=access,
+            refresh_token=new_refresh,
+            expires_in=settings.access_token_ttl_seconds,
+            user=UserInfo(username=user.username, role=user.role),
+        )
+    )
+
+
+@router.post("/logout", response_model=ApiResponse[dict])
+async def logout(body: RefreshRequest, session: AsyncSession = Depends(get_session)):
+    """登出：吊销当前 refresh（幂等）。access 仍会自然过期，客户端应同时清本地会话。
+
+    故意不要求 access 鉴权：access 可能已经过期，否则用户将无法登出。
+    """
+    username = await token_service.revoke_refresh_token(
+        session, body.refresh_token, token_service.REASON_LOGOUT
+    )
+    if username:
+        await audit_service.log(
+            session,
+            operator=username,
+            action=audit_service.ACTION_LOGOUT,
+            target_type="app_user",
+            target_id=username,
+        )
+    await session.commit()
+    return ApiResponse(data={"revoked": username is not None})
 
 
 @router.get("/mqtt-credentials", response_model=ApiResponse[MqttClientCredentialOut])
