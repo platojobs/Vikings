@@ -165,6 +165,7 @@ class _FakeApiClient extends ApiClient {
   int lastPage = 0;
   String? lastKeyword;
   String? lastStatus;
+  String? lastGroup;
   bool lastHasAlert = false;
   int alertFetchCalls = 0;
 
@@ -184,6 +185,7 @@ class _FakeApiClient extends ApiClient {
     int pageSize = 20,
     String? status,
     String? keyword,
+    String? group,
     bool hasAlert = false,
     bool withAlertCount = false,
   }) async {
@@ -191,6 +193,7 @@ class _FakeApiClient extends ApiClient {
     lastPage = page;
     lastKeyword = keyword;
     lastStatus = status;
+    lastGroup = group;
     lastHasAlert = hasAlert;
     final error = fetchError;
     if (error != null) {
@@ -213,6 +216,11 @@ class _FakeApiClient extends ApiClient {
       filtered = filtered.where((item) => item.status == 'online').toList();
     } else if (status == 'offline') {
       filtered = filtered.where((item) => item.status != 'online').toList();
+    }
+    if (group != null && group.isNotEmpty) {
+      filtered = filtered
+          .where((item) => _groupNameOf(item) == group)
+          .toList(growable: false);
     }
     if (hasAlert) {
       final alertIds = alerts
@@ -259,6 +267,25 @@ class _FakeApiClient extends ApiClient {
   }
 
   @override
+  Future<List<DeviceGroup>> fetchGroups({required String token}) async {
+    final byName = <String, DeviceGroup>{};
+    for (final device in devices) {
+      final name = _groupNameOf(device);
+      final previous = byName[name];
+      final online = device.status == 'online' ? 1 : 0;
+      byName[name] = DeviceGroup(
+        groupName: name,
+        total: (previous?.total ?? 0) + 1,
+        online: (previous?.online ?? 0) + online,
+        offline: (previous?.offline ?? 0) + (1 - online),
+      );
+    }
+    final groups = byName.values.toList();
+    groups.sort((a, b) => a.groupName.compareTo(b.groupName));
+    return groups;
+  }
+
+  @override
   Future<List<SensorReading>> fetchLatestReadings({
     required String token,
     List<String>? deviceIds,
@@ -288,6 +315,11 @@ class _FakeApiClient extends ApiClient {
         ? const <AlertItem>[]
         : open.sublist(start, start + pageSize > total ? total : start + pageSize);
     return AlertPage(items: items, total: total, page: page, pageSize: pageSize);
+  }
+
+  String _groupNameOf(DeviceSummary device) {
+    final name = device.groupName.trim();
+    return name.isEmpty ? '未分组' : name;
   }
 
   @override
@@ -507,6 +539,8 @@ void main() {
     final api = _FakeApiClient();
     await _pumpBoard(tester, api: api, session: _adminSession);
     await tester.pumpAndSettle();
+    // 分组筛选行使告警区下移，先滚动到告警区再断言
+    await _scrollTo(tester, find.text('未处理告警（1）'));
     expect(find.text('未处理告警（1）'), findsOneWidget);
 
     await _scrollTo(tester, find.widgetWithText(TextButton, '确认告警'));
@@ -785,10 +819,13 @@ void main() {
     expect(find.text('告警 3'), findsOneWidget);
     expect(find.text('筛选结果：1 台 / 全部 10 台'), findsOneWidget);
 
-    // 告警总数来自服务端 total，而不是已加载列表长度；汇总卡同理
-    expect(find.text('未处理告警（1）'), findsOneWidget);
+    // 汇总卡同样使用服务端全量统计
     expect(find.text('10'), findsOneWidget);
     expect(find.text('8'), findsOneWidget);
+
+    // 告警总数来自服务端 total，而不是已加载列表长度
+    await _scrollTo(tester, find.text('未处理告警（1）'));
+    expect(find.text('未处理告警（1）'), findsOneWidget);
   });
 
   testWidgets('末页显示没有更多了，空结果展示空状态', (tester) async {
@@ -866,6 +903,114 @@ void main() {
     await tester.pump(const Duration(milliseconds: 20));
     expect(find.text('一号机'), findsNothing);
     expect(find.text('二号机'), findsOneWidget);
+  });
+
+  testWidgets('切换分组重置分页并只展示该分组设备', (tester) async {
+    final devices = List<DeviceSummary>.generate(25, (index) {
+      final id = 'dev-${index.toString().padLeft(2, '0')}';
+      return DeviceSummary(
+        deviceId: id,
+        name: index == 24 ? '巡检设备' : '设备 $id',
+        model: 'Battery-Sensor',
+        firmwareVersion: '1.0.0',
+        groupName: index == 24 ? '巡检组' : '生产组',
+        status: 'online',
+      );
+    });
+    final api = _FakeApiClient(devices: devices);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    // 先翻到第 2 页
+    for (var i = 0; i < 12 && api.lastPage == 1; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+    expect(api.lastPage, 2);
+
+    await tester.drag(find.byType(ListView).first, const Offset(0, 3000));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ChoiceChip, '巡检组'));
+    await tester.pumpAndSettle();
+
+    // 切组后重置到第 1 页，且 group 作为服务端参数下发
+    expect(api.lastPage, 1);
+    expect(api.lastGroup, '巡检组');
+    expect(find.text('巡检设备'), findsOneWidget);
+    expect(find.text('设备 dev-00'), findsNothing);
+    expect(find.text('筛选结果：1 台 / 全部 25 台'), findsOneWidget);
+  });
+
+  testWidgets('分组与搜索组合筛选同时生效', (tester) async {
+    const production = DeviceSummary(
+      deviceId: 'dev-prod-1',
+      name: '一号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '生产组',
+      status: 'online',
+    );
+    const production2 = DeviceSummary(
+      deviceId: 'dev-prod-2',
+      name: '二号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '生产组',
+      status: 'online',
+    );
+    const warehouse = DeviceSummary(
+      deviceId: 'dev-wh-1',
+      name: '三号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '仓储组',
+      status: 'online',
+    );
+    final api = _FakeApiClient(devices: const [production, production2, warehouse]);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ChoiceChip, '生产组'));
+    await tester.pumpAndSettle();
+    expect(api.lastGroup, '生产组');
+
+    await tester.enterText(find.byType(TextField), 'dev-prod-2');
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+    expect(api.lastGroup, '生产组');
+    expect(api.lastKeyword, 'dev-prod-2');
+    expect(find.text('二号机'), findsOneWidget);
+    expect(find.text('一号机'), findsNothing);
+    expect(find.text('三号机'), findsNothing);
+    expect(find.text('筛选结果：1 台 / 全部 3 台'), findsOneWidget);
+  });
+
+  testWidgets('无分组设备归入未分组并可筛选', (tester) async {
+    const ungrouped = DeviceSummary(
+      deviceId: 'dev-ungrouped',
+      name: '未分组设备',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '',
+      status: 'online',
+    );
+    final api = _FakeApiClient(devices: const [_device, ungrouped]);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    // 空分组在分组概览中显示为「未分组」
+    expect(find.widgetWithText(ChoiceChip, '未分组'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(ChoiceChip, '未分组'));
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+    expect(api.lastGroup, '未分组');
+    expect(find.text('未分组设备'), findsOneWidget);
+    expect(find.text('一号机'), findsNothing);
+    expect(find.text('筛选结果：1 台 / 全部 2 台'), findsOneWidget);
   });
 }
 

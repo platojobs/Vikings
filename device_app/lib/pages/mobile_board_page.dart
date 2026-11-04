@@ -95,6 +95,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   String _keyword = '';
   _BoardStatusFilter _statusFilter = _BoardStatusFilter.all;
 
+  /// 分组筛选：空字符串表示全部分组；「未分组」由网关统一归并。
+  String _groupFilter = '';
+  List<DeviceGroup> _groups = const <DeviceGroup>[];
+
   /// 服务端分页状态：只加载当前页，滚动到底追加下一页，不再受首屏 100 台上限约束。
   final ScrollController _scrollController = ScrollController();
   final GlobalKey _deviceFooterKey = GlobalKey();
@@ -538,6 +542,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         pageSize: _boardPageSize,
         status: _requestStatus,
         keyword: _keyword,
+        group: _groupFilter.isEmpty ? null : _groupFilter,
         hasAlert: _statusFilter == _BoardStatusFilter.alert,
         withAlertCount: true,
       );
@@ -555,6 +560,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           pageSize: _alertPageSize,
         ),
         client.fetchStatsOverview(token: session.token),
+        client.fetchGroups(token: session.token),
       ]);
       if (!mounted || requestId != _requestSeq) {
         return;
@@ -570,6 +576,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         _alertPage = 1;
         _alertTotal = alertPage.total;
         _stats = results[2] as StatsOverview;
+        _groups = results[3] as List<DeviceGroup>;
         // REST 快照比本地实时状态更新，清空后再由新事件补齐
         _liveStatus.clear();
         _error = null;
@@ -608,6 +615,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         pageSize: _boardPageSize,
         status: _requestStatus,
         keyword: _keyword,
+        group: _groupFilter.isEmpty ? null : _groupFilter,
         hasAlert: _statusFilter == _BoardStatusFilter.alert,
         withAlertCount: true,
       );
@@ -758,6 +766,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _alertPage = 1;
       _alertTotal = 0;
       _stats = StatsOverview.empty;
+      _groupFilter = '';
+      _groups = const <DeviceGroup>[];
       _requestSeq += 1;
       _loading = false;
       _error = null;
@@ -785,6 +795,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       _alertPage = 1;
       _alertTotal = 0;
       _stats = StatsOverview.empty;
+      _groupFilter = '';
+      _groups = const <DeviceGroup>[];
       _requestSeq += 1;
       _error = null;
       _writeBlockedReason = null;
@@ -940,12 +952,30 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     unawaited(_loadData(silent: true));
   }
 
-  /// 服务端已按状态 / 关键词 / 有告警完成过滤与分页；这里只做实时状态修正：
+  /// 切换分组同样按新参数重拉第 1 页，与搜索、状态筛选、有告警组合生效。
+  void _onGroupChanged(String groupName) {
+    if (_groupFilter == groupName) {
+      return;
+    }
+    setState(() => _groupFilter = groupName);
+    unawaited(_loadData(silent: true));
+  }
+
+  /// 空分组名统一显示为「未分组」，与网关的分组概览口径一致。
+  String _deviceGroupName(DeviceSummary device) {
+    final name = device.groupName.trim();
+    return name.isEmpty ? '未分组' : name;
+  }
+
+  /// 服务端已按状态 / 关键词 / 分组 / 有告警完成过滤与分页；这里只做实时状态修正：
   /// 上下线事件能立即改变「在线 / 离线」结果；「有告警」直接使用服务端聚合的
   /// `openAlertCount`，不再依赖未处理告警列表的前 50 条。
   List<DeviceSummary> get _filteredDevices {
     final keyword = _keyword.toLowerCase();
     return _devices.where((device) {
+      if (_groupFilter.isNotEmpty && _deviceGroupName(device) != _groupFilter) {
+        return false;
+      }
       if (keyword.isNotEmpty) {
         final id = device.deviceId.toLowerCase();
         final name = device.name.toLowerCase();
@@ -963,7 +993,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   }
 
   bool get _filterActive =>
-      _keyword.isNotEmpty || _statusFilter != _BoardStatusFilter.all;
+      _keyword.isNotEmpty ||
+      _statusFilter != _BoardStatusFilter.all ||
+      _groupFilter.isNotEmpty;
 
   SensorReading? _readingFor(String deviceId) {
     for (final reading in _readings) {
@@ -1319,6 +1351,34 @@ class _MobileBoardPageState extends State<MobileBoardPage>
             ],
           ),
         ),
+        const SizedBox(height: 8),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(right: 8, top: 8),
+                child: Text(
+                  '分组：',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ),
+              ChoiceChip(
+                label: const Text('全部分组'),
+                selected: _groupFilter.isEmpty,
+                onSelected: (_) => _onGroupChanged(''),
+              ),
+              for (final group in _groups) ...[
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: Text(group.groupName),
+                  selected: _groupFilter == group.groupName,
+                  onSelected: (_) => _onGroupChanged(group.groupName),
+                ),
+              ],
+            ],
+          ),
+        ),
       ],
     );
   }
@@ -1352,6 +1412,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           const SizedBox(height: 6),
           Text(
             '当前筛选：${_statusFilter.label}'
+            '${_groupFilter.isEmpty ? '' : ' · 分组「$_groupFilter」'}'
             '${_keyword.isEmpty ? '' : ' · 关键词「$_keyword」'}；'
             '可清空关键词或切回「全部」。上方汇总卡仍为全部 ${_stats.deviceTotal} 台设备。',
             style: const TextStyle(fontSize: 12, color: Colors.black54),

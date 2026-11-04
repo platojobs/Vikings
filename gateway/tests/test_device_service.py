@@ -359,3 +359,57 @@ def test_latest_records_device_ids_filter(tmp_path):
         ]
 
     _run(tmp_path, scenario)
+
+
+def test_group_filter_and_ungrouped_bucket(tmp_path):
+    """分组筛选：空分组与字面「未分组」合并，且可与关键词、有告警组合。"""
+    async def scenario(session):
+        await device_service.create_device(
+            session, "dev-prod", "生产设备", "VG-S100", "1.0.0", "生产组"
+        )
+        await device_service.create_device(
+            session, "dev-empty", "空分组设备", "VG-S100", "1.0.0", ""
+        )
+        await device_service.create_device(
+            session, "dev-literal", "未分组设备", "VG-S100", "1.0.0", "未分组"
+        )
+        await device_service.create_device(
+            session, "dev-default", "默认设备", "VG-S100", "1.0.0", "默认分组"
+        )
+        _add_alert(session, "alt-empty", "dev-empty")
+        await session.flush()
+
+        groups = await device_service.list_groups(session)
+        assert {item["group_name"]: item["total"] for item in groups} == {
+            "生产组": 1,
+            "未分组": 2,
+            "默认分组": 1,
+        }
+        assert [item["group_name"] for item in groups] == sorted(
+            item["group_name"] for item in groups
+        )
+
+        ungrouped, ungrouped_total = await device_service.list_devices(
+            session, None, None, 1, 20, group_name="未分组"
+        )
+        assert ungrouped_total == 2
+        assert {item.device_id for item in ungrouped} == {"dev-empty", "dev-literal"}
+
+        prod, prod_total = await device_service.list_devices(
+            session, None, None, 1, 20, group_name="生产组"
+        )
+        assert prod_total == 1
+        assert prod[0].device_id == "dev-prod"
+
+        # 分组 + 关键词 + 有告警 组合筛选
+        both, both_total = await device_service.list_devices(
+            session, None, "空分组", 1, 20, group_name="未分组", has_alert=True
+        )
+        assert both_total == 1
+        assert both[0].device_id == "dev-empty"
+
+        # 回归：不传 group 时总数不变
+        _all, all_total = await device_service.list_devices(session, None, None, 1, 20)
+        assert all_total == 4
+
+    _run(tmp_path, scenario)

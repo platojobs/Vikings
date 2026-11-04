@@ -285,6 +285,7 @@ http://192.168.1.8:5173
 | --- | --- |
 | 搜索框 | 按设备名称 / ID 模糊匹配（`keyword` 请求参数），大小写不敏感；输入 300ms 防抖后重置到第 1 页 |
 | 状态筛选 | 全部 / 在线 / 离线 / 有告警：分别下发 `status=online/offline`、`hasAlert=true`，切换即按新参数重拉第 1 页 |
+| 分组筛选 | 用 `GET /api/devices/groups` 的分组概览渲染 chips，选择后下发 `group=<组名>` 并重置第 1 页；可与搜索、状态筛选、有告警组合；空分组名统一显示为「未分组」 |
 | 列表分页 | 首屏 `page=1&pageSize=20`；设备区页脚进入视口自动请求下一页，加载中显示「加载中…」，末页显示「没有更多了」 |
 | 有告警与角标 | `withAlertCount=true` 返回每设备 `open_alert_count`（数据库按 `status='open'` 聚合），筛选与卡片角标同源，不受告警列表分页大小影响 |
 | 告警列表 | `status=open&page=N&pageSize=20` 按页追加；标题「未处理告警（N）」使用服务端 `total`，不再停在 50 条 |
@@ -582,3 +583,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.9.3` | E2E 纳入 GitHub Actions 独立作业（mosquitto + 端口检查 + 超时 + 清理）；E2E 使用临时 Broker 数据目录与 Python/Mosquitto 路径自适应 |
 | `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试（[发布说明](docs/releases/v1.10.0.md)） |
 | `v1.11.0` | 移动看板切换服务端分页与筛选，拆掉首屏 100 台与告警 pageSize=50 上限；网关 `/api/devices` 新增可选 `hasAlert` / `withAlertCount`（按设备聚合未处理告警数），`/api/records/latest` 新增可选 `deviceIds`；汇总卡改用服务端统计，实时与分页协同（[发布说明](docs/releases/v1.11.0.md)） |
+| `v1.12.0` | 移动看板新增分组切换与分组筛选（与搜索、状态、有告警、服务端分页组合生效，切组重置第 1 页）；空分组统一归入「未分组」，网关分组概览同步归并（[发布说明](docs/releases/v1.12.0.md)） |

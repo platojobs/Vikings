@@ -180,6 +180,10 @@
 设备条目（`DeviceOut`）字段：`device_id`、`name`、`model`、`firmware_version`、`group_name`、
 `status`、`last_report_at`、`last_online_at`、`open_alert_count`（可选，仅 `withAlertCount=true` 时填充）。
 
+v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹配 `group_name` 为空串或字面「未分组」的设备；
+`GET /api/devices/groups` 也把空分组名与「未分组」合并为同一个 `未分组` 桶（`total` / `online` / `offline` 累加）。
+不传 `group` 时行为不变；普通组名筛选语义不变。
+
 写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
 
 ### 3.3 告警
@@ -249,7 +253,8 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 用途 | 接口 | 参数 / 说明 |
 | --- | --- | --- |
 | 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, user}` |
-| 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `hasAlert` / `withAlertCount=true` |
+| 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `group` / `hasAlert` / `withAlertCount=true` |
+| 分组概览 | `GET /api/devices/groups` | 分组 chips 数据源；空分组与「未分组」合并 |
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
 | 单设备历史上报 | `GET /api/devices/{id}/records` | 看板固定 `limit=10` |
 | 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数 |

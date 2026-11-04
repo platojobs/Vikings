@@ -54,6 +54,7 @@ class ApiClient {
     int pageSize = 20,
     String? status,
     String? keyword,
+    String? group,
     bool hasAlert = false,
     bool withAlertCount = false,
   }) async {
@@ -66,6 +67,7 @@ class ApiClient {
         'pageSize': '$pageSize',
         if (status != null && status.isNotEmpty) 'status': status,
         if (keyword != null && keyword.isNotEmpty) 'keyword': keyword,
+        if (group != null && group.isNotEmpty) 'group': group,
         if (hasAlert) 'hasAlert': 'true',
         if (withAlertCount) 'withAlertCount': 'true',
       },
@@ -74,6 +76,12 @@ class ApiClient {
       throw const ApiException(ApiErrorKind.invalidResponse, '设备列表响应缺少 data');
     }
     return DevicePage.fromJson(data);
+  }
+
+  /// 分组概览（每组总数 / 在线 / 离线），用于看板分组筛选。
+  Future<List<DeviceGroup>> fetchGroups({required String token}) async {
+    final data = await _send('GET', '/api/devices/groups', token: token);
+    return _mapList(data, DeviceGroup.fromJson);
   }
 
   /// 每设备最新一条上报。

@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,9 @@ from app.schemas import DeviceStatusMessage, SensorReportMessage
 from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE
 
 logger = logging.getLogger(__name__)
+
+# 空分组名与字面「未分组」统一归入该桶，供列表筛选与分组概览使用
+UNGROUPED_GROUP_NAME = "未分组"
 
 
 def _now() -> datetime:
@@ -115,8 +118,16 @@ async def list_devices(
         stmt = stmt.where(Device.status == status)
         count_stmt = count_stmt.where(Device.status == status)
     if group_name:
-        stmt = stmt.where(Device.group_name == group_name)
-        count_stmt = count_stmt.where(Device.group_name == group_name)
+        if group_name == UNGROUPED_GROUP_NAME:
+            # 空分组与字面「未分组」统一归入未分组，移动看板可直接筛选
+            group_clause = or_(
+                Device.group_name == "",
+                Device.group_name == UNGROUPED_GROUP_NAME,
+            )
+        else:
+            group_clause = Device.group_name == group_name
+        stmt = stmt.where(group_clause)
+        count_stmt = count_stmt.where(group_clause)
     if keyword:
         like = "%" + keyword + "%"
         cond = Device.device_id.ilike(like) | Device.name.ilike(like)
@@ -225,7 +236,10 @@ async def delete_device(session: AsyncSession, device_id: str) -> Tuple[bool, st
 
 
 async def list_groups(session: AsyncSession) -> List[dict]:
-    """分组概览：每组设备数与在线/离线数量，用于列表筛选与拓扑概览。"""
+    """分组概览：每组设备数与在线/离线数量，用于列表筛选与拓扑概览。
+
+    空分组名与字面「未分组」合并为同一个「未分组」桶，避免出现空标题分组。
+    """
     stmt = (
         select(
             Device.group_name.label("group_name"),
@@ -233,22 +247,25 @@ async def list_groups(session: AsyncSession) -> List[dict]:
             func.sum(case((Device.status == DEVICE_STATUS_ONLINE, 1), else_=0)).label("online"),
         )
         .group_by(Device.group_name)
-        .order_by(Device.group_name)
     )
     rows = (await session.execute(stmt)).all()
-    result = []
+    merged: Dict[str, Dict[str, int]] = {}
     for row in rows:
-        total = int(row.total)
-        online = int(row.online or 0)
-        result.append(
-            {
-                "group_name": row.group_name,
-                "total": total,
-                "online": online,
-                "offline": total - online,
-            }
-        )
-    return result
+        name = (row.group_name or "").strip() or UNGROUPED_GROUP_NAME
+        entry = merged.setdefault(name, {"total": 0, "online": 0})
+        entry["total"] += int(row.total)
+        entry["online"] += int(row.online or 0)
+    if not merged:
+        return []
+    return [
+        {
+            "group_name": name,
+            "total": values["total"],
+            "online": values["online"],
+            "offline": values["total"] - values["online"],
+        }
+        for name, values in sorted(merged.items())
+    ]
 
 
 async def get_device(session: AsyncSession, device_id: str) -> Optional[Device]:

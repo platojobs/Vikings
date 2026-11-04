@@ -171,6 +171,28 @@ class AlertPage {
   );
 }
 
+/// `GET /api/devices/groups` 的分组概览。
+class DeviceGroup {
+  const DeviceGroup({
+    required this.groupName,
+    required this.total,
+    required this.online,
+    required this.offline,
+  });
+
+  final String groupName;
+  final int total;
+  final int online;
+  final int offline;
+
+  factory DeviceGroup.fromJson(Map<String, dynamic> json) => DeviceGroup(
+    groupName: _asString(json['group_name'], '未分组'),
+    total: _asInt(json['total']),
+    online: _asInt(json['online']),
+    offline: _asInt(json['offline']),
+  );
+}
+
 /// `GET /api/stats/overview`：看板汇总卡使用的服务端全量统计。
 class StatsOverview {
   const StatsOverview({
