@@ -923,9 +923,21 @@ def ack_alert(ctx: Context) -> str:
         if not items:
             raise RuntimeError("未找到可确认的未处理告警")
         ctx.alert_id = items[0]["alert_id"]
-    acked = api(ctx, "POST", f"/api/alerts/{ctx.alert_id}/ack")
+    single_note = "E2E 单条确认：已远程检查设备"
+    acked = api(
+        ctx,
+        "POST",
+        f"/api/alerts/{ctx.alert_id}/ack",
+        json={"note": single_note},
+    )
     if acked.get("status") != "acked":
         raise RuntimeError(f"确认后状态不是 acked：{acked}")
+    if acked.get("acked_by") != ctx.args.username:
+        raise RuntimeError(f"acked_by 未记录真实操作人：{acked}")
+    if acked.get("ack_note") != single_note:
+        raise RuntimeError(f"单条确认备注未落库：{acked}")
+    if not acked.get("acked_at"):
+        raise RuntimeError(f"单条确认缺少 acked_at：{acked}")
     open_data = api(
         ctx,
         "GET",
@@ -944,7 +956,10 @@ def ack_alert(ctx: Context) -> str:
     acked_ids = [item["alert_id"] for item in acked_data.get("items") or []]
     if ctx.alert_id not in acked_ids:
         raise RuntimeError("确认后告警未出现在 acked 列表")
-    return f"告警 {ctx.alert_id} 已 acked，open 列表不再返回，acked 列表可查"
+    return (
+        f"告警 {ctx.alert_id} 已 acked，记录 acked_by={acked.get('acked_by')}、"
+        f"acked_at、备注；open 列表不再返回，acked 列表可查"
+    )
 
 
 def verify_alert_center_bulk_ack(ctx: Context) -> str:
@@ -1024,11 +1039,15 @@ def verify_alert_center_bulk_ack(ctx: Context) -> str:
         raise RuntimeError(f"告警中心筛选 total 异常：{page}")
 
     missing_id = f"alt-e2e-missing-{uuid.uuid4().hex[:6]}"
+    bulk_note = "E2E 批量确认：湿度越限，已派单检查"
     result = api(
         ctx,
         "POST",
         "/api/alerts/bulk-ack",
-        json={"alert_ids": [new_alert_id, missing_id]},
+        json={
+            "alert_ids": [new_alert_id, missing_id],
+            "note": bulk_note,
+        },
     )
     if result.get("acked") != [new_alert_id]:
         raise RuntimeError(f"批量确认 acked 不符合预期：{result}")
@@ -1057,12 +1076,58 @@ def verify_alert_center_bulk_ack(ctx: Context) -> str:
             "pageSize": 50,
         },
     )
-    acked_ids = [row["alert_id"] for row in acked_data.get("items") or []]
-    if new_alert_id not in acked_ids:
+    acked_rows = {
+        row["alert_id"]: row for row in acked_data.get("items") or []
+    }
+    row = acked_rows.get(new_alert_id)
+    if row is None:
         raise RuntimeError("批量确认后告警未出现在 acked 列表")
+    if row.get("acked_by") != ctx.args.username:
+        raise RuntimeError(f"批量确认 acked_by 未记录真实操作人：{row}")
+    if row.get("ack_note") != bulk_note:
+        raise RuntimeError(f"批量确认备注未落库：{row}")
+    if not row.get("acked_at"):
+        raise RuntimeError(f"批量确认缺少 acked_at：{row}")
+
+    # 旧客户端/重复提交不带备注：幂等，且不覆盖首次处置信息
+    retry = api(
+        ctx,
+        "POST",
+        "/api/alerts/bulk-ack",
+        json={"alert_ids": [new_alert_id]},
+    )
+    if retry.get("already_acked") != [new_alert_id]:
+        raise RuntimeError(f"重复批量确认未按 already_acked 返回：{retry}")
+    refreshed = api(
+        ctx,
+        "GET",
+        "/api/alerts",
+        params={
+            "deviceId": ctx.device_id,
+            "level": "critical",
+            "status": "acked",
+            "pageSize": 50,
+        },
+    )
+    refreshed_row = next(
+        (
+            item
+            for item in refreshed.get("items") or []
+            if item["alert_id"] == new_alert_id
+        ),
+        None,
+    )
+    if refreshed_row is None:
+        raise RuntimeError("重复确认后告警从 acked 列表消失")
+    if refreshed_row.get("ack_note") != bulk_note:
+        raise RuntimeError(
+            f"不带备注的重复确认覆盖了首次备注：{refreshed_row}"
+        )
     return (
         f"新告警 {new_alert_id}（humidity）经筛选可见；批量确认 acked=1、"
-        f"not_found=1（部分失败可见）；open 不再返回，acked 可查"
+        f"not_found=1（部分失败可见）；acked_by={row.get('acked_by')}、"
+        f"备注与 acked_at 已记录；旧客户端重试不覆盖处置信息；"
+        f"open 不再返回，acked 可查"
     )
 
 

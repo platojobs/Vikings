@@ -5,7 +5,7 @@ OTA 链路支撑两张表：device_command / ota_task
 """
 
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sqlalchemy import (
     JSON,
@@ -112,6 +112,11 @@ class DeviceAlert(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # 处置元数据（v1.21.0）：回答「谁、何时、为什么确认」。
+    # 历史已确认行没有这些信息，保持 NULL，不做臆测回填。
+    ack_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    acked_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    acked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DeviceCommand(Base):

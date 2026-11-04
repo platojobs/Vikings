@@ -1,4 +1,4 @@
-# 生产编排（v1.20.0）。与 infra/docker-compose.yml（本地开发）用途不同：
+# 生产编排（v1.21.0）。与 infra/docker-compose.yml（本地开发）用途不同：
 #   - 开发编排面向本机快速起依赖；本文件面向一台干净机器的完整对外服务。
 #   - 使用方式见 docs/deployment.md；推荐直接执行 scripts/prod_up.sh。
 #

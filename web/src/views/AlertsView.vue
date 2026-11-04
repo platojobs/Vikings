@@ -1,15 +1,18 @@
 <script setup lang="ts">
 /**
- * 告警中心：统计卡片 + 筛选列表 + 确认操作 + 阈值在线配置。
+ * 告警中心：统计卡片 + 筛选列表 + 单条/批量确认（含处置备注）+ 阈值在线配置。
  * 订阅 device/system/alert，新告警实时插入列表头部并弹通知。
+ * v1.21.0：批量确认复用 POST /api/alerts/bulk-ack，部分失败逐类展示；
+ * viewer 只读，多选与确认按钮禁用并给出说明。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElNotification } from 'element-plus'
-import { ackAlert, fetchAlerts, fetchAlertSummary } from '@/api/alerts'
+import { ackAlert, bulkAckAlerts, fetchAlerts, fetchAlertSummary } from '@/api/alerts'
 import { fetchThresholds, updateThresholds } from '@/api/rules'
 import { subscribe } from '@/services/mqtt'
 import { canOperate, isAdmin } from '@/utils/permissions'
 import { formatDateTime } from '@/utils/format'
+import { summarizeBulkAck, type BulkAckSummary } from '@/utils/alertSummary'
 import {
   alertLevelLabel,
   alertLevelTagType,
@@ -56,6 +59,31 @@ const pageSize = ref(20)
 const loading = ref(false)
 const ackingId = ref('')
 
+/** 多选状态：只允许选未处理告警，viewer 也能选但不允许提交 */
+const tableRef = ref<{ clearSelection: () => void } | null>(null)
+const selectedIds = ref<string[]>([])
+/** 批量确认结果常驻展示，部分失败必须让操作者看到 */
+const ackResult = ref<BulkAckSummary | null>(null)
+
+const ackDialog = reactive<{
+  visible: boolean
+  mode: 'single' | 'bulk'
+  note: string
+  loading: boolean
+}>({
+  visible: false,
+  mode: 'single',
+  note: '',
+  loading: false,
+})
+const singleTarget = ref<AlertItem | null>(null)
+
+const ackDialogTitle = computed(() =>
+  ackDialog.mode === 'bulk'
+    ? `批量确认 ${selectedIds.value.length} 条告警`
+    : '确认告警',
+)
+
 async function loadAlerts(): Promise<void> {
   loading.value = true
   try {
@@ -68,11 +96,26 @@ async function loadAlerts(): Promise<void> {
     })
     alerts.value = result.items
     total.value = result.total
+    clearSelection()
   } catch {
     // 错误提示已由 HTTP 层统一处理
   } finally {
     loading.value = false
   }
+}
+
+function handleSelectionChange(rows: AlertItem[]): void {
+  selectedIds.value = rows.map((row) => row.alert_id)
+}
+
+/** 已确认行不可再选，避免把「幂等跳过」混进本次待确认范围 */
+function selectableRow(row: AlertItem): boolean {
+  return row.status === 'open'
+}
+
+function clearSelection(): void {
+  selectedIds.value = []
+  tableRef.value?.clearSelection()
 }
 
 function handleSearch(): void {
@@ -93,17 +136,47 @@ function handleSizeChange(): void {
   loadAlerts()
 }
 
-async function handleAck(row: AlertItem): Promise<void> {
-  ackingId.value = row.alert_id
+function openSingleAck(row: AlertItem): void {
+  if (!canWrite.value) return
+  singleTarget.value = row
+  ackDialog.mode = 'single'
+  ackDialog.note = ''
+  ackDialog.visible = true
+}
+
+function openBulkAck(): void {
+  if (!canWrite.value || selectedIds.value.length === 0) return
+  ackDialog.mode = 'bulk'
+  ackDialog.note = ''
+  ackDialog.visible = true
+}
+
+/** 单条与批量共用同一个备注弹窗，语义与移动端保持一致 */
+async function confirmAck(): Promise<void> {
+  const note = ackDialog.note.trim()
+  ackDialog.loading = true
   try {
-    const updated = await ackAlert(row.alert_id)
-    const target = alerts.value.find((a) => a.alert_id === row.alert_id)
-    if (target) target.status = updated.status
-    ElMessage.success('告警已确认')
-    loadSummary()
+    if (ackDialog.mode === 'single') {
+      const target = singleTarget.value
+      if (!target) return
+      ackingId.value = target.alert_id
+      const updated = await ackAlert(target.alert_id, note)
+      Object.assign(target, updated)
+      ackDialog.visible = false
+      ElMessage.success(note ? '告警已确认，处置备注已记录' : '告警已确认')
+      loadSummary()
+    } else {
+      const ids = [...selectedIds.value]
+      const result = await bulkAckAlerts(ids, note)
+      ackResult.value = summarizeBulkAck(result)
+      ackDialog.visible = false
+      await loadAlerts()
+      loadSummary()
+    }
   } catch {
     // 错误提示已由 HTTP 层统一处理
   } finally {
+    ackDialog.loading = false
     ackingId.value = ''
   }
 }
@@ -329,7 +402,42 @@ onUnmounted(() => {
     </el-card>
 
     <el-card shadow="never" class="table-card">
-      <el-table v-loading="loading" :data="alerts" row-key="alert_id">
+      <el-alert
+        v-if="ackResult"
+        :type="ackResult.severity"
+        :title="ackResult.title"
+        :description="ackResult.detail"
+        show-icon
+        class="ack-result"
+        @close="ackResult = null"
+      />
+
+      <div class="batch-bar">
+        <span class="batch-count">已选择 {{ selectedIds.length }} 条未处理告警</span>
+        <el-button
+          type="primary"
+          size="small"
+          :disabled="!canWrite || selectedIds.length === 0"
+          @click="openBulkAck"
+        >
+          批量确认
+        </el-button>
+        <span v-if="!canWrite" class="readonly-hint">
+          当前为只读账号（viewer），可以查看但不能确认告警
+        </span>
+        <span v-else-if="selectedIds.length === 0" class="batch-tip">
+          勾选未处理告警后可批量确认
+        </span>
+      </div>
+
+      <el-table
+        ref="tableRef"
+        v-loading="loading"
+        :data="alerts"
+        row-key="alert_id"
+        @selection-change="handleSelectionChange"
+      >
+        <el-table-column type="selection" width="46" :selectable="selectableRow" />
         <el-table-column label="级别" width="90">
           <template #default="{ row }">
             <el-tag :type="alertLevelTagType(row.level)" effect="dark" size="small">
@@ -362,6 +470,19 @@ onUnmounted(() => {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="处置信息" min-width="200">
+          <template #default="{ row }">
+            <template v-if="row.status === 'acked'">
+              <div v-if="row.acked_by" class="ack-meta">
+                {{ row.acked_by }}
+                <span v-if="row.acked_at" class="ack-time">· {{ formatDateTime(row.acked_at) }}</span>
+              </div>
+              <div v-else class="acked-hint">历史确认（无处置记录）</div>
+              <div v-if="row.ack_note" class="ack-note">{{ row.ack_note }}</div>
+            </template>
+            <span v-else class="acked-hint">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="发生时间" min-width="170">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
@@ -372,11 +493,11 @@ onUnmounted(() => {
               link
               type="primary"
               :loading="ackingId === row.alert_id"
-              @click="handleAck(row)"
+              @click="openSingleAck(row)"
             >
               确认
             </el-button>
-            <span v-else class="acked-hint">—</span>
+            <span v-else class="acked-hint">{{ row.status === 'open' ? '只读' : '—' }}</span>
           </template>
         </el-table-column>
         <template #empty>
@@ -397,6 +518,35 @@ onUnmounted(() => {
         />
       </div>
     </el-card>
+
+    <el-dialog
+      v-model="ackDialog.visible"
+      :title="ackDialogTitle"
+      width="460px"
+      destroy-on-close
+    >
+      <div class="ack-dialog-body">
+        <p v-if="ackDialog.mode === 'bulk'" class="ack-dialog-text">
+          将确认选中的 {{ selectedIds.length }} 条未处理告警。部分告警可能已被他人确认或不存在，结果会按类别单独列出。
+        </p>
+        <p v-else class="ack-dialog-text">确认告警「{{ singleTarget?.message }}」。</p>
+        <el-input
+          v-model="ackDialog.note"
+          type="textarea"
+          :rows="3"
+          maxlength="500"
+          show-word-limit
+          placeholder="可选：填写处置说明，例如「已联系现场，重启设备后恢复」"
+        />
+        <div class="ack-dialog-hint">备注与操作人、确认时间一并保存，并写入审计摘要。</div>
+      </div>
+      <template #footer>
+        <el-button @click="ackDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="ackDialog.loading" @click="confirmAck">
+          确认
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-drawer
       v-model="thresholdDrawer"
@@ -554,5 +704,61 @@ onUnmounted(() => {
 .threshold-save {
   width: 100%;
   margin-top: 20px;
+}
+
+/* v1.21.0 批量确认与处置信息 */
+.ack-result {
+  margin-bottom: 12px;
+}
+
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.batch-count {
+  font-size: 13px;
+  color: #475569;
+}
+
+.batch-tip,
+.readonly-hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.readonly-hint {
+  color: #d97706;
+}
+
+.ack-meta {
+  font-size: 13px;
+  color: #334155;
+}
+
+.ack-time {
+  color: #94a3b8;
+}
+
+.ack-note {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #64748b;
+  word-break: break-word;
+}
+
+.ack-dialog-text {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.ack-dialog-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #94a3b8;
 }
 </style>

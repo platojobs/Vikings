@@ -1,4 +1,4 @@
-# 运维手册（v1.20.0）
+# 运维手册（v1.21.0）
 
 > 面向已按 [deployment.md](deployment.md) 完成部署的运维人员。
 > 所有命令均在仓库根目录执行，并使用生产编排文件。
@@ -201,7 +201,8 @@ v1.19.0 起，表结构只由 `gateway/alembic/versions/` 中的迁移文件管�
 - 生产编排的 `migrate` 一次性服务在 gateway 启动前执行 `alembic upgrade head`，
   失败时 gateway 不会启动；
 - 版本记录在 `alembic_version` 表，`0001_baseline` 对应 v1.18.0 及之前的结构，
-  `0002_lifecycle_indexes` 为 v1.19.0 的查询索引。
+  `0002_lifecycle_indexes` 为 v1.19.0 的查询索引，
+  `0003_alert_ack_metadata` 为 v1.21.0 的告警处置列（`ack_note` / `acked_by` / `acked_at`）。
 
 ### 4.1 升级前必做：备份
 
@@ -223,13 +224,21 @@ $COMPOSE up -d --build
 $COMPOSE logs migrate | tail -20
 $COMPOSE exec -T postgres sh -c \
   'psql -tAc "select version_num from alembic_version" -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-# 期望：0002_lifecycle_indexes（以仓库 head 为准）
+# 期望：0003_alert_ack_metadata（以仓库 head 为准）
 
 # 4) 健康检查
 curl -k https://<host>/api/health
 ```
 
 若只改代码不改结构，`migrate` 也会执行一次 `upgrade head`，已是 head 时为空操作。
+
+v1.21.0 的 `0003_alert_ack_metadata` 只新增三个可空列，不重建表、不修改既有行：
+
+- 存量 `open` 行天然为空；
+- v1.21.0 之前已确认的历史行无法得知真实操作人与时间，保持 NULL，
+  页面显示「历史确认（无处置记录）」，**不会用 `created_at` 冒充 `acked_at`**；
+- 回退一个版本（`alembic downgrade -1`）会删除这三列，处置备注随之丢失；
+  回退前请先备份（见 4.1）。
 
 ### 4.3 已有库（v1.18.0 及更早）
 

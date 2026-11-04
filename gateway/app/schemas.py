@@ -212,6 +212,17 @@ class DeviceDetailOut(DeviceOut):
     latest: Optional[SensorRecordOut] = None
 
 
+ACK_NOTE_MAX_LENGTH = 500
+
+
+def _normalize_ack_note(value: Optional[str]) -> Optional[str]:
+    """备注只保留有内容的文本：去首尾空白，全空视为未填写。"""
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
 class AlertOut(BaseModel):
     alert_id: str
     device_id: str
@@ -223,17 +234,39 @@ class AlertOut(BaseModel):
     ai_generated: bool
     status: str
     created_at: datetime
+    # v1.21.0 处置元数据；历史已确认行保持 None（无处置记录）
+    ack_note: Optional[str] = None
+    acked_by: Optional[str] = None
+    acked_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class AlertAckRequest(BaseModel):
+    """单条确认入参（v1.21.0）：备注可选，旧客户端不传 body 照常工作。"""
+
+    note: Optional[str] = Field(default=None, max_length=ACK_NOTE_MAX_LENGTH)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _clean_note(cls, value):
+        return _normalize_ack_note(value)
 
 
 class AlertBulkAckRequest(BaseModel):
     """批量确认入参：一次最多 100 条，重复 ID 在服务端去重。
 
     字段名沿用 REST 的 snake_case；移动端与 Web 后台都按此契约调用。
+    v1.21.0 增加可选 `note`，同一批 open 告警写入相同的处置备注。
     """
 
     alert_ids: List[str] = Field(min_length=1, max_length=100)
+    note: Optional[str] = Field(default=None, max_length=ACK_NOTE_MAX_LENGTH)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _clean_note(cls, value):
+        return _normalize_ack_note(value)
 
 
 class AlertBulkAckResult(BaseModel):

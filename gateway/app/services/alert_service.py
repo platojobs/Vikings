@@ -129,25 +129,42 @@ async def list_alerts(
     return rows, total
 
 
-async def ack_alert(session: AsyncSession, alert_id: str) -> Optional[DeviceAlert]:
+async def ack_alert(
+    session: AsyncSession,
+    alert_id: str,
+    operator: str = "system",
+    note: Optional[str] = None,
+) -> Optional[DeviceAlert]:
+    """确认单条告警，记录「谁、何时、为什么」。
+
+    已是 acked 的行保持幂等：不覆盖首次确认人/时间/备注，
+    避免重复点击或旧客户端重试改写处置证据。
+    """
     stmt = select(DeviceAlert).where(DeviceAlert.alert_id == alert_id)
     alert = (await session.execute(stmt)).scalars().first()
     if alert is None:
         return None
-    alert.status = "acked"
+    if alert.status != "acked":
+        alert.status = "acked"
+        alert.acked_by = operator
+        alert.acked_at = datetime.now(timezone.utc)
+        alert.ack_note = note
     await session.flush()
     return alert
 
 
 async def bulk_ack_alerts(
-    session: AsyncSession, alert_ids: List[str]
+    session: AsyncSession,
+    alert_ids: List[str],
+    operator: str = "system",
+    note: Optional[str] = None,
 ) -> Dict[str, object]:
     """批量确认告警，逐类返回结果，允许部分失败。
 
     语义：
     - 重复 ID 先去重，`requested` 为去重后的条数；
-    - open → acked 计入 `acked`；
-    - 已是 acked 计入 `already_acked`（幂等成功，不当作失败）；
+    - open → acked 计入 `acked`，同一批写入相同的确认人/时间/可选备注；
+    - 已是 acked 计入 `already_acked`（幂等成功，不当作失败，也不改写既有处置信息）；
     - 不存在的 ID 计入 `not_found`，不抛 404，避免一条脏 ID 让整批失败。
 
     调用方负责提交事务与审计；本函数只 flush，便于复用现有告警落库流程。
@@ -159,6 +176,7 @@ async def bulk_ack_alerts(
     stmt = select(DeviceAlert).where(DeviceAlert.alert_id.in_(unique_ids))
     rows = list((await session.execute(stmt)).scalars().all())
     by_id = {row.alert_id: row for row in rows}
+    acked_at = datetime.now(timezone.utc)
 
     acked: List[str] = []
     already_acked: List[str] = []
@@ -171,6 +189,9 @@ async def bulk_ack_alerts(
             already_acked.append(alert_id)
         else:
             row.status = "acked"
+            row.acked_by = operator
+            row.acked_at = acked_at
+            row.ack_note = note
             acked.append(alert_id)
 
     await session.flush()

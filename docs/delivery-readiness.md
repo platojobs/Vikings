@@ -1,11 +1,12 @@
-# 交付就绪审计（v1.15.1，状态更新至 v1.20.0）
+# 交付就绪审计（v1.15.1，状态更新至 v1.21.0）
 
 > 审计日期：2026-11-05
 > 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
 > 审计基线：`v1.15.0`（提交 `f77af2d`）
 > 状态更新：P0-2 于 v1.16.0 完成、P0-3 于 v1.17.0 完成、P0-1 于 v1.18.0 完成；
 > P1-2（数据生命周期 + 备份恢复）与 P1-3（迁移机制）于 v1.19.0 合并完成；
-> P1-1（可观测性）于 v1.20.0 完成。
+> P1-1（可观测性）于 v1.20.0 完成；
+> P1-4（Web 批量确认）、P2-2（处置备注）、P2-1（级别口径统一）于 v1.21.0 合并完成。
 > P0 阻断项已全部关闭。
 
 ## 总体结论
@@ -227,7 +228,7 @@
     `[baseline] 检测到既有 schema，跳过建表`，`alembic_version=0002_lifecycle_indexes`，
     设备数仍为 4，HTTPS 登录与查询正常；`down`/`up` 后数据仍在。
 
-### P1-4 Web 后台未复用批量确认，告警操作能力落后于移动端
+### P1-4 Web 后台未复用批量确认，告警操作能力落后于移动端 ✅ 已完成（v1.21.0）
 
 - **现状证据**
   - `web/src/api/alerts.ts:18-22` 只有单条 `ackAlert`，全文件无 `bulk-ack`。
@@ -237,6 +238,17 @@
 - **建议做法**：Web 告警页增加多选 + 批量确认，复用同一端点；错误按 `acked/already_acked/not_found` 分类提示。
 - **预估工作量**：0.5~1 人日（含路由守卫/组件测试）。
 - **依赖关系**：无；可直接复用既有接口。
+- **完成证据（v1.21.0）**
+  - `web/src/api/alerts.ts` 新增 `bulkAckAlerts()`，直接调用 `POST /api/alerts/bulk-ack`，
+    未新增任何端点；`ackAlert()` 同步支持可选备注。
+  - `web/src/views/AlertsView.vue`：未处理告警多选（`type="selection"`，已确认行不可选）、
+    批量确认按钮（viewer 禁用并展示「只读账号不可确认」说明）、备注弹窗；
+    结果以常驻 `el-alert` 按 `acked / already_acked / not_found` 逐类展示，部分失败不会被
+    「操作成功」掩盖。
+  - `web/src/utils/alertSummary.ts` + `web/src/api/alerts.spec.ts`：摘要拼装与请求体
+    单测（部分失败、全部不存在、全部已确认、空结果、ID 折叠）。
+  - 与移动端语义一致：同一端点、同一请求体、同一三类结果口径。
+  - E2E `alert_center_bulk_ack` 在真实链路上验证 acked/not_found 与备注、`acked_by`。
 
 ### P1-5 移动端无可发布产物：release 仍用 debug 签名，CI 无构建/制品/依赖扫描
 
@@ -284,19 +296,38 @@
 
 ## P2（体验与质量，不阻断交付）
 
-### P2-1 告警级别口径三端不一致
+### P2-1 告警级别口径三端不一致 ✅ 已完成（v1.21.0）
 
 - **现状证据**：规则引擎仅产出 `warning` / `critical`（`gateway/app/rules.py` 与 `docs/contracts.md` 的阈值表）；移动端告警中心暴露 info/notice/warning/critical 四个筛选（`device_app/lib/pages/alert_center_page.dart` 的 `_levelOptions`）；Web 告警页筛选仍为 warning/critical（`web/src/views/AlertsView.vue`）。
 - **缺口**：用户会问「info/notice 为什么永远为空」；两端筛选能力也不对齐。
 - **做法**：明确产品口径——要么规则引擎补充 info/notice 产出，要么移动端隐藏这两级（保留接口兼容）；文档写清楚。
 - **预估**：0.5 人日。**依赖**：无。
+- **最终选择（v1.21.0）：(b) 收窄对外级别为 `warning` / `critical`**
+  - 理由：`gateway/app/rules.py` 是确定性阈值引擎，只有「超阈值 → warning/critical」
+    一条分类路径；补 info/notice 需要新的业务语义（如恢复通知、趋势提示），
+    属于新功能而非口径收敛，且无产品需求。收窄可一次消除三端错位，风险最低。
+  - 落地：网关 `ALERT_LEVEL_PATTERN` 收窄为 `^(warning|critical)$`（`info`/`notice` 查询 422）；
+    移动端筛选只保留两级、未知级别回退灰显；Web 本就只有两级；契约文档同步最终枚举。
+  - 测试证据：`gateway/tests/test_http_regression.py` 断言 `level=info|notice` → 422；
+    `device_app/test/alert_center_widget_test.dart` 断言 info/notice 筛选片不存在。
 
-### P2-2 告警处置备注缺失
+### P2-2 告警处置备注缺失 ✅ 已完成（v1.21.0）
 
 - **现状证据**：`gateway/app/models.py:73-94` 的 `DeviceAlert` 无备注字段；`POST /api/alerts/{id}/ack` 只改状态；`web/src/api/alerts.ts` 与移动端批量确认均无备注入参。
 - **缺口**：确认后无法记录「谁、为什么、怎么处理」，审计只有动作没有处置内容。
 - **做法**：新增 `ack_note` / `acked_by` / `acked_at` 字段与可选入参，单条与批量都支持；列表展示处置人/备注。
 - **预估**：1~1.5 人日。**依赖**：P1-3 迁移机制。
+- **完成证据（v1.21.0）**
+  - 迁移 `gateway/alembic/versions/0003_alert_ack_metadata.py` 新增三列（均可空），
+    不重建表、不动既有行；空库 upgrade、v1.20 存量库 upgrade、downgrade/upgrade 往返
+    均在 `gateway/tests/test_migrations.py` 真实执行并通过。
+  - 历史已确认行不回填：无法得知真实操作人与时间，保持 `NULL`，页面显示
+    「历史确认（无处置记录）」；不以 `created_at` 冒充 `acked_at`。
+  - 单条与批量确认接受可选 `note`（≤500 字，空白归一到 `null`），写入
+    `acked_by` / `acked_at` / `ack_note`；重复确认（`already_acked`）不覆盖首次处置信息。
+  - 审计 `alert.ack` 增加 `note_summary`：经 v1.20 `redact_text` 脱敏后截断 100 字，
+    敏感口令/token 不会原样进入审计或日志。
+  - Web 与移动端均支持备注输入、展示确认人/时间/备注；旧客户端不传备注照常工作。
 
 ### P2-3 移动端规模化上限写死在页面
 
@@ -348,5 +379,6 @@
 - `v1.18.0`：P0-1 + P1-6（生产部署入口与运维/部署手册）✅ 已完成；
 - `v1.19.0`：P1-2 + P1-3（Alembic 迁移、数据生命周期、备份恢复）✅ 已完成；
 - `v1.20.0`：P1-1（结构化日志、请求 ID、分层健康检查、Prometheus 指标与告警规则）✅ 已完成；
-- 下一批：P1-4 Web 批量确认、P1-5 移动端发布工程、P1-7 剩余测试补强；
+- `v1.21.0`：P1-4 + P2-2 + P2-1（Web 批量确认、处置备注、级别口径统一）✅ 已完成；
+- 下一批：P1-5 移动端发布工程、P1-7 剩余测试补强；
 - P2 项穿插或单独小版本。

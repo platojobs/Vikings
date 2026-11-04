@@ -6,7 +6,7 @@
 
 架构目标：贴合真实中小 IoT 公司的生产架构，而不是"学生玩具项目"。
 
-> **生产部署（v1.20.0）**：一台干净机器执行 `./scripts/prod_up.sh`，
+> **生产部署（v1.21.0）**：一台干净机器执行 `./scripts/prod_up.sh`，
 > 即可构建并拉起 PostgreSQL + Mosquitto + 网关 + Web + HTTPS 反代（含健康检查、数据卷与网络隔离）；
 > 表结构由 Alembic 迁移自动升级，备份/恢复脚本见 `scripts/pg_backup.sh` / `scripts/pg_restore.sh`。
 > 完整步骤、端口、证书替换、升级备份与人工验收命令见 **[docs/deployment.md](docs/deployment.md)**；
@@ -802,3 +802,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.18.0` | P0-1 生产部署入口：gateway/web Dockerfile（多阶段、非 root、健康检查）、生产编排与网络隔离、nginx HTTPS 反代与安全头、生产 env 模板与一键脚本；本机真实起栈完成登录/MQTT 凭证/设备查询/模拟上报与持久化验收（[发布说明](docs/releases/v1.18.0.md)） |
 | `v1.19.0` | P1-2 + P1-3 数据层：Alembic baseline 与迁移机制（既有库自动标记、不重建）、告警/审计查询索引、records/告警/审计三套保留策略与手动清理、`pg_dump` 备份/恢复脚本与隔离库恢复演练；CI 增加空库迁移与真实 PostgreSQL 作业（[发布说明](docs/releases/v1.19.0.md)） |
 | `v1.20.0` | P1-1 可观测性：JSON 结构化日志与 `X-Request-Id` 全链路、`/api/health/ready` 分层就绪探针、Prometheus `/metrics`（请求/延迟/5xx、登录 429、MQTT 掉线与 DB 错误）、反代内网白名单与可直接加载的告警规则；真实停库/停 Broker 演练（[发布说明](docs/releases/v1.20.0.md)） |
+| `v1.21.0` | P1-4 + P2-2 + P2-1 告警闭环：Web 多选批量确认（复用 `bulk-ack`，部分失败逐类可见、viewer 只读）、`ack_note` / `acked_by` / `acked_at` 处置元数据（迁移 `0003`，单条与批量可选备注、审计脱敏摘要）、级别口径收窄为 `warning` / `critical`；E2E 验证备注与 `acked_by`（[发布说明](docs/releases/v1.21.0.md)） |

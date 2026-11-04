@@ -55,12 +55,10 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     with WidgetsBindingObserver {
   static const int _pageSize = 20;
   static const Duration _pollInterval = Duration(seconds: 15);
-  static const List<String> _levelOptions = <String>[
-    'info',
-    'notice',
-    'warning',
-    'critical',
-  ];
+
+  /// P2-1（v1.21.0）：规则引擎实际只产出 warning / critical，
+  /// 对外口径收窄为两级，不再展示永远为空的 info / notice。
+  static const List<String> _levelOptions = <String>['warning', 'critical'];
 
   late final AppStorage _storage;
   late final AlertApiClientFactory _createApiClient;
@@ -508,7 +506,9 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     }
     if (state == RealtimeState.connected) {
       _stopPolling();
-    } else if (state.requiresPollingFallback && _appVisible && _session != null) {
+    } else if (state.requiresPollingFallback &&
+        _appVisible &&
+        _session != null) {
       _startPolling();
     }
   }
@@ -594,25 +594,11 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     if (session == null || _selected.isEmpty || _acking || !_canWrite) {
       return;
     }
-    final confirmed = await showDialog<bool>(
+    final note = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('批量确认告警'),
-        content: Text('确认选中的 ${_selected.length} 条告警？确认后状态变为 acked。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            key: const ValueKey('bulk-ack-confirm'),
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('确认'),
-          ),
-        ],
-      ),
+      builder: (context) => _BulkAckDialog(count: _selected.length),
     );
-    if (confirmed != true) {
+    if (note == null) {
       return;
     }
     final ids = _selected.toList(growable: false);
@@ -625,6 +611,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       final result = await client.bulkAckAlerts(
         token: session.token,
         alertIds: ids,
+        note: note.isEmpty ? null : note,
       );
       if (!mounted) {
         return;
@@ -745,7 +732,9 @@ class _AlertCenterPageState extends State<AlertCenterPage>
             child: Row(
               children: [
                 _levelChip('全部级别', ''),
-                ..._levelOptions.map((level) => _levelChip(_levelLabel(level), level)),
+                ..._levelOptions.map(
+                  (level) => _levelChip(_levelLabel(level), level),
+                ),
               ],
             ),
           ),
@@ -769,7 +758,10 @@ class _AlertCenterPageState extends State<AlertCenterPage>
               decoration: const InputDecoration(
                 labelText: '设备筛选',
                 border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
               ),
               items: [
                 const DropdownMenuItem(value: '', child: Text('全部设备')),
@@ -813,8 +805,6 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   }
 
   String _levelLabel(String level) => switch (level) {
-    'info' => 'info 提示',
-    'notice' => 'notice 注意',
     'warning' => 'warning 警告',
     'critical' => 'critical 严重',
     _ => level,
@@ -844,7 +834,11 @@ class _AlertCenterPageState extends State<AlertCenterPage>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.notifications_off_outlined, size: 36, color: Colors.black38),
+              const Icon(
+                Icons.notifications_off_outlined,
+                size: 36,
+                color: Colors.black38,
+              ),
               const SizedBox(height: 8),
               Text(_status == 'open' ? '当前筛选下没有未处理告警' : '当前筛选下没有告警'),
               const SizedBox(height: 4),
@@ -901,7 +895,10 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                   Row(
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
                         decoration: BoxDecoration(
                           color: color.withValues(alpha: 0.12),
                           borderRadius: BorderRadius.circular(4),
@@ -917,14 +914,19 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                           deviceLabel,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
+                          ),
                         ),
                       ),
                       Text(
                         alert.status == 'open' ? '未处理' : '已确认',
                         style: TextStyle(
                           fontSize: 11,
-                          color: alert.status == 'open' ? Colors.orange : Colors.green,
+                          color: alert.status == 'open'
+                              ? Colors.orange
+                              : Colors.green,
                         ),
                       ),
                     ],
@@ -938,13 +940,42 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                   if (alert.message.isNotEmpty)
                     Text(
                       alert.message,
-                      style: const TextStyle(fontSize: 12, color: Colors.black54),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.black54,
+                      ),
                     ),
                   const SizedBox(height: 2),
                   Text(
                     _formatTime(alert.createdAt),
                     style: const TextStyle(fontSize: 11, color: Colors.black45),
                   ),
+                  if (alert.status == 'acked') ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      alert.ackedBy == null || alert.ackedBy!.isEmpty
+                          ? '历史确认（无处置记录）'
+                          : '确认人 ${alert.ackedBy}'
+                                '${alert.ackedAt == null ? '' : ' · ${_formatTime(alert.ackedAt)}'}',
+                      key: ValueKey('ack-meta-${alert.alertId}'),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.black54,
+                      ),
+                    ),
+                    if ((alert.ackNote ?? '').isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          '处置备注：${alert.ackNote}',
+                          key: ValueKey('ack-note-${alert.alertId}'),
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ),
+                  ],
                 ],
               ),
             ),
@@ -963,7 +994,11 @@ class _AlertCenterPageState extends State<AlertCenterPage>
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
               SizedBox(width: 8),
               Text('加载中…', style: TextStyle(fontSize: 12)),
             ],
@@ -1046,9 +1081,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   Color _levelColor(String level) => switch (level) {
     'critical' => Colors.red,
     'warning' => Colors.orange,
-    'notice' => Colors.blue,
-    'info' => Colors.grey,
-    _ => Colors.orange,
+    _ => Colors.grey,
   };
 
   String _formatNumber(double value) {
@@ -1066,5 +1099,67 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     String two(int value) => value.toString().padLeft(2, '0');
     return '${local.year}-${two(local.month)}-${two(local.day)} '
         '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
+  }
+}
+
+/// 批量确认弹窗：备注可选，确认返回 trim 后的文本，取消返回 null。
+/// 用 StatefulWidget 持有 TextEditingController，确保关闭动画结束前不提前 dispose。
+class _BulkAckDialog extends StatefulWidget {
+  const _BulkAckDialog({required this.count});
+
+  final int count;
+
+  @override
+  State<_BulkAckDialog> createState() => _BulkAckDialogState();
+}
+
+class _BulkAckDialogState extends State<_BulkAckDialog> {
+  final TextEditingController _noteController = TextEditingController();
+
+  @override
+  void dispose() {
+    _noteController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('批量确认告警'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('确认选中的 ${widget.count} 条告警？确认后状态变为 acked。'),
+            const SizedBox(height: 12),
+            TextField(
+              key: const ValueKey('bulk-ack-note'),
+              controller: _noteController,
+              maxLength: 500,
+              maxLines: 3,
+              minLines: 1,
+              decoration: const InputDecoration(
+                labelText: '处置备注（可选）',
+                hintText: '例如：已联系现场，重启设备后恢复',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          key: const ValueKey('bulk-ack-confirm'),
+          onPressed: () =>
+              Navigator.of(context).pop(_noteController.text.trim()),
+          child: const Text('确认'),
+        ),
+      ],
+    );
   }
 }

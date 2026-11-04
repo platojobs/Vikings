@@ -210,15 +210,21 @@ class ApiClient {
   ///
   /// 不采用 N 次单条请求，避免网络放大与部分提交不可见；
   /// 权限与单条确认一致，viewer 会被网关 403。
+  /// v1.21.0 增加可选 `note`（处置备注），与 Web 使用同一份请求体语义。
   Future<BulkAckResult> bulkAckAlerts({
     required String token,
     required List<String> alertIds,
+    String? note,
   }) async {
+    final text = note?.trim();
     final data = await _send(
       'POST',
       '/api/alerts/bulk-ack',
       token: token,
-      body: <String, dynamic>{'alert_ids': alertIds},
+      body: <String, dynamic>{
+        'alert_ids': alertIds,
+        if (text != null && text.isNotEmpty) 'note': text,
+      },
     );
     if (data is! Map<String, dynamic>) {
       throw const ApiException(ApiErrorKind.invalidResponse, '批量确认响应缺少 data');

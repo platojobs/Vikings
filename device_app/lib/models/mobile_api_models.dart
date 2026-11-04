@@ -30,6 +30,11 @@ double _asDouble(Object? value, [double fallback = 0]) {
 String _asString(Object? value, [String fallback = '']) =>
     value?.toString() ?? fallback;
 
+String? _asNullableString(Object? value) {
+  final text = value?.toString().trim();
+  return (text == null || text.isEmpty) ? null : text;
+}
+
 DateTime? _asTime(Object? value) =>
     value is String ? DateTime.tryParse(value) : null;
 
@@ -110,17 +115,18 @@ class DeviceSummary {
 
   bool get online => status == 'online';
 
-  DeviceSummary copyWith({int? openAlertCount, String? groupName}) => DeviceSummary(
-    deviceId: deviceId,
-    name: name,
-    model: model,
-    firmwareVersion: firmwareVersion,
-    groupName: groupName ?? this.groupName,
-    status: status,
-    lastReportAt: lastReportAt,
-    lastOnlineAt: lastOnlineAt,
-    openAlertCount: openAlertCount ?? this.openAlertCount,
-  );
+  DeviceSummary copyWith({int? openAlertCount, String? groupName}) =>
+      DeviceSummary(
+        deviceId: deviceId,
+        name: name,
+        model: model,
+        firmwareVersion: firmwareVersion,
+        groupName: groupName ?? this.groupName,
+        status: status,
+        lastReportAt: lastReportAt,
+        lastOnlineAt: lastOnlineAt,
+        openAlertCount: openAlertCount ?? this.openAlertCount,
+      );
 
   factory DeviceSummary.fromJson(Map<String, dynamic> json) => DeviceSummary(
     deviceId: _asString(json['device_id']),
@@ -155,7 +161,10 @@ class DevicePage {
     items: (json['items'] is List)
         ? (json['items'] as List)
               .whereType<Map>()
-              .map((item) => DeviceSummary.fromJson(Map<String, dynamic>.from(item)))
+              .map(
+                (item) =>
+                    DeviceSummary.fromJson(Map<String, dynamic>.from(item)),
+              )
               .toList(growable: false)
         : const <DeviceSummary>[],
     total: _asInt(json['total']),
@@ -182,7 +191,9 @@ class AlertPage {
     items: (json['items'] is List)
         ? (json['items'] as List)
               .whereType<Map>()
-              .map((item) => AlertItem.fromJson(Map<String, dynamic>.from(item)))
+              .map(
+                (item) => AlertItem.fromJson(Map<String, dynamic>.from(item)),
+              )
               .toList(growable: false)
         : const <AlertItem>[],
     total: _asInt(json['total']),
@@ -301,6 +312,9 @@ class AlertItem {
     required this.aiGenerated,
     required this.status,
     this.createdAt,
+    this.ackNote,
+    this.ackedBy,
+    this.ackedAt,
   });
 
   final String alertId;
@@ -318,6 +332,15 @@ class AlertItem {
   final String status;
   final DateTime? createdAt;
 
+  /// 处置备注（v1.21.0，可选）
+  final String? ackNote;
+
+  /// 确认人；v1.21.0 之前的历史确认行为 null
+  final String? ackedBy;
+
+  /// 确认时间；历史确认行为 null
+  final DateTime? ackedAt;
+
   bool get critical => level == 'critical';
 
   factory AlertItem.fromJson(Map<String, dynamic> json) => AlertItem(
@@ -331,6 +354,9 @@ class AlertItem {
     aiGenerated: json['ai_generated'] == true,
     status: _asString(json['status'], 'open'),
     createdAt: _asTime(json['created_at']),
+    ackNote: _asNullableString(json['ack_note']),
+    ackedBy: _asNullableString(json['acked_by']),
+    ackedAt: _asTime(json['acked_at']),
   );
 }
 

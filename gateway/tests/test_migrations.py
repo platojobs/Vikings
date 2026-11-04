@@ -19,12 +19,14 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
+HEAD = "0003_alert_ack_metadata"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
     "idx_alert_status_device",
     "idx_audit_operator_created",
 }
+ACK_COLUMNS = {"ack_note", "acked_by", "acked_at"}
 
 
 def _run_alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess:
@@ -60,8 +62,13 @@ def _table_names(db_path: Path) -> set[str]:
         }
 
 
+def _alert_columns(db_path: Path) -> set[str]:
+    with sqlite3.connect(db_path) as con:
+        return {row[1] for row in con.execute("PRAGMA table_info(device_alert)")}
+
+
 def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
-    """模拟 v1.18 及之前的库：表已存在，但缺少 v1.19 新增索引，也没有 alembic_version。"""
+    """模拟 v1.20 库：表已存在，但缺少 v1.21 的三个处置列、v1.19 索引，也没有 alembic_version。"""
 
     async def build() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
@@ -74,10 +81,19 @@ def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
     with sqlite3.connect(db_path) as con:
         for name in NEW_INDEXES:
             con.execute(f"DROP INDEX {name}")
+        # create_all 会带上最新模型列；删掉它们才等价于 v1.20 生产库
+        for name in ACK_COLUMNS:
+            con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
         if seed_device:
             con.execute(
                 "INSERT INTO device (device_id, name, model, firmware_version, group_name, status) "
                 "VALUES ('dev-legacy', '存量设备', 'VG-S100', '1.0.0', '默认分组', 'online')"
+            )
+            con.execute(
+                "INSERT INTO device_alert "
+                "(alert_id, device_id, level, metric, value, threshold, message, ai_generated, status, created_at) "
+                "VALUES ('alt-legacy-acked', 'dev-legacy', 'critical', 'voltage', 2.9, 3.2, "
+                "'历史告警', 0, 'acked', '2026-11-04 08:00:00')"
             )
         con.commit()
 
@@ -98,7 +114,8 @@ def test_upgrade_on_empty_database(tmp_path):
         "app_user",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
-    assert _alembic_version(db_path) == "0002_lifecycle_indexes"
+    assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert _alembic_version(db_path) == HEAD
 
 
 def test_existing_database_is_stamped_and_data_preserved(tmp_path):
@@ -112,9 +129,16 @@ def test_existing_database_is_stamped_and_data_preserved(tmp_path):
 
     with sqlite3.connect(db_path) as con:
         rows = con.execute("select device_id, status from device").fetchall()
+        alert_rows = con.execute(
+            "select alert_id, status, acked_by, acked_at, ack_note from device_alert"
+        ).fetchall()
     assert rows == [("dev-legacy", "online")], "迁移不得清空或重建存量数据"
+    assert alert_rows == [("alt-legacy-acked", "acked", None, None, None)], (
+        "历史已确认行必须保留 acked 状态，且不臆测回填处置人/时间/备注"
+    )
     assert NEW_INDEXES <= _index_names(db_path)
-    assert _alembic_version(db_path) == "0002_lifecycle_indexes"
+    assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert _alembic_version(db_path) == HEAD
 
 
 def test_explicit_stamp_baseline_then_upgrade(tmp_path):
@@ -129,7 +153,8 @@ def test_explicit_stamp_baseline_then_upgrade(tmp_path):
     upgrade = _run_alembic(db_path, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
     assert NEW_INDEXES <= _index_names(db_path)
-    assert _alembic_version(db_path) == "0002_lifecycle_indexes"
+    assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert _alembic_version(db_path) == HEAD
 
 
 def test_downgrade_one_step_then_upgrade(tmp_path):
@@ -138,12 +163,13 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
 
     down = _run_alembic(db_path, "downgrade", "-1")
     assert down.returncode == 0, down.stderr
-    assert _alembic_version(db_path) == "0001_baseline"
-    assert not (NEW_INDEXES & _index_names(db_path)), "downgrade 必须移除新增索引"
+    assert _alembic_version(db_path) == "0002_lifecycle_indexes"
+    assert not (ACK_COLUMNS & _alert_columns(db_path)), "downgrade 必须移除处置列"
 
     up = _run_alembic(db_path, "upgrade", "head")
     assert up.returncode == 0, up.stderr
-    assert NEW_INDEXES <= _index_names(db_path)
+    assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert _alembic_version(db_path) == HEAD
 
 
 def test_upgrade_to_head_inside_running_loop(tmp_path):
@@ -153,8 +179,9 @@ def test_upgrade_to_head_inside_running_loop(tmp_path):
     async def scenario() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
         await upgrade_to_head(engine)
-        assert await current_revision(engine) == "0002_lifecycle_indexes"
+        assert await current_revision(engine) == HEAD
         await engine.dispose()
 
     asyncio.run(scenario())
     assert NEW_INDEXES <= _index_names(db_path)
+    assert ACK_COLUMNS <= _alert_columns(db_path)

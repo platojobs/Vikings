@@ -38,6 +38,9 @@ AlertItem _alert(
   String deviceId = 'dev-0001',
   double value = 80,
   String metric = 'temperature',
+  String? ackNote,
+  String? ackedBy,
+  DateTime? ackedAt,
 }) => AlertItem(
   alertId: id,
   deviceId: deviceId,
@@ -49,6 +52,9 @@ AlertItem _alert(
   aiGenerated: false,
   status: status,
   createdAt: DateTime.utc(2026, 11, 4, 8),
+  ackNote: ackNote,
+  ackedBy: ackedBy,
+  ackedAt: ackedAt,
 );
 
 /// 内存版安全存储，测试不触碰 Keychain / Keystore。
@@ -76,7 +82,9 @@ class _FakeApiClient extends ApiClient {
     this.bulkError,
     List<DeviceSummary>? devices,
   }) : alerts = List<AlertItem>.of(alerts ?? const <AlertItem>[]),
-       devices = List<DeviceSummary>.of(devices ?? const <DeviceSummary>[_deviceA]),
+       devices = List<DeviceSummary>.of(
+         devices ?? const <DeviceSummary>[_deviceA],
+       ),
        super(baseUrl: 'http://192.168.1.8:8000');
 
   final List<AlertItem> alerts;
@@ -91,6 +99,7 @@ class _FakeApiClient extends ApiClient {
   String? lastStatus;
   String? lastDeviceId;
   List<String> lastBulkIds = const <String>[];
+  String? lastBulkNote;
 
   @override
   Future<AlertPage> fetchAlerts({
@@ -120,8 +129,16 @@ class _FakeApiClient extends ApiClient {
     final start = (page - 1) * pageSize;
     final items = start >= total
         ? const <AlertItem>[]
-        : filtered.sublist(start, start + pageSize > total ? total : start + pageSize);
-    return AlertPage(items: items, total: total, page: page, pageSize: pageSize);
+        : filtered.sublist(
+            start,
+            start + pageSize > total ? total : start + pageSize,
+          );
+    return AlertPage(
+      items: items,
+      total: total,
+      page: page,
+      pageSize: pageSize,
+    );
   }
 
   @override
@@ -139,9 +156,11 @@ class _FakeApiClient extends ApiClient {
   Future<BulkAckResult> bulkAckAlerts({
     required String token,
     required List<String> alertIds,
+    String? note,
   }) async {
     bulkCalls += 1;
     lastBulkIds = List<String>.of(alertIds);
+    lastBulkNote = note;
     final error = bulkError;
     if (error != null) {
       throw error;
@@ -169,6 +188,9 @@ class _FakeApiClient extends ApiClient {
           aiGenerated: row.aiGenerated,
           status: 'acked',
           createdAt: row.createdAt,
+          ackNote: note,
+          ackedBy: 'admin',
+          ackedAt: DateTime.utc(2026, 11, 5, 4, 15),
         );
       }
     }
@@ -217,12 +239,8 @@ class _FakeApiClient extends ApiClient {
     required String token,
     int page = 1,
     int pageSize = 20,
-  }) async => const AlertPage(
-    items: <AlertItem>[],
-    total: 0,
-    page: 1,
-    pageSize: 20,
-  );
+  }) async =>
+      const AlertPage(items: <AlertItem>[], total: 0, page: 1, pageSize: 20);
 
   @override
   void close() {}
@@ -335,7 +353,11 @@ void main() {
     final api = _FakeApiClient(
       alerts: List<AlertItem>.generate(
         25,
-        (index) => _alert('alt-${index.toString().padLeft(2, '0')}', 'warning', 'open'),
+        (index) => _alert(
+          'alt-${index.toString().padLeft(2, '0')}',
+          'warning',
+          'open',
+        ),
       ),
     );
     await _pumpAlertCenter(tester, api: api);
@@ -403,8 +425,90 @@ void main() {
     expect(find.textContaining('已确认 2 条告警'), findsOneWidget);
   });
 
+  testWidgets('批量确认备注：请求携带备注，确认后展示操作人/时间/备注', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[_alert('alt-n1', 'warning', 'open')],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('select-alt-n1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-button')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const ValueKey('bulk-ack-note')),
+      '已联系现场，重启设备后恢复',
+    );
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(api.lastBulkNote, '已联系现场，重启设备后恢复');
+
+    // 切到已确认视图，处置信息应完整展示（与 Web 列语义一致）
+    await tester.tap(_statusChip('acked'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('ack-meta-alt-n1')), findsOneWidget);
+    expect(find.textContaining('确认人 admin'), findsOneWidget);
+    expect(find.byKey(const ValueKey('ack-note-alt-n1')), findsOneWidget);
+    expect(find.textContaining('已联系现场，重启设备后恢复'), findsOneWidget);
+  });
+
+  testWidgets('历史已确认行：无处置元数据时显示可读说明', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[
+        _alert('alt-hist', 'critical', 'acked', metric: 'voltage'),
+      ],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.tap(_statusChip('acked'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('ack-meta-alt-hist')), findsOneWidget);
+    expect(find.text('历史确认（无处置记录）'), findsOneWidget);
+    expect(find.byKey(const ValueKey('ack-note-alt-hist')), findsNothing);
+  });
+
+  testWidgets('级别口径：只呈现规则引擎真实产出的 warning / critical', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[_alert('alt-l1', 'warning', 'open')],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    expect(_levelChip('warning'), findsOneWidget);
+    expect(_levelChip('critical'), findsOneWidget);
+    expect(_levelChip('info'), findsNothing);
+    expect(_levelChip('notice'), findsNothing);
+  });
+
+  test('AlertItem.fromJson 解析处置元数据', () {
+    final alert = AlertItem.fromJson(<String, dynamic>{
+      'alert_id': 'alt-json',
+      'device_id': 'dev-0001',
+      'level': 'critical',
+      'metric': 'voltage',
+      'value': 2.9,
+      'threshold': 3.2,
+      'message': '电压过低',
+      'ai_generated': false,
+      'status': 'acked',
+      'created_at': '2026-11-04T08:00:00Z',
+      'ack_note': '  已校准探头  ',
+      'acked_by': 'operator1',
+      'acked_at': '2026-11-05T02:30:00Z',
+    });
+    expect(alert.ackNote, '已校准探头');
+    expect(alert.ackedBy, 'operator1');
+    expect(alert.ackedAt, isNotNull);
+  });
+
   testWidgets('viewer 只读：可勾选但批量确认按钮禁用并说明原因', (tester) async {
-    final api = _FakeApiClient(alerts: <AlertItem>[_alert('alt-v', 'warning', 'open')]);
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[_alert('alt-v', 'warning', 'open')],
+    );
     await _pumpAlertCenter(tester, api: api, session: _viewerSession);
     await tester.pumpAndSettle();
 
@@ -424,7 +528,11 @@ void main() {
   testWidgets('服务端 403：提示并禁用本轮写操作，不崩溃', (tester) async {
     final api = _FakeApiClient(
       alerts: <AlertItem>[_alert('alt-403', 'warning', 'open')],
-      bulkError: const ApiException(ApiErrorKind.forbidden, '当前账号无权访问该数据', statusCode: 403),
+      bulkError: const ApiException(
+        ApiErrorKind.forbidden,
+        '当前账号无权访问该数据',
+        statusCode: 403,
+      ),
     );
     await _pumpAlertCenter(tester, api: api);
     await tester.pumpAndSettle();
@@ -492,7 +600,9 @@ void main() {
     expect(find.text('设备模拟'), findsOneWidget);
     realtime.emit(AlertEvent(_alert('alt-badge', 'critical', 'open')));
     await tester.pumpAndSettle();
-    final badge = tester.widget<Badge>(find.byKey(const ValueKey('alert-tab-badge')));
+    final badge = tester.widget<Badge>(
+      find.byKey(const ValueKey('alert-tab-badge')),
+    );
     expect(badge.isLabelVisible, isTrue);
     expect((badge.label as Text?)?.data, '1');
 

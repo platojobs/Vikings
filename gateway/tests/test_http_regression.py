@@ -8,12 +8,13 @@ import asyncio
 from datetime import datetime, timezone
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import models  # noqa: F401  注册 ORM 元数据
 from app.database import Base, get_session
 from app.main import app
-from app.models import Device, DeviceAlert
+from app.models import AuditLog, Device, DeviceAlert
 from app.security import ROLE_OPERATOR, ROLE_VIEWER, create_access_token
 
 
@@ -144,6 +145,12 @@ def test_alert_list_http_filters_and_pagination(tmp_path):
         # 非法 level 仍应被参数校验拒绝（避免脏查询拖垮数据库）
         bad = await client.get("/api/alerts", params={"level": "unknown"}, headers=headers)
         assert bad.status_code == 422
+        # P2-1：对外级别收窄为规则引擎真实产出的 warning / critical
+        for legacy in ("info", "notice"):
+            legacy_resp = await client.get(
+                "/api/alerts", params={"level": legacy}, headers=headers
+            )
+            assert legacy_resp.status_code == 422
 
     _run(tmp_path, scenario)
 
@@ -156,7 +163,8 @@ def test_bulk_ack_http_partial_failure_and_permissions(tmp_path):
         await _seed_alert(factory, "alt-open", status="open")
         await _seed_alert(factory, "alt-acked", status="acked")
 
-        payload = {"alert_ids": ["alt-open", "alt-acked", "alt-missing"]}
+        note = "现场已检查，湿度探头需要校准"
+        payload = {"alert_ids": ["alt-open", "alt-acked", "alt-missing"], "note": note}
         resp = await client.post(
             "/api/alerts/bulk-ack",
             json=payload,
@@ -173,6 +181,32 @@ def test_bulk_ack_http_partial_failure_and_permissions(tmp_path):
             "/api/alerts", params={"status": "open"}, headers=_headers(ROLE_VIEWER, "viewer1")
         )
         assert open_resp.json()["data"]["total"] == 0
+
+        # 处置元数据：本次确认写入操作人/时间/备注；历史 acked 行不被覆盖
+        acked_resp = await client.get(
+            "/api/alerts", params={"status": "acked"}, headers=_headers(ROLE_VIEWER, "viewer1")
+        )
+        rows = {row["alert_id"]: row for row in acked_resp.json()["data"]["items"]}
+        assert rows["alt-open"]["acked_by"] == "operator1"
+        assert rows["alt-open"]["acked_at"] is not None
+        assert rows["alt-open"]["ack_note"] == note
+        assert rows["alt-acked"]["acked_by"] is None
+        assert rows["alt-acked"]["ack_note"] is None
+
+        # 旧客户端/重试不带 note：照常工作，且不覆盖首次处置信息
+        retry = await client.post(
+            "/api/alerts/bulk-ack",
+            json={"alert_ids": ["alt-open"]},
+            headers=_headers(ROLE_OPERATOR, "operator2"),
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["data"]["already_acked"] == ["alt-open"]
+        after = await client.get(
+            "/api/alerts", params={"status": "acked"}, headers=_headers(ROLE_VIEWER, "viewer1")
+        )
+        row = next(r for r in after.json()["data"]["items"] if r["alert_id"] == "alt-open")
+        assert row["acked_by"] == "operator1"
+        assert row["ack_note"] == note
 
         forbidden = await client.post(
             "/api/alerts/bulk-ack",
@@ -192,5 +226,76 @@ def test_bulk_ack_http_partial_failure_and_permissions(tmp_path):
             headers=_headers(ROLE_OPERATOR, "operator1"),
         )
         assert empty.status_code == 422
+
+        # 备注长度上限 500，超限在参数层拒绝
+        too_long = await client.post(
+            "/api/alerts/bulk-ack",
+            json={"alert_ids": ["alt-open"], "note": "x" * 501},
+            headers=_headers(ROLE_OPERATOR, "operator1"),
+        )
+        assert too_long.status_code == 422
+
+    _run(tmp_path, scenario)
+
+
+def test_single_ack_http_note_and_legacy_body(tmp_path):
+    """单条确认：带备注写入处置信息；不传 body 的旧客户端照常工作。"""
+
+    async def scenario(client, factory, _mqtt):
+        await _seed_device(factory)
+        await _seed_alert(factory, "alt-single", status="open")
+        headers = _headers(ROLE_OPERATOR, "operator1")
+
+        # 备注本身可能夹带敏感信息：业务记录保留原文，审计摘要必须脱敏
+        raw_note = "已远程重启设备，Authorization: Bearer e2e-secret-token-123"
+        resp = await client.post(
+            "/api/alerts/alt-single/ack",
+            json={"note": raw_note},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert data["status"] == "acked"
+        assert data["acked_by"] == "operator1"
+        assert data["acked_at"] is not None
+        assert data["ack_note"] == raw_note
+
+        async with factory() as session:
+            entry = (
+                await session.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == "alert.ack")
+                    .order_by(AuditLog.id.desc())
+                )
+            ).scalars().first()
+        assert entry is not None
+        assert entry.operator == "operator1"
+        summary = entry.detail.get("note_summary") or ""
+        assert "e2e-secret-token-123" not in summary, "审计摘要泄漏了 Bearer token"
+        assert "[REDACTED]" in summary
+
+        # 旧客户端不传 body：仍 200，且首次处置信息不被覆盖
+        await _seed_alert(factory, "alt-legacy", status="open")
+        legacy = await client.post("/api/alerts/alt-legacy/ack", headers=headers)
+        assert legacy.status_code == 200, legacy.text
+        legacy_data = legacy.json()["data"]
+        assert legacy_data["status"] == "acked"
+        assert legacy_data["acked_by"] == "operator1"
+        assert legacy_data["ack_note"] is None
+
+        # 空白备注归一到 None，不产生空字符串
+        await _seed_alert(factory, "alt-blank", status="open")
+        blank = await client.post(
+            "/api/alerts/alt-blank/ack", json={"note": "   "}, headers=headers
+        )
+        assert blank.status_code == 200
+        assert blank.json()["data"]["ack_note"] is None
+
+        missing = await client.post(
+            "/api/alerts/alt-missing/ack",
+            json={"note": "不存在"},
+            headers=headers,
+        )
+        assert missing.status_code == 404
 
     _run(tmp_path, scenario)

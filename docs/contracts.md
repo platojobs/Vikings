@@ -345,22 +345,50 @@ v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(info/notice/warning/critical)、`status`(open/acked)、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
-| POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增），见 3.3.1 |
-| POST | `/api/alerts/{alertId}/ack` | 单条告警确认（语义不变） |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
+| POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增，v1.21.0 支持备注），见 3.3.1 |
+| POST | `/api/alerts/{alertId}/ack` | 单条告警确认（v1.21.0 支持备注），见 3.3.2 |
 | GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today}` |
 
-#### 3.3.1 批量确认 `POST /api/alerts/bulk-ack`（v1.15.0）
+**级别口径（P2-1 / v1.21.0）**：规则引擎按阈值真实产出的级别只有 `warning` 与
+`critical` 两级；对外枚举同步收敛，`level` 传 `info` / `notice` 一律 422。
+Web 与移动端不再展示永远为空的级别，历史数据也不存在这两级（规则从未产出）。
+
+**处置元数据（P2-2 / v1.21.0）**：`AlertOut` 新增三个可选字段，回答「谁、何时、为什么确认」：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `acked_by` | string \| null | 确认人（网关登录用户名）；历史确认行为 `null` |
+| `acked_at` | ISO8601 \| null | 确认时间（UTC）；历史确认行为 `null` |
+| `ack_note` | string \| null | 处置备注（≤500 字，首尾空白已去除）；未填写为 `null` |
+
+v1.21.0 之前已确认的历史行**不做臆测回填**：无法得知真实操作人与时间，
+页面显示「历史确认（无处置记录）」。重复确认（`already_acked`）不覆盖首次
+`acked_by` / `acked_at` / `ack_note`，保证处置证据稳定。
+
+#### 3.3.1 批量确认 `POST /api/alerts/bulk-ack`（v1.15.0；v1.21.0 增备注）
 
 | 项 | 契约 |
 | --- | --- |
 | 权限 | `operator` / `admin`；`viewer` 403，未登录 401（与单条确认一致） |
-| 入参 | `{"alert_ids": ["alt-..."]}`，去重前 1~100 条；空列表或超限 422 |
+| 入参 | `{"alert_ids": ["alt-..."], "note": "可选备注"}`，`alert_ids` 去重前 1~100 条；`note` 可省略、≤500 字；空列表/超限/备注超长 422 |
 | 出参 | `data: {acked: [], already_acked: [], not_found: [], requested: N}`；`requested` 为去重后条数 |
 | 部分失败 | 不整批回滚、不返回 404：open → acked 计入 `acked`；已是 acked 幂等计入 `already_acked`；不存在的 ID 计入 `not_found`，调用方逐类展示 |
 | 全失败 | 全部 ID 不存在时仍返回 200，`acked` 为空、`not_found` 为全部去重后的 ID |
-| 事务与审计 | 单事务提交；写一条 `alert.ack` 审计，`detail` 记录 `bulk` / 请求数与三类计数 |
-| 兼容 | 单条 `POST /api/alerts/{alertId}/ack` 保持原有 200/404 语义；批量端点纯新增，旧客户端不受影响 |
+| 处置写入 | 本批 open → acked 的行写同一份 `acked_by` / `acked_at` / `ack_note`；已 acked 行保持不变 |
+| 事务与审计 | 单事务提交；写一条 `alert.ack` 审计，`detail` 记录 `bulk` / 请求数与三类计数，`note_summary` 为脱敏后前 100 字（不带原始敏感内容） |
+| 兼容 | 旧客户端不传 `note` 照常工作；批量端点纯新增，旧客户端不受影响 |
+
+#### 3.3.2 单条确认 `POST /api/alerts/{alertId}/ack`（v1.15.0；v1.21.0 增备注）
+
+| 项 | 契约 |
+| --- | --- |
+| 权限 | `operator` / `admin`；`viewer` 403，未登录 401 |
+| 入参 | 可选 body `{"note": "..."}`（≤500 字）；**不传 body 的旧客户端照常工作** |
+| 出参 | `data: AlertOut`，`status=acked` 且带 `acked_by` / `acked_at` / `ack_note` |
+| 幂等 | 已 acked 的行再次确认返回 200，保留首次处置信息（不覆盖） |
+| 错误 | 告警不存在 404；备注超长 422 |
+| 审计 | 写 `alert.ack`，`detail` 含 `deviceId` / `level` / `metric` / `note_summary`（脱敏摘要） |
 
 ### 3.4 阈值在线配置
 
@@ -475,7 +503,8 @@ v1.8.0 起看板增量数据改走 MQTT over WebSocket（默认 `ws://<网关主
 | 操作 | 接口 | 入参 | 返回 | 角色 |
 | --- | --- | --- | --- | --- |
 | 指令下发 | `POST /api/devices/{deviceId}/commands` | `{type, payload}`；type ∈ `calibrate` / `ota` / `reboot` / `config` | `data: CommandOut`（`cmd_id` / `state` / `progress` / `message`） | operator / admin |
-| 告警确认 | `POST /api/alerts/{alertId}/ack` | 无 body | `data: AlertOut`（`status=acked`） | operator / admin |
+| 告警确认 | `POST /api/alerts/{alertId}/ack` | 可选 `{note}`（≤500 字） | `data: AlertOut`（`status=acked`，含 `acked_by` / `acked_at` / `ack_note`） | operator / admin |
+| 批量确认 | `POST /api/alerts/bulk-ack` | `{alert_ids, note?}` | `data: BulkAckResult`，逐类展示部分失败 | operator / admin |
 
 - 网关只校验 `type` 枚举与设备 / 告警是否存在，`payload` 的键值由客户端先行校验：
   calibrate `{temperatureOffset, humidityOffset}`、config `{reportIntervalSec, sleepSec}`、
@@ -552,16 +581,16 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | --- | --- |
 | 列表 | `GET /api/alerts?deviceId&level&status&page&pageSize`，三组筛选可组合；切换筛选重置 `page=1`；`total` 为过滤后全量 |
 | 分页 | `pageSize=20`，滚动到页脚请求 `page+1` 并追加；加载中 / `page * pageSize >= total`（没有更多）/ 首页空态三态可读 |
-| 每行 | 设备（名称优先，取 `GET /api/devices?pageSize=200` 的本地映射，缺失时回落 `device_id`）、`metric`、`value`、`threshold`、`level`、`created_at`、`status` |
-| 批量确认 | 仅 open 行可勾选；`POST /api/alerts/bulk-ack` 一次提交，成功后按 `acked` 移除行、`total` 与未读角标同步减少；`already_acked` / `not_found` 在页面提示，不当作成功数量 |
+| 每行 | 设备（名称优先，取 `GET /api/devices?pageSize=200` 的本地映射，缺失时回落 `device_id`）、`metric`、`value`、`threshold`、`level`（warning/critical）、`created_at`、`status`；已确认行展示 `acked_by` / `acked_at` / `ack_note`，历史行显示「历史确认（无处置记录）」 |
+| 批量确认 | 仅 open 行可勾选；`POST /api/alerts/bulk-ack` 一次提交（可选 `note` ≤500 字），成功后按 `acked` 移除行、`total` 与未读角标同步减少；`already_acked` / `not_found` 在页面提示，不当作成功数量 |
 | 实时 | `device/system/alert`（报文见 2.5）按 `alertId` 去重；满足当前 level/status/device 筛选时插入列表顶部，否则只累加角标；实时断开时 15 秒轮询第 1 页 + `summary` 补齐 |
 | 角标口径 | 本地未读计数：初始 = `GET /api/alerts/summary.open`；实时新增 +1；进入告警中心清零；页面不可见时的轮询以服务端 `open` 总数取大值补齐，页面可见时保持清零口径 |
 | 权限 | 与 3.10.2 一致：viewer 可勾选但批量确认按钮禁用并提示；operator/admin 可提交；403 提示后禁用本轮写操作；401 清会话回登录页 |
-| 兼容 | `GET /api/alerts` 不传新参数时行为不变；级别校验从 warning/critical 放宽到 info/notice/warning/critical 仅为允许更多取值，不改变既有数据筛选结果 |
+| 兼容 | `GET /api/alerts` 不传新参数时行为不变；v1.21.0 起级别收窄为 warning/critical，`info`/`notice` 返回 422（规则引擎从未产出这两级，无历史行受影响） |
 
 回归覆盖：`gateway/tests/test_alert_service.py`（筛选 / 分页 / 批量部分失败 / 全失败）、
-`gateway/tests/test_http_regression.py`（批量确认 HTTP 权限与部分失败、PATCH 设备在 MQTT 不可用时仍 200）、
-`device_app/test/alert_center_widget_test.dart`（筛选切换、分页、空态、批量成功、viewer 禁用、403、实时入顶与角标清零）、
+`gateway/tests/test_http_regression.py`（批量确认 HTTP 权限与部分失败、备注与处置元数据、级别收窄 422、PATCH 设备在 MQTT 不可用时仍 200）、
+`device_app/test/alert_center_widget_test.dart`（筛选切换、分页、空态、批量成功、备注输入与处置信息展示、viewer 禁用、403、实时入顶与角标清零）、
 `scripts/e2e/e2e_acceptance.py` 的 `alert_center_bulk_ack`（真实 Broker 产生告警 → REST 筛选可见 → 批量确认后 open 不再返回）。
 
 ---
@@ -613,6 +642,9 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | ai_generated | boolean | 是否由 LLM 生成 |
 | status | varchar(16) | open / acked |
 | created_at | timestamptz | 触发时间 |
+| ack_note | text NULL | 处置备注（v1.21.0，≤500 字由 API 校验） |
+| acked_by | varchar(64) NULL | 确认人；v1.21.0 之前的历史确认行为 NULL |
+| acked_at | timestamptz NULL | 确认时间；历史确认行为 NULL |
 
 ### 4.4 支撑表（OTA / 指令链路必需）
 

@@ -117,6 +117,70 @@ def test_bulk_ack_partial_failure_is_visible(tmp_path):
     _run(tmp_path, scenario)
 
 
+def test_bulk_ack_records_disposition_metadata(tmp_path):
+    """批量确认写入 acked_by / acked_at / ack_note，且已确认行不被改写。"""
+
+    async def scenario(session):
+        _add_alert(session, "alt-open-1", status="open", minutes=1)
+        _add_alert(session, "alt-open-2", status="open", minutes=2)
+        _add_alert(session, "alt-old-acked", status="acked", minutes=3)
+        await session.flush()
+
+        result = await alert_service.bulk_ack_alerts(
+            session,
+            ["alt-open-1", "alt-open-2", "alt-old-acked"],
+            operator="alice",
+            note="已联系现场，湿度传感器校准中",
+        )
+        assert result["acked"] == ["alt-open-1", "alt-open-2"]
+        assert result["already_acked"] == ["alt-old-acked"]
+
+        rows, _ = await alert_service.list_alerts(session, None, None, "acked", 1, 20)
+        by_id = {row.alert_id: row for row in rows}
+        for alert_id in ("alt-open-1", "alt-open-2"):
+            assert by_id[alert_id].acked_by == "alice"
+            assert by_id[alert_id].acked_at is not None
+            assert by_id[alert_id].ack_note == "已联系现场，湿度传感器校准中"
+        # 历史已确认行保持 NULL，不被本次批量备注覆盖
+        assert by_id["alt-old-acked"].acked_by is None
+        assert by_id["alt-old-acked"].acked_at is None
+        assert by_id["alt-old-acked"].ack_note is None
+
+    _run(tmp_path, scenario)
+
+
+def test_ack_alert_note_and_idempotent(tmp_path):
+    """单条确认记录操作人与备注；重复确认不覆盖首次证据。"""
+
+    async def scenario(session):
+        _add_alert(session, "alt-single", status="open", minutes=1)
+        await session.flush()
+
+        alert = await alert_service.ack_alert(
+            session, "alt-single", operator="bob", note="重启设备后恢复"
+        )
+        assert alert is not None
+        assert alert.status == "acked"
+        assert alert.acked_by == "bob"
+        assert alert.acked_at is not None
+        assert alert.ack_note == "重启设备后恢复"
+
+        # 旧客户端/重复点击：不带备注再次确认，元数据保持第一次的结果
+        again = await alert_service.ack_alert(session, "alt-single", operator="carol")
+        assert again is not None
+        assert again.acked_by == "bob"
+        assert again.ack_note == "重启设备后恢复"
+
+    _run(tmp_path, scenario)
+
+
+def test_ack_alert_missing_returns_none(tmp_path):
+    async def scenario(session):
+        assert await alert_service.ack_alert(session, "alt-missing") is None
+
+    _run(tmp_path, scenario)
+
+
 def test_bulk_ack_all_failure_returns_200_semantics(tmp_path):
     """全部失败（都不存在）时不抛异常，逐条返回 not_found。"""
 

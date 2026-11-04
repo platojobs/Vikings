@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="IoT 业务网关",
     description="设备消息消费、时序入库、AI 异常诊断、指令下发与后台查询接口",
-    version="1.20.0",
+    version="1.21.0",
     lifespan=lifespan,
 )
 

@@ -100,7 +100,7 @@ grep '<requestId>' logs/gateway.log
   "message": "not ready",
   "data": {
     "status": "not_ready",
-    "version": "1.20.0",
+    "version": "1.21.0",
     "uptimeSeconds": 123,
     "components": {
       "database": {"ok": false, "backend": "postgresql", "latencyMs": 24.5, "error": "TimeoutError: ..."},

@@ -156,9 +156,13 @@ export interface DeviceRecordsQuery {
 
 // ==================== 告警 ====================
 
+/**
+ * 级别口径（P2-1 / v1.21.0）：规则引擎按阈值真实产出 warning / critical，
+ * 对外枚举同步只保留这两级，页面不再展示空级别。
+ */
 export type AlertLevel = 'warning' | 'critical'
 
-/** 告警（REST snake_case） */
+/** 告警（REST snake_case）；v1.21.0 起带处置元数据 */
 export interface AlertItem {
   alert_id: string
   device_id: string
@@ -170,6 +174,20 @@ export interface AlertItem {
   ai_generated: boolean
   status: string
   created_at: string
+  /** 处置备注；旧数据/未填写为 null */
+  ack_note?: string | null
+  /** 确认人用户名；v1.21.0 之前的历史确认行为 null */
+  acked_by?: string | null
+  /** 确认时间（ISO8601）；历史确认行为 null */
+  acked_at?: string | null
+}
+
+/** 批量确认结果：三类 ID 逐类返回，部分失败对调用方可见 */
+export interface BulkAckResult {
+  acked: string[]
+  already_acked: string[]
+  not_found: string[]
+  requested: number
 }
 
 /** 告警展示模型：把 REST / MQTT 两种来源统一成组件可用的结构 */
