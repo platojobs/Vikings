@@ -568,7 +568,7 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | 作业 | 运行环境 | 内容 | 正常耗时 |
 | --- | --- | --- | --- |
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
-| `web` | ubuntu-latest | `npm ci` + `npm run build` | 约 1~2 分钟 |
+| `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
 | `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（21 项） | 约 2~3 分钟 |
 
@@ -584,11 +584,44 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | 设备端单测 | `cd device_app && flutter test` | 实时报文解析与断线重连、token 迁移与安全存储、指令参数校验、REST 结果分类 |
 | 设备端 Widget 测试 | `cd device_app && flutter test test/mobile_board_widget_test.dart` | 登录进入看板、指令下发二次确认 / 取消 / 回执、告警确认移除、viewer 与 403 禁用、实时降级轮询、401 回登录 |
 | 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约 |
+| Web 单元测试 | `cd web && npm run test` | 路由守卫：未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底 |
 | Web | `cd web && npm run build` | 生产构建回归 |
 
 Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / 实时服务 / 存储，
 不发起真实网络请求，也不依赖真实 Keychain / Keystore 或设备索引；每个用例至少断言一个
 用户可见结果（登录页、列表项、按钮禁用状态或状态条文案）。
+
+### 13.3 Web 单元测试
+
+- **技术栈**：`vitest` + `jsdom`，复用生产 `vite.config.ts`（`mergeConfig`），
+  因此 Vue SFC、`@` 别名与 Element Plus 按需引入的解析规则与构建完全一致；
+  配置见 [web/vitest.config.ts](web/vitest.config.ts)，Node 26 实验性 `localStorage`
+  的兼容补丁见 [web/test/setup.ts](web/test/setup.ts)。
+- **如何跑**：
+
+```bash
+cd web
+npm run test        # vitest run，CI 与本地同一命令
+```
+
+- **覆盖范围**：直接实例化生产 router（`createAppRouter`，测试注入 memory history），
+  不复制守卫逻辑，断言的是导航后的真实 `currentRoute`：
+
+| 用例 | 断言 |
+| --- | --- |
+| 未登录访问受保护路由 | 落到 `/login`，`redirect` 保留完整 `fullPath`（含查询参数） |
+| 未登录访问根路径 | 落到 `/login`，`redirect=/dashboard` |
+| 已登录访问 `/login` | 回到 `/dashboard` |
+| admin 访问 `/system` | 允许进入，停留在 `/system` |
+| viewer 访问 `/system` | 被拒并回到 `/dashboard` |
+| operator 访问 `/users` | 被拒并回到 `/dashboard` |
+| 已登录访问未知路径 | 落到兜底路由 `/dashboard` |
+
+- **与 CI 的关系**：CI `web` 作业在 `npm ci` 后先跑 `npm run test`，再执行
+  `vue-tsc --noEmit && vite build`；单测失败会直接以用例名（如
+  `viewer 访问 /system → 被拒并回到 /dashboard`）标红，无需翻构建产物。
+  用例不发起网络请求，不依赖网关或 Broker，可在干净环境独立运行。
+
 
 ---
 
@@ -619,3 +652,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.11.0` | 移动看板切换服务端分页与筛选，拆掉首屏 100 台与告警 pageSize=50 上限；网关 `/api/devices` 新增可选 `hasAlert` / `withAlertCount`（按设备聚合未处理告警数），`/api/records/latest` 新增可选 `deviceIds`；汇总卡改用服务端统计，实时与分页协同（[发布说明](docs/releases/v1.11.0.md)） |
 | `v1.12.0` | 移动看板新增分组切换与分组筛选（与搜索、状态、有告警、服务端分页组合生效，切组重置第 1 页）；空分组统一归入「未分组」，网关分组概览同步归并（[发布说明](docs/releases/v1.12.0.md)） |
 | `v1.13.0` | 移动看板设备详情「历史上报」分页（`limit+offset`，首屏一页、加载更早、三态文案、实时插入保持滚动位置）；网关 records 新增可选 `offset`（不传行为不变）；Web 路由全部懒加载 + `manualChunks` 拆分，入口主包 693.24 kB → 312.04 kB 且无体积告警（[发布说明](docs/releases/v1.13.0.md)） |
+| `v1.13.1` | Web 测试基建：vitest + jsdom 复用生产 Vite 配置，7 条路由守卫用例（未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底）接入 CI `web` 作业（[发布说明](docs/releases/v1.13.1.md)） |

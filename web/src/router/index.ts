@@ -1,4 +1,11 @@
-import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import {
+  createRouter,
+  createWebHistory,
+  type RouteLocationNormalized,
+  type RouteLocationRaw,
+  type RouteRecordRaw,
+  type RouterHistory,
+} from 'vue-router'
 import { getToken } from '@/utils/auth'
 import { currentRole } from '@/utils/permissions'
 
@@ -62,13 +69,8 @@ const routes: RouteRecordRaw[] = [
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
-const router = createRouter({
-  history: createWebHistory(),
-  routes,
-})
-
 /** 未登录统一重定向到登录页，并记录回跳地址 */
-router.beforeEach((to) => {
+export function authGuard(to: RouteLocationNormalized): true | RouteLocationRaw {
   const token = getToken()
   if (!to.meta.public && !token) {
     return { path: '/login', query: { redirect: to.fullPath } }
@@ -81,6 +83,15 @@ router.beforeEach((to) => {
     return { path: '/dashboard' }
   }
   return true
-})
+}
+
+/** 构造 router：生产用浏览器 history，单元测试注入 memory history 隔离状态 */
+export function createAppRouter(history: RouterHistory = createWebHistory()) {
+  const router = createRouter({ history, routes })
+  router.beforeEach(authGuard)
+  return router
+}
+
+const router = createAppRouter()
 
 export default router

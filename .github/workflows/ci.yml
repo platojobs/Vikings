@@ -28,7 +28,7 @@ jobs:
         run: pytest -q
 
   web:
-    name: Vue 后台（类型检查 + 构建）
+    name: Vue 后台（单元测试 + 类型检查 + 构建）
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -42,6 +42,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: 安装依赖
         run: npm ci
+      - name: 单元测试（路由守卫）
+        run: npm run test
       - name: 类型检查 + 构建
         run: npm run build
 
