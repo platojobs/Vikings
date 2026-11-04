@@ -1,0 +1,214 @@
+/// 移动看板使用的 REST 视图模型。
+///
+/// 字段名与 `docs/contracts.md` 的 snake_case REST 出参一一对应；
+/// MQTT 报文模型仍留在 [SensorPayload] 系列，两类协议不混用。
+library;
+
+int _asInt(Object? value, [int fallback = 0]) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? num.tryParse(value)?.toInt() ?? fallback;
+  }
+  return fallback;
+}
+
+double _asDouble(Object? value, [double fallback = 0]) {
+  if (value is num) {
+    return value.toDouble();
+  }
+  if (value is String) {
+    return double.tryParse(value) ?? fallback;
+  }
+  return fallback;
+}
+
+String _asString(Object? value, [String fallback = '']) =>
+    value?.toString() ?? fallback;
+
+DateTime? _asTime(Object? value) =>
+    value is String ? DateTime.tryParse(value) : null;
+
+/// 登录成功后的会话，token 持久化在本地。
+class AuthSession {
+  const AuthSession({
+    required this.token,
+    required this.username,
+    required this.role,
+  });
+
+  final String token;
+  final String username;
+  final String role;
+
+  bool get canIssueCommand => role == 'admin' || role == 'operator';
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'token': token,
+    'username': username,
+    'role': role,
+  };
+
+  factory AuthSession.fromJson(Map<String, dynamic> json) => AuthSession(
+    token: _asString(json['token']),
+    username: _asString(json['username']),
+    role: _asString(json['role'], 'viewer'),
+  );
+}
+
+/// `GET /api/devices` 的设备条目。
+class DeviceSummary {
+  const DeviceSummary({
+    required this.deviceId,
+    required this.name,
+    required this.model,
+    required this.firmwareVersion,
+    required this.groupName,
+    required this.status,
+    this.lastReportAt,
+    this.lastOnlineAt,
+  });
+
+  final String deviceId;
+  final String name;
+  final String model;
+  final String firmwareVersion;
+  final String groupName;
+
+  /// online / offline，由网关根据上报与离线巡检维护。
+  final String status;
+  final DateTime? lastReportAt;
+  final DateTime? lastOnlineAt;
+
+  bool get online => status == 'online';
+
+  factory DeviceSummary.fromJson(Map<String, dynamic> json) => DeviceSummary(
+    deviceId: _asString(json['device_id']),
+    name: _asString(json['name']),
+    model: _asString(json['model']),
+    firmwareVersion: _asString(json['firmware_version']),
+    groupName: _asString(json['group_name'], '默认分组'),
+    status: _asString(json['status'], 'offline'),
+    lastReportAt: _asTime(json['last_report_at']),
+    lastOnlineAt: _asTime(json['last_online_at']),
+  );
+}
+
+/// `GET /api/records/latest` 的每设备最新一条上报。
+class SensorReading {
+  const SensorReading({
+    required this.deviceId,
+    required this.temperature,
+    required this.humidity,
+    required this.voltage,
+    required this.rssi,
+    required this.battery,
+    required this.seq,
+    required this.ts,
+  });
+
+  final String deviceId;
+  final double temperature;
+  final double humidity;
+  final double voltage;
+  final int rssi;
+  final int battery;
+  final int seq;
+  final DateTime? ts;
+
+  factory SensorReading.fromJson(Map<String, dynamic> json) => SensorReading(
+    deviceId: _asString(json['device_id']),
+    temperature: _asDouble(json['temperature']),
+    humidity: _asDouble(json['humidity']),
+    voltage: _asDouble(json['voltage']),
+    rssi: _asInt(json['rssi']),
+    battery: _asInt(json['battery']),
+    seq: _asInt(json['seq']),
+    ts: _asTime(json['ts']),
+  );
+}
+
+/// `GET /api/alerts` 的告警条目。
+class AlertItem {
+  const AlertItem({
+    required this.alertId,
+    required this.deviceId,
+    required this.level,
+    required this.metric,
+    required this.value,
+    required this.threshold,
+    required this.message,
+    required this.aiGenerated,
+    required this.status,
+    this.createdAt,
+  });
+
+  final String alertId;
+  final String deviceId;
+
+  /// warning / critical
+  final String level;
+  final String metric;
+  final double value;
+  final double threshold;
+  final String message;
+  final bool aiGenerated;
+
+  /// open / acked
+  final String status;
+  final DateTime? createdAt;
+
+  bool get critical => level == 'critical';
+
+  factory AlertItem.fromJson(Map<String, dynamic> json) => AlertItem(
+    alertId: _asString(json['alert_id']),
+    deviceId: _asString(json['device_id']),
+    level: _asString(json['level'], 'warning'),
+    metric: _asString(json['metric']),
+    value: _asDouble(json['value']),
+    threshold: _asDouble(json['threshold']),
+    message: _asString(json['message']),
+    aiGenerated: json['ai_generated'] == true,
+    status: _asString(json['status'], 'open'),
+    createdAt: _asTime(json['created_at']),
+  );
+}
+
+/// `GET /api/devices/{id}/commands` 的指令回执。
+class CommandItem {
+  const CommandItem({
+    required this.cmdId,
+    required this.type,
+    required this.state,
+    required this.progress,
+    this.message,
+    required this.operator,
+    this.createdAt,
+  });
+
+  final String cmdId;
+
+  /// calibrate / reboot / config / ota
+  final String type;
+
+  /// received / progress / success / failed
+  final String state;
+  final int progress;
+  final String? message;
+  final String operator;
+  final DateTime? createdAt;
+
+  factory CommandItem.fromJson(Map<String, dynamic> json) => CommandItem(
+    cmdId: _asString(json['cmd_id']),
+    type: _asString(json['type']),
+    state: _asString(json['state']),
+    progress: _asInt(json['progress']),
+    message: json['message']?.toString(),
+    operator: _asString(json['operator']),
+    createdAt: _asTime(json['created_at']),
+  );
+}

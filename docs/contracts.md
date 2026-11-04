@@ -226,6 +226,23 @@ fire-and-forget，不阻塞告警主链路。
 账号变更全部写入审计日志（`user.create` / `user.update` / `user.delete`），
 审计 detail 只记录变更项，不落口令明文。
 
+### 3.10 移动看板复用的只读接口（v1.7.0，无新增契约）
+
+device_app 的只读看板不新增、不修改任何网关端点，仅消费以下既有接口：
+
+| 用途 | 接口 | 参数 / 说明 |
+| --- | --- | --- |
+| 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, user}` |
+| 设备列表 | `GET /api/devices` | `page=1&pageSize=100`，`data.items` 为设备数组 |
+| 每设备最新值 | `GET /api/records/latest` | 返回全部设备各自最新一条 |
+| 单设备历史上报 | `GET /api/devices/{id}/records` | 看板固定 `limit=10` |
+| 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=50` |
+| 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
+
+统一鉴权头 `Authorization: Bearer <token>`；token 由登录接口下发，与 Web 后台一致。
+看板对 `401` 的处理：清除本地 token 并回到登录页；`403` 提示无权访问；
+超时与网络错误展示可读文案。看板为只读，不调用任何写接口。
+
 ---
 
 ## 4. 数据库表结构
