@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# 同一分支/PR 的新推送取消旧运行，节省 runner 与排查噪音；
+# 标签构建（ref_type=tag）不参与取消：每个发布标签各自成组且 cancel-in-progress=false。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   gateway:
     name: Python 网关（lint + 测试）
@@ -42,7 +48,17 @@ jobs:
           alembic upgrade head
           alembic check
       - name: 单元测试
-        run: pytest -q
+        run: |
+          set -o pipefail
+          pytest -q 2>&1 | tee pytest.log
+      - name: 失败时上传测试日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateway-test-log-${{ github.run_id }}
+          path: gateway/pytest.log
+          if-no-files-found: warn
+          retention-days: 7
 
   postgres:
     name: PostgreSQL 迁移、生命周期与核心用例
@@ -139,8 +155,24 @@ jobs:
           flutter-version: "3.47.9"
           channel: stable
       - run: flutter pub get
-      - run: flutter analyze
-      - run: flutter test
+      - name: 静态分析
+        run: |
+          set -o pipefail
+          flutter analyze 2>&1 | tee flutter-analyze.log
+      - name: 单元测试
+        run: |
+          set -o pipefail
+          flutter test 2>&1 | tee flutter-test.log
+      - name: 失败时上传 Flutter 日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: flutter-test-logs-${{ github.run_id }}
+          path: |
+            device_app/flutter-analyze.log
+            device_app/flutter-test.log
+          if-no-files-found: warn
+          retention-days: 7
 
   device_app_release:
     name: Flutter 设备端（发布构建 + 制品）
@@ -375,6 +407,14 @@ jobs:
             echo "===== $log"
             tail -80 "$log"
           done
+      - name: 失败时上传 E2E 日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          path: .run/e2e/*.log
+          if-no-files-found: warn
+          retention-days: 7
       - name: 兜底清理
         if: always()
         run: |
