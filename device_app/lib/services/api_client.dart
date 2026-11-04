@@ -150,6 +150,65 @@ class ApiClient {
     return AlertPage.fromJson(data);
   }
 
+  /// 告警中心使用的分页查询：level / status / deviceId 均可组合。
+  ///
+  /// 与 [fetchOpenAlerts] 并存：后者保持看板既有调用语义不变，
+  /// 本方法只用于新页面，空参数时不带任何筛选，行为等同网关默认查询。
+  Future<AlertPage> fetchAlerts({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+    String? deviceId,
+    String? level,
+    String? status,
+  }) async {
+    final data = await _send(
+      'GET',
+      '/api/alerts',
+      token: token,
+      query: <String, String>{
+        'page': '$page',
+        'pageSize': '$pageSize',
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+        if (level != null && level.isNotEmpty) 'level': level,
+        if (status != null && status.isNotEmpty) 'status': status,
+      },
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '告警响应缺少 data');
+    }
+    return AlertPage.fromJson(data);
+  }
+
+  /// 告警汇总：用于告警中心角标与打开告警总数兜底。
+  Future<AlertSummary> fetchAlertSummary({required String token}) async {
+    final data = await _send('GET', '/api/alerts/summary', token: token);
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '告警汇总响应缺少 data');
+    }
+    return AlertSummary.fromJson(data);
+  }
+
+  /// 批量确认：一次请求提交多条，服务端逐类返回部分失败。
+  ///
+  /// 不采用 N 次单条请求，避免网络放大与部分提交不可见；
+  /// 权限与单条确认一致，viewer 会被网关 403。
+  Future<BulkAckResult> bulkAckAlerts({
+    required String token,
+    required List<String> alertIds,
+  }) async {
+    final data = await _send(
+      'POST',
+      '/api/alerts/bulk-ack',
+      token: token,
+      body: <String, dynamic>{'alert_ids': alertIds},
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '批量确认响应缺少 data');
+    }
+    return BulkAckResult.fromJson(data);
+  }
+
   /// 看板汇总卡的服务端全量统计（设备总数 / 在线数 / 未处理告警数）。
   Future<StatsOverview> fetchStatsOverview({required String token}) async {
     final data = await _send('GET', '/api/stats/overview', token: token);

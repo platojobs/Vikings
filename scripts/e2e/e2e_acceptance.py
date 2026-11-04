@@ -633,6 +633,124 @@ def ack_alert(ctx: Context) -> str:
     return f"告警 {ctx.alert_id} 已 acked，open 列表不再返回，acked 列表可查"
 
 
+def verify_alert_center_bulk_ack(ctx: Context) -> str:
+    """告警中心验收：真实上报产生新告警 → REST 筛选可见 → 批量确认后 open 不再返回。
+
+    用湿度 99（critical 阈值 97）触发一条与既有电压告警不同 metric 的新告警，
+    避免命中规则引擎的同设备同指标抑制窗口。批量确认故意混入一个不存在的 ID，
+    验证部分失败在真实链路上同样逐类可见。
+    """
+    assert ctx.collector is not None
+    seq = 8888
+    publisher = mqtt.Client(
+        callback_api_version=CallbackAPIVersion.VERSION2,
+        client_id=f"e2e-alert-{uuid.uuid4().hex[:6]}",
+        transport="tcp",
+        protocol=mqtt.MQTTv311,
+    )
+    publisher.connect(MQTT_HOST, MQTT_PORT, keepalive=15)
+    publisher.loop_start()
+    try:
+        publisher.publish(
+            f"device/{ctx.device_id}/sensor/report",
+            json.dumps(
+                {
+                    "deviceId": ctx.device_id,
+                    "temperature": 24.0,
+                    "humidity": 99.0,
+                    "voltage": 3.75,
+                    "rssi": -60,
+                    "battery": 80,
+                    "seq": seq,
+                    "ts": int(time.time() * 1000),
+                }
+            ),
+            qos=1,
+        ).wait_for_publish(timeout=5)
+    finally:
+        publisher.loop_stop()
+        publisher.disconnect()
+
+    item = ctx.collector.wait_message(
+        lambda m: m["topic"] == "device/system/alert"
+        and m["payload"].get("deviceId") == ctx.device_id
+        and m["payload"].get("metric") == "humidity",
+        15,
+        "告警中心可用的新告警",
+    )
+    new_alert_id = item["payload"].get("alertId")
+    if not new_alert_id:
+        raise RuntimeError(f"湿度告警缺少 alertId：{item['payload']}")
+
+    # 告警中心列表：deviceId + level + status + 分页参数，等待入库后可见
+    deadline = time.monotonic() + 10
+    visible: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        page = api(
+            ctx,
+            "GET",
+            "/api/alerts",
+            params={
+                "deviceId": ctx.device_id,
+                "level": "critical",
+                "status": "open",
+                "page": 1,
+                "pageSize": 5,
+            },
+        )
+        rows = page.get("items") or []
+        visible = next((row for row in rows if row.get("alert_id") == new_alert_id), None)
+        if visible is not None:
+            break
+        time.sleep(0.3)
+    if visible is None:
+        raise RuntimeError(f"告警中心筛选未返回新告警 {new_alert_id}")
+    if int(page.get("total", 0)) < 1:
+        raise RuntimeError(f"告警中心筛选 total 异常：{page}")
+
+    missing_id = f"alt-e2e-missing-{uuid.uuid4().hex[:6]}"
+    result = api(
+        ctx,
+        "POST",
+        "/api/alerts/bulk-ack",
+        json={"alert_ids": [new_alert_id, missing_id]},
+    )
+    if result.get("acked") != [new_alert_id]:
+        raise RuntimeError(f"批量确认 acked 不符合预期：{result}")
+    if result.get("not_found") != [missing_id]:
+        raise RuntimeError(f"批量确认未把不存在 ID 暴露为 not_found：{result}")
+    if result.get("requested") != 2:
+        raise RuntimeError(f"批量确认 requested 不符合预期：{result}")
+
+    open_data = api(
+        ctx,
+        "GET",
+        "/api/alerts",
+        params={"deviceId": ctx.device_id, "status": "open", "pageSize": 50},
+    )
+    open_ids = [row["alert_id"] for row in open_data.get("items") or []]
+    if new_alert_id in open_ids:
+        raise RuntimeError("批量确认后告警仍出现在 open 列表")
+    acked_data = api(
+        ctx,
+        "GET",
+        "/api/alerts",
+        params={
+            "deviceId": ctx.device_id,
+            "level": "critical",
+            "status": "acked",
+            "pageSize": 50,
+        },
+    )
+    acked_ids = [row["alert_id"] for row in acked_data.get("items") or []]
+    if new_alert_id not in acked_ids:
+        raise RuntimeError("批量确认后告警未出现在 acked 列表")
+    return (
+        f"新告警 {new_alert_id}（humidity）经筛选可见；批量确认 acked=1、"
+        f"not_found=1（部分失败可见）；open 不再返回，acked 可查"
+    )
+
+
 def verify_group_change(ctx: Context) -> str:
     """改分组 → WS 收到 device/system/group → 设备详情与分组概览口径一致。"""
     assert ctx.collector is not None
@@ -884,6 +1002,7 @@ def main() -> int:
         rep.run("command_dispatch", lambda: dispatch_command(ctx))
         rep.run("command_ack", lambda: verify_command_ack(ctx))
         rep.run("alert_ack", lambda: ack_alert(ctx))
+        rep.run("alert_center_bulk_ack", lambda: verify_alert_center_bulk_ack(ctx))
         rep.run("group_change", lambda: verify_group_change(ctx))
         rep.run("stop_simulator", lambda: stop_simulator(ctx))
         rep.run("degrade_disconnect", lambda: degrade_disconnect(ctx))

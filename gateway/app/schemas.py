@@ -199,6 +199,30 @@ class AlertOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AlertBulkAckRequest(BaseModel):
+    """批量确认入参：一次最多 100 条，重复 ID 在服务端去重。
+
+    字段名沿用 REST 的 snake_case；移动端与 Web 后台都按此契约调用。
+    """
+
+    alert_ids: List[str] = Field(min_length=1, max_length=100)
+
+
+class AlertBulkAckResult(BaseModel):
+    """批量确认结果：逐类返回，部分失败对调用方可见。
+
+    - acked：本次由 open 变为 acked 的告警；
+    - already_acked：此前已确认，幂等跳过（不算失败）；
+    - not_found：ID 不存在；
+    - requested：去重后的请求条数。
+    """
+
+    acked: List[str]
+    already_acked: List[str]
+    not_found: List[str]
+    requested: int
+
+
 class CommandCreateRequest(BaseModel):
     type: str = Field(pattern="^(calibrate|ota|reboot|config)$")
     payload: Dict[str, Any] = Field(default_factory=dict)

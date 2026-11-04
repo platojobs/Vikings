@@ -62,7 +62,7 @@ python scripts/e2e/e2e_acceptance.py
 > 但 `degrade_disconnect` 会 FAIL 并提示「Broker 由外部托管」——这是有意的保护，
 > 验收前请先停掉外部 Broker，让脚本自起。
 
-## 4. 覆盖项（21 项）
+## 4. 覆盖项（23 项）
 
 | 步骤 | 验证内容 |
 | --- | --- |
@@ -70,7 +70,7 @@ python scripts/e2e/e2e_acceptance.py
 | `broker` | 启动或复用 1883 + 9001 WebSocket Broker |
 | `gateway` | 启动或复用网关，临时 SQLite，不碰生产库 |
 | `auth_login` | admin 登录，角色校验 |
-| `ws_connected` | paho 以 `transport=websockets` 连接 9001 并订阅四个 Topic |
+| `ws_connected` | paho 以 `transport=websockets` 连接 9001 并订阅固定 Topic 列表 |
 | `simulator` | 启动模拟设备（`voltage=2.90` 触发 critical） |
 | `realtime_report` | WS 收到上报，端到端延迟 < 3000ms |
 | `rest_device` | REST 设备列表与 `/api/records/latest` 可读，状态 online |
@@ -80,6 +80,8 @@ python scripts/e2e/e2e_acceptance.py
 | `command_dispatch` | REST `POST /commands` 下发 config，返回 `cmd_id` |
 | `command_ack` | WS 收到设备 ack success，REST 指令历史同步 success |
 | `alert_ack` | REST 确认告警，状态 acked，open 不再返回、acked 可查 |
+| `alert_center_bulk_ack` | 上报产生新告警 → REST 按 deviceId/level/status 筛选可见 → 批量确认（含不存在 ID）→ open 不再返回、acked 可查 |
+| `group_change` | REST 改分组 → WS 收到 `device/system/group` → REST 详情与分组概览一致 |
 | `stop_simulator` | 停止模拟器 |
 | `degrade_disconnect` | 停 Broker，WS 客户端触发 `on_disconnect`（轮询降级前提） |
 | `degrade_polling_rest` | Broker 停机期间 REST 仍可用（看板可切轮询） |

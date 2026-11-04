@@ -314,6 +314,64 @@ class AlertItem {
   );
 }
 
+/// `GET /api/alerts/summary`：告警中心角标与概览使用。
+class AlertSummary {
+  const AlertSummary({
+    required this.open,
+    required this.criticalOpen,
+    required this.today,
+  });
+
+  final int open;
+  final int criticalOpen;
+  final int today;
+
+  static const AlertSummary empty = AlertSummary(
+    open: 0,
+    criticalOpen: 0,
+    today: 0,
+  );
+
+  factory AlertSummary.fromJson(Map<String, dynamic> json) => AlertSummary(
+    open: _asInt(json['open']),
+    criticalOpen: _asInt(json['critical_open']),
+    today: _asInt(json['today']),
+  );
+}
+
+/// `POST /api/alerts/bulk-ack`：逐类返回，部分失败对调用方可见。
+class BulkAckResult {
+  const BulkAckResult({
+    required this.acked,
+    required this.alreadyAcked,
+    required this.notFound,
+    required this.requested,
+  });
+
+  /// 本次由 open 变为 acked 的告警 ID。
+  final List<String> acked;
+
+  /// 此前已确认（幂等跳过，不算失败）。
+  final List<String> alreadyAcked;
+
+  /// 不存在的告警 ID。
+  final List<String> notFound;
+
+  /// 去重后的请求条数。
+  final int requested;
+
+  factory BulkAckResult.fromJson(Map<String, dynamic> json) => BulkAckResult(
+    acked: _stringList(json['acked']),
+    alreadyAcked: _stringList(json['already_acked']),
+    notFound: _stringList(json['not_found']),
+    requested: _asInt(json['requested']),
+  );
+
+  static List<String> _stringList(Object? value) => value is List
+      ? value.map((item) => item.toString()).toList(growable: false)
+      : const <String>[];
+}
+
 /// `GET /api/devices/{id}/commands` 的指令回执。
 class CommandItem {
   const CommandItem({

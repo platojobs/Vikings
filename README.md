@@ -102,7 +102,7 @@
 │   └── lib/
 │       ├── config/            设备状态机与网关地址配置
 │       ├── models/            MQTT 报文与 REST 视图模型
-│       ├── pages/             设备模拟器 / 登录 / 移动看板 / 双模式入口
+│       ├── pages/             设备模拟器 / 登录 / 移动看板 / 告警中心 / 三模式入口
 │       ├── services/          MQTT 客户端、实时订阅、REST 客户端与安全存储
 │       └── widgets/           传感器卡片、在线徽标
 ├── scripts/
@@ -157,12 +157,13 @@ flutter pub get
 flutter run          # 选择模拟器 / 真机
 ```
 
-App 启动后底部有两个入口，默认进入「设备模拟」，原有模拟器功能不变：
+App 启动后底部有三个入口，默认进入「设备模拟」，原有模拟器功能不变：
 
 | 入口 | 用途 | 依赖 |
 | --- | --- | --- |
 | 设备模拟 | 模拟电池传感器：间歇上线、周期上报、收指令、OTA | 只依赖 MQTT Broker |
 | 移动看板 | 登录网关后查看真实数据（设备/实时值/历史/告警/指令回执），实时增量走 WebSocket；admin / operator 可下发指令、确认告警 | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
+| 告警中心 | 多设备告警筛选 / 滚动分页 / 多选批量确认；实时新告警入顶，tab 角标显示未读，进入页面清零 | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
 
 设备模拟页的「Broker 地址」按运行环境填写，填错会表现为一直连不上：
 
@@ -320,6 +321,19 @@ http://192.168.1.8:5173
 | chips 与 total | 事件后 250ms 防抖重拉 `GET /api/devices/groups` 与当前分页/`/api/stats/overview`，chips、`total`、汇总卡统一以服务端口径为准（本地增量在并发改名 / 整组清空时可能失真） |
 | 降级 | 实时断开期间收不到事件，但 15 秒轮询或手动刷新会用 REST 结果覆盖分组与 chips，不会「永远看不到」；新进入当前筛选的设备在下次刷新/翻页出现 |
 | 兼容 | 事件 Topic 与报文为新增的可选能力：旧看板不订阅该 Topic，行为与 v1.13.x 完全一致；`PATCH` 入参、响应与错误语义不变，MQTT 不可用时编辑仍返回 200 |
+
+告警中心（v1.15.0，HomeShell 第三个 tab）：
+
+| 能力 | 行为 |
+| --- | --- |
+| 列表与筛选 | 级别（info / notice / warning / critical）、状态（open / acked）、设备三组条件可组合；切换即重置到第 1 页并按新参数重拉，接口为 `GET /api/alerts?deviceId&level&status&page&pageSize` |
+| 分页 | 首屏 `page=1&pageSize=20`，滚动到页脚自动追加下一页；加载中显示「加载中…」，末页「没有更多了」，首页即空按状态给出可读空态 |
+| 每行信息 | 设备名（ID）、指标、当前值、阈值、级别、时间、状态；只读账号也能勾选查看 |
+| 批量确认 | 多选后一次请求 `POST /api/alerts/bulk-ack`（`alert_ids` 1~100 条），响应逐类返回 `acked` / `already_acked` / `not_found` / `requested`；部分失败在页面提示，不整批回滚，也不以 N 次单条请求伪装批量 |
+| 实时 | 新告警经 `device/system/alert` 插入列表顶部（当前筛选不匹配时只累加角标不插入）；实时断开时 15 秒轮询第 1 页 + `/api/alerts/summary` 补齐，不漏告警 |
+| tab 角标 | 角标展示本地未读计数：初始取 `/api/alerts/summary.open`，实时新增 +1，进入告警中心即清零；新告警确认后计数同步减少。告警中心在前台保持实时订阅，保证切到其它 tab 时角标仍能累加（代价是一条 MQTT 连接，与看板互不影响） |
+| 权限 | 与单条确认一致：viewer 只读，批量确认按钮禁用并说明原因；operator / admin 可确认；服务端 403 提示后禁用本轮写操作，401 清除会话回登录页 |
+| 兼容 | `GET /api/alerts` 原参数与默认行为不变，仅把 `level` 校验放宽到 info/notice/warning/critical（老数据不受影响）；单条 `POST /api/alerts/{id}/ack` 语义保持不变 |
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -559,6 +573,8 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 - WebSocket 9001 秒级收到上报、上下线与 critical 告警；
 - REST 下发 config 指令，模拟设备回执 success 并同步到指令历史；
 - REST 确认告警，状态变为 acked（open 消失、acked 可查）；
+- 告警中心：真实上报产生新告警 → `GET /api/alerts` 按 deviceId/level/status 筛选可见 →
+  `POST /api/alerts/bulk-ack` 批量确认（混入不存在 ID 验证部分失败可见）→ open 不再返回、acked 可查；
 - 停 Broker 后 WS 断连、REST 仍可轮询；重启 Broker 后 WS 重连、网关
   `mqtt.connected=true`，并再次收到真实上报。
 
@@ -583,7 +599,7 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（22 项） | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（23 项） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
 结束后脚本自清理并由 `if: always()` 兜底；不依赖外部服务、不写生产数据。
@@ -596,7 +612,8 @@ Broker 使用临时数据目录（保留消息不跨运行累积），不写生�
 | --- | --- | --- |
 | 设备端单测 | `cd device_app && flutter test` | 实时报文解析与断线重连、token 迁移与安全存储、指令参数校验、REST 结果分类 |
 | 设备端 Widget 测试 | `cd device_app && flutter test test/mobile_board_widget_test.dart` | 登录进入看板、指令下发二次确认 / 取消 / 回执、告警确认移除、viewer 与 403 禁用、实时降级轮询、401 回登录、分组变更移出当前筛选与 chips 刷新 |
-| 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约；分组变更事件字段与发布降级 |
+| 告警中心 Widget 测试 | `cd device_app && flutter test test/alert_center_widget_test.dart` | 级别 / 状态筛选切换、滚动分页与没有更多、空态、批量确认成功与 403、viewer 禁用、实时入顶与未读角标清零 |
+| 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约；分组变更事件字段与发布降级；告警筛选 / 分页 / 批量确认（含部分失败）与 PATCH 设备 HTTP 回归 |
 | Web 单元测试 | `cd web && npm run test` | 路由守卫：未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底 |
 | Web | `cd web && npm run build` | 生产构建回归 |
 
@@ -667,3 +684,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.13.0` | 移动看板设备详情「历史上报」分页（`limit+offset`，首屏一页、加载更早、三态文案、实时插入保持滚动位置）；网关 records 新增可选 `offset`（不传行为不变）；Web 路由全部懒加载 + `manualChunks` 拆分，入口主包 693.24 kB → 312.04 kB 且无体积告警（[发布说明](docs/releases/v1.13.0.md)） |
 | `v1.13.1` | Web 测试基建：vitest + jsdom 复用生产 Vite 配置，7 条路由守卫用例（未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底）接入 CI `web` 作业（[发布说明](docs/releases/v1.13.1.md)） |
 | `v1.14.0` | 设备分组变更实时化：网关在 `PATCH` 落库后发布 `device/system/group`，移动看板就地更新分组名、移出当前筛选并防抖重拉 chips / total / 汇总卡；E2E 增加真实 Broker 的分组变更验收（[发布说明](docs/releases/v1.14.0.md)） |
+| `v1.15.0` | 移动端新增「告警中心」第三 tab：级别 / 状态 / 设备筛选、滚动分页、多选批量确认、实时入顶与未读角标；网关新增 `POST /api/alerts/bulk-ack`（部分失败逐类可见），告警级别校验放宽到 info/notice/warning/critical；补 `PATCH /api/devices/{id}` HTTP 回归与真实 Broker 告警中心验收（[发布说明](docs/releases/v1.15.0.md)） |

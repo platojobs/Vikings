@@ -139,6 +139,49 @@ async def ack_alert(session: AsyncSession, alert_id: str) -> Optional[DeviceAler
     return alert
 
 
+async def bulk_ack_alerts(
+    session: AsyncSession, alert_ids: List[str]
+) -> Dict[str, object]:
+    """批量确认告警，逐类返回结果，允许部分失败。
+
+    语义：
+    - 重复 ID 先去重，`requested` 为去重后的条数；
+    - open → acked 计入 `acked`；
+    - 已是 acked 计入 `already_acked`（幂等成功，不当作失败）；
+    - 不存在的 ID 计入 `not_found`，不抛 404，避免一条脏 ID 让整批失败。
+
+    调用方负责提交事务与审计；本函数只 flush，便于复用现有告警落库流程。
+    """
+    unique_ids = list(dict.fromkeys(alert_id for alert_id in alert_ids if alert_id))
+    if not unique_ids:
+        return {"acked": [], "already_acked": [], "not_found": [], "requested": 0}
+
+    stmt = select(DeviceAlert).where(DeviceAlert.alert_id.in_(unique_ids))
+    rows = list((await session.execute(stmt)).scalars().all())
+    by_id = {row.alert_id: row for row in rows}
+
+    acked: List[str] = []
+    already_acked: List[str] = []
+    not_found: List[str] = []
+    for alert_id in unique_ids:
+        row = by_id.get(alert_id)
+        if row is None:
+            not_found.append(alert_id)
+        elif row.status == "acked":
+            already_acked.append(alert_id)
+        else:
+            row.status = "acked"
+            acked.append(alert_id)
+
+    await session.flush()
+    return {
+        "acked": acked,
+        "already_acked": already_acked,
+        "not_found": not_found,
+        "requested": len(unique_ids),
+    }
+
+
 async def count_open_alerts(session: AsyncSession) -> int:
     stmt = select(func.count()).select_from(DeviceAlert).where(DeviceAlert.status == "open")
     return int((await session.execute(stmt)).scalar_one())

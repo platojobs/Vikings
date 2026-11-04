@@ -1,0 +1,509 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:iot_device_app/models/mobile_api_models.dart';
+import 'package:iot_device_app/models/realtime_payload.dart';
+import 'package:iot_device_app/pages/alert_center_page.dart';
+import 'package:iot_device_app/pages/home_shell.dart';
+import 'package:iot_device_app/services/api_client.dart';
+import 'package:iot_device_app/services/app_storage.dart';
+import 'package:iot_device_app/services/board_realtime_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+const AuthSession _adminSession = AuthSession(
+  token: 'jwt-admin',
+  username: 'admin',
+  role: 'admin',
+);
+const AuthSession _viewerSession = AuthSession(
+  token: 'jwt-viewer',
+  username: 'viewer',
+  role: 'viewer',
+);
+
+const DeviceSummary _deviceA = DeviceSummary(
+  deviceId: 'dev-0001',
+  name: '一号机',
+  model: 'Battery-Sensor',
+  firmwareVersion: '1.0.0',
+  groupName: '默认分组',
+  status: 'online',
+);
+
+AlertItem _alert(
+  String id,
+  String level,
+  String status, {
+  String deviceId = 'dev-0001',
+  double value = 80,
+  String metric = 'temperature',
+}) => AlertItem(
+  alertId: id,
+  deviceId: deviceId,
+  level: level,
+  metric: metric,
+  value: value,
+  threshold: 75,
+  message: '$metric 越界',
+  aiGenerated: false,
+  status: status,
+  createdAt: DateTime.utc(2026, 11, 4, 8),
+);
+
+/// 内存版安全存储，测试不触碰 Keychain / Keystore。
+class _FakeSecureStore implements SecureStore {
+  final Map<String, String> values = <String, String>{};
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    values.remove(key);
+  }
+}
+
+/// 假 REST 客户端：模拟网关过滤 / 分页 / 批量确认语义，不发真实请求。
+class _FakeApiClient extends ApiClient {
+  _FakeApiClient({
+    List<AlertItem>? alerts,
+    this.bulkError,
+    List<DeviceSummary>? devices,
+  }) : alerts = List<AlertItem>.of(alerts ?? const <AlertItem>[]),
+       devices = List<DeviceSummary>.of(devices ?? const <DeviceSummary>[_deviceA]),
+       super(baseUrl: 'http://192.168.1.8:8000');
+
+  final List<AlertItem> alerts;
+  final List<DeviceSummary> devices;
+  final Object? bulkError;
+
+  int alertFetchCalls = 0;
+  int bulkCalls = 0;
+  int summaryCalls = 0;
+  int? lastPage;
+  String? lastLevel;
+  String? lastStatus;
+  String? lastDeviceId;
+  List<String> lastBulkIds = const <String>[];
+
+  @override
+  Future<AlertPage> fetchAlerts({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+    String? deviceId,
+    String? level,
+    String? status,
+  }) async {
+    alertFetchCalls += 1;
+    lastPage = page;
+    lastLevel = level;
+    lastStatus = status;
+    lastDeviceId = deviceId;
+    var filtered = alerts;
+    if (level != null && level.isNotEmpty) {
+      filtered = filtered.where((item) => item.level == level).toList();
+    }
+    if (status != null && status.isNotEmpty) {
+      filtered = filtered.where((item) => item.status == status).toList();
+    }
+    if (deviceId != null && deviceId.isNotEmpty) {
+      filtered = filtered.where((item) => item.deviceId == deviceId).toList();
+    }
+    final total = filtered.length;
+    final start = (page - 1) * pageSize;
+    final items = start >= total
+        ? const <AlertItem>[]
+        : filtered.sublist(start, start + pageSize > total ? total : start + pageSize);
+    return AlertPage(items: items, total: total, page: page, pageSize: pageSize);
+  }
+
+  @override
+  Future<AlertSummary> fetchAlertSummary({required String token}) async {
+    summaryCalls += 1;
+    final open = alerts.where((item) => item.status == 'open').toList();
+    return AlertSummary(
+      open: open.length,
+      criticalOpen: open.where((item) => item.level == 'critical').length,
+      today: open.length,
+    );
+  }
+
+  @override
+  Future<BulkAckResult> bulkAckAlerts({
+    required String token,
+    required List<String> alertIds,
+  }) async {
+    bulkCalls += 1;
+    lastBulkIds = List<String>.of(alertIds);
+    final error = bulkError;
+    if (error != null) {
+      throw error;
+    }
+    final acked = <String>[];
+    final already = <String>[];
+    final missing = <String>[];
+    for (final id in alertIds) {
+      final index = alerts.indexWhere((item) => item.alertId == id);
+      if (index < 0) {
+        missing.add(id);
+      } else if (alerts[index].status == 'acked') {
+        already.add(id);
+      } else {
+        acked.add(id);
+        final row = alerts[index];
+        alerts[index] = AlertItem(
+          alertId: row.alertId,
+          deviceId: row.deviceId,
+          level: row.level,
+          metric: row.metric,
+          value: row.value,
+          threshold: row.threshold,
+          message: row.message,
+          aiGenerated: row.aiGenerated,
+          status: 'acked',
+          createdAt: row.createdAt,
+        );
+      }
+    }
+    return BulkAckResult(
+      acked: acked,
+      alreadyAcked: already,
+      notFound: missing,
+      requested: alertIds.length,
+    );
+  }
+
+  @override
+  Future<DevicePage> fetchDevices({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+    String? status,
+    String? keyword,
+    String? group,
+    bool hasAlert = false,
+    bool withAlertCount = false,
+  }) async => DevicePage(
+    items: devices,
+    total: devices.length,
+    page: page,
+    pageSize: pageSize,
+  );
+
+  // 以下为 HomeShell 中移动看板 tab 启动所需的最小返回，避免真实网络请求。
+  @override
+  Future<List<DeviceGroup>> fetchGroups({required String token}) async =>
+      const <DeviceGroup>[];
+
+  @override
+  Future<List<SensorReading>> fetchLatestReadings({
+    required String token,
+    List<String>? deviceIds,
+  }) async => const <SensorReading>[];
+
+  @override
+  Future<StatsOverview> fetchStatsOverview({required String token}) async =>
+      StatsOverview.empty;
+
+  @override
+  Future<AlertPage> fetchOpenAlerts({
+    required String token,
+    int page = 1,
+    int pageSize = 20,
+  }) async => const AlertPage(
+    items: <AlertItem>[],
+    total: 0,
+    page: 1,
+    pageSize: 20,
+  );
+
+  @override
+  void close() {}
+}
+
+class _FakeRealtimeService extends BoardRealtimeService {
+  _FakeRealtimeService([this.initialState = RealtimeState.connected])
+    : super(
+        url: 'ws://192.168.1.8:9001',
+        transportFactory: (_, _) => throw StateError('测试不应创建真实连接'),
+      );
+
+  final RealtimeState initialState;
+  final StreamController<RealtimeEvent> _controller =
+      StreamController<RealtimeEvent>.broadcast();
+
+  @override
+  Stream<RealtimeEvent> get events => _controller.stream;
+
+  void emit(RealtimeEvent event) {
+    if (!_controller.isClosed) {
+      _controller.add(event);
+    }
+  }
+
+  @override
+  void start() {
+    state.value = initialState;
+  }
+
+  @override
+  Future<void> dispose() async {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
+    await _controller.close();
+  }
+
+  bool _disposed = false;
+}
+
+Future<AppStorage> _storageWith(AuthSession session) async {
+  final storage = AppStorage(secureStore: _FakeSecureStore());
+  await storage.saveSession(session);
+  return storage;
+}
+
+Future<void> _pumpAlertCenter(
+  WidgetTester tester, {
+  required _FakeApiClient api,
+  AuthSession? session,
+  _FakeRealtimeService? realtime,
+  bool active = true,
+  void Function(int)? onUnreadChanged,
+}) async {
+  final storage = await _storageWith(session ?? _adminSession);
+  await tester.pumpWidget(
+    MaterialApp(
+      home: AlertCenterPage(
+        active: active,
+        storage: storage,
+        apiClientFactory: (_) => api,
+        realtimeServiceFactory: (_) => realtime ?? _FakeRealtimeService(),
+        onUnreadChanged: onUnreadChanged,
+      ),
+    ),
+  );
+}
+
+Finder _levelChip(String level) => find.byKey(ValueKey('level-$level'));
+Finder _statusChip(String status) => find.byKey(ValueKey('status-$status'));
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+  });
+
+  testWidgets('筛选切换：级别与状态分别转为服务端参数并刷新列表', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[
+        _alert('alt-c1', 'critical', 'open'),
+        _alert('alt-w1', 'warning', 'open', deviceId: 'dev-0002'),
+        _alert('alt-c2', 'critical', 'acked', metric: 'voltage'),
+      ],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    expect(api.lastStatus, 'open');
+    expect(find.byKey(const ValueKey('alert-row-alt-c1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-w1')), findsOneWidget);
+
+    await tester.tap(_levelChip('critical'));
+    await tester.pumpAndSettle();
+    expect(api.lastLevel, 'critical');
+    expect(find.byKey(const ValueKey('alert-row-alt-c1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-w1')), findsNothing);
+
+    await tester.tap(_statusChip('acked'));
+    await tester.pumpAndSettle();
+    expect(api.lastStatus, 'acked');
+    expect(find.byKey(const ValueKey('alert-row-alt-c2')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-c1')), findsNothing);
+  });
+
+  testWidgets('滚动分页：第一页 20 条，滑到底追加第二页并展示没有更多', (tester) async {
+    final api = _FakeApiClient(
+      alerts: List<AlertItem>.generate(
+        25,
+        (index) => _alert('alt-${index.toString().padLeft(2, '0')}', 'warning', 'open'),
+      ),
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+
+    await tester.drag(find.byType(ListView), const Offset(0, -2000));
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 2);
+    // 列表懒加载，页脚需滚动到底才会构建
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('alert-footer-end')),
+      400,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(find.text('没有更多了'), findsOneWidget);
+
+    // 第二页数据确实追加进列表
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('alert-row-alt-24')),
+      400,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(find.byKey(const ValueKey('alert-row-alt-24')), findsOneWidget);
+  });
+
+  testWidgets('空态：无未处理告警时给出可读提示', (tester) async {
+    final api = _FakeApiClient();
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+    expect(find.text('当前筛选下没有未处理告警'), findsOneWidget);
+    expect(find.byType(ListView), findsNothing);
+  });
+
+  testWidgets('批量确认成功：一次请求提交多选，行移除且部分失败可见', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[
+        _alert('alt-a', 'critical', 'open'),
+        _alert('alt-b', 'warning', 'open'),
+        _alert('alt-c', 'warning', 'open'),
+      ],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('select-alt-a')));
+    await tester.tap(find.byKey(const ValueKey('select-alt-b')));
+    await tester.pumpAndSettle();
+    expect(find.text('已选择 2 条'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-button')));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(api.bulkCalls, 1);
+    expect(api.lastBulkIds, <String>['alt-a', 'alt-b']);
+    expect(find.byKey(const ValueKey('alert-row-alt-a')), findsNothing);
+    expect(find.byKey(const ValueKey('alert-row-alt-b')), findsNothing);
+    expect(find.byKey(const ValueKey('alert-row-alt-c')), findsOneWidget);
+    expect(find.textContaining('已确认 2 条告警'), findsOneWidget);
+  });
+
+  testWidgets('viewer 只读：可勾选但批量确认按钮禁用并说明原因', (tester) async {
+    final api = _FakeApiClient(alerts: <AlertItem>[_alert('alt-v', 'warning', 'open')]);
+    await _pumpAlertCenter(tester, api: api, session: _viewerSession);
+    await tester.pumpAndSettle();
+
+    expect(find.text('当前账号为只读（viewer），批量确认已禁用。'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('select-alt-v')));
+    await tester.pumpAndSettle();
+    expect(find.text('已选择 1 条'), findsOneWidget);
+    expect(find.text('只读账号不可确认'), findsOneWidget);
+
+    final button = tester.widget<FilledButton>(
+      find.byKey(const ValueKey('bulk-ack-button')),
+    );
+    expect(button.onPressed, isNull);
+    expect(api.bulkCalls, 0);
+  });
+
+  testWidgets('服务端 403：提示并禁用本轮写操作，不崩溃', (tester) async {
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[_alert('alt-403', 'warning', 'open')],
+      bulkError: const ApiException(ApiErrorKind.forbidden, '当前账号无权访问该数据', statusCode: 403),
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('select-alt-403')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('本轮写操作已禁用'), findsWidgets);
+    final button = tester.widget<FilledButton>(
+      find.byKey(const ValueKey('bulk-ack-button')),
+    );
+    expect(button.onPressed, isNull);
+  });
+
+  testWidgets('实时新告警插入列表顶部并累加未读回调', (tester) async {
+    final realtime = _FakeRealtimeService();
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[_alert('alt-old', 'warning', 'open')],
+    );
+    final unreadChanges = <int>[];
+    await _pumpAlertCenter(
+      tester,
+      api: api,
+      realtime: realtime,
+      onUnreadChanged: unreadChanges.add,
+    );
+    await tester.pumpAndSettle();
+
+    final live = _alert('alt-live', 'critical', 'open', value: 99);
+    realtime.emit(AlertEvent(live));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('alert-row-alt-live')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-old')), findsOneWidget);
+    expect(unreadChanges.last, greaterThan(0));
+
+    // 新告警应位于旧告警之前（列表顶部）
+    final liveTop = tester.getTopLeft(
+      find.byKey(const ValueKey('alert-row-alt-live')),
+    );
+    final oldTop = tester.getTopLeft(
+      find.byKey(const ValueKey('alert-row-alt-old')),
+    );
+    expect(liveTop.dy, lessThan(oldTop.dy));
+  });
+
+  testWidgets('HomeShell 角标：新告警累加，进入告警中心后清零', (tester) async {
+    final realtime = _FakeRealtimeService();
+    final api = _FakeApiClient();
+    final storage = await _storageWith(_adminSession);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeShell(
+          storage: storage,
+          apiClientFactory: (_) => api,
+          realtimeServiceFactory: (_) => realtime,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('设备模拟'), findsOneWidget);
+    realtime.emit(AlertEvent(_alert('alt-badge', 'critical', 'open')));
+    await tester.pumpAndSettle();
+    final badge = tester.widget<Badge>(find.byKey(const ValueKey('alert-tab-badge')));
+    expect(badge.isLabelVisible, isTrue);
+    expect((badge.label as Text?)?.data, '1');
+
+    await tester.tap(find.text('告警中心'));
+    await tester.pumpAndSettle();
+    final selectedBadge = tester.widget<Badge>(
+      find.ancestor(
+        of: find.byIcon(Icons.notifications),
+        matching: find.byType(Badge),
+      ),
+    );
+    expect(selectedBadge.isLabelVisible, isFalse);
+  });
+}

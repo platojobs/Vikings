@@ -220,9 +220,22 @@ v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`page`、`pageSize` |
-| POST | `/api/alerts/{alertId}/ack` | 告警确认 |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(info/notice/warning/critical)、`status`(open/acked)、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
+| POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增），见 3.3.1 |
+| POST | `/api/alerts/{alertId}/ack` | 单条告警确认（语义不变） |
 | GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today}` |
+
+#### 3.3.1 批量确认 `POST /api/alerts/bulk-ack`（v1.15.0）
+
+| 项 | 契约 |
+| --- | --- |
+| 权限 | `operator` / `admin`；`viewer` 403，未登录 401（与单条确认一致） |
+| 入参 | `{"alert_ids": ["alt-..."]}`，去重前 1~100 条；空列表或超限 422 |
+| 出参 | `data: {acked: [], already_acked: [], not_found: [], requested: N}`；`requested` 为去重后条数 |
+| 部分失败 | 不整批回滚、不返回 404：open → acked 计入 `acked`；已是 acked 幂等计入 `already_acked`；不存在的 ID 计入 `not_found`，调用方逐类展示 |
+| 全失败 | 全部 ID 不存在时仍返回 200，`acked` 为空、`not_found` 为全部去重后的 ID |
+| 事务与审计 | 单事务提交；写一条 `alert.ack` 审计，`detail` 记录 `bulk` / 请求数与三类计数 |
+| 兼容 | 单条 `POST /api/alerts/{alertId}/ack` 保持原有 200/404 语义；批量端点纯新增，旧客户端不受影响 |
 
 ### 3.4 阈值在线配置
 
@@ -394,6 +407,24 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 `device_app/test/realtime_test.dart`（报文解析与脏报文）、
 `device_app/test/mobile_board_widget_test.dart`（移出当前筛选、chips 刷新）、
 `scripts/e2e/e2e_acceptance.py` 的 `group_change`（真实 Broker + WebSocket + REST 口径一致）。
+
+#### 3.10.6 告警中心（v1.15.0）
+
+| 行为 | 契约 |
+| --- | --- |
+| 列表 | `GET /api/alerts?deviceId&level&status&page&pageSize`，三组筛选可组合；切换筛选重置 `page=1`；`total` 为过滤后全量 |
+| 分页 | `pageSize=20`，滚动到页脚请求 `page+1` 并追加；加载中 / `page * pageSize >= total`（没有更多）/ 首页空态三态可读 |
+| 每行 | 设备（名称优先，取 `GET /api/devices?pageSize=200` 的本地映射，缺失时回落 `device_id`）、`metric`、`value`、`threshold`、`level`、`created_at`、`status` |
+| 批量确认 | 仅 open 行可勾选；`POST /api/alerts/bulk-ack` 一次提交，成功后按 `acked` 移除行、`total` 与未读角标同步减少；`already_acked` / `not_found` 在页面提示，不当作成功数量 |
+| 实时 | `device/system/alert`（报文见 2.5）按 `alertId` 去重；满足当前 level/status/device 筛选时插入列表顶部，否则只累加角标；实时断开时 15 秒轮询第 1 页 + `summary` 补齐 |
+| 角标口径 | 本地未读计数：初始 = `GET /api/alerts/summary.open`；实时新增 +1；进入告警中心清零；页面不可见时的轮询以服务端 `open` 总数取大值补齐，页面可见时保持清零口径 |
+| 权限 | 与 3.10.2 一致：viewer 可勾选但批量确认按钮禁用并提示；operator/admin 可提交；403 提示后禁用本轮写操作；401 清会话回登录页 |
+| 兼容 | `GET /api/alerts` 不传新参数时行为不变；级别校验从 warning/critical 放宽到 info/notice/warning/critical 仅为允许更多取值，不改变既有数据筛选结果 |
+
+回归覆盖：`gateway/tests/test_alert_service.py`（筛选 / 分页 / 批量部分失败 / 全失败）、
+`gateway/tests/test_http_regression.py`（批量确认 HTTP 权限与部分失败、PATCH 设备在 MQTT 不可用时仍 200）、
+`device_app/test/alert_center_widget_test.dart`（筛选切换、分页、空态、批量成功、viewer 禁用、403、实时入顶与角标清零）、
+`scripts/e2e/e2e_acceptance.py` 的 `alert_center_bulk_ack`（真实 Broker 产生告警 → REST 筛选可见 → 批量确认后 open 不再返回）。
 
 ---
 
