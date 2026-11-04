@@ -4,8 +4,11 @@ import 'package:flutter/material.dart';
 
 import '../config/api_config.dart';
 import '../models/mobile_api_models.dart';
+import '../models/realtime_payload.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
+import '../services/board_realtime_service.dart';
+import '../services/realtime_transport.dart';
 import '../widgets/online_badge.dart';
 import '../widgets/sensor_card.dart';
 import 'login_page.dart';
@@ -13,9 +16,10 @@ import 'login_page.dart';
 /// 移动看板：手机端只读展示网关数据（设备、实时值、告警、指令回执）。
 ///
 /// 设计约束：
-/// - 只复用既有 REST，网关与 Web 零改动；
-/// - 保留本地设备模拟器为默认入口，本页不依赖 MQTT；
-/// - 未登录、后端不可达、token 失效均给出可读提示，不白屏、不崩溃。
+/// - 首屏与手动刷新走既有 REST，实时增量走 MQTT over WebSocket（9001）；
+/// - 网关与 Web 零改动，订阅 Topic 与后台看板一致；
+/// - 保留本地设备模拟器为默认入口，两套 MQTT 连接互不影响；
+/// - 未登录、后端不可达、token 失效、实时断线均给出可读提示，不白屏、不崩溃。
 class MobileBoardPage extends StatefulWidget {
   const MobileBoardPage({super.key});
 
@@ -35,7 +39,12 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
   bool _loading = false;
   String? _error;
   String? _notice;
-  Timer? _timer;
+
+  /// 实时通道收到的最新在线状态，优先于 REST 快照。
+  final Map<String, String> _liveStatus = <String, String>{};
+
+  BoardRealtimeService? _realtime;
+  StreamSubscription<RealtimeEvent>? _eventSub;
 
   @override
   void initState() {
@@ -45,7 +54,9 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _eventSub?.cancel();
+    unawaited(_realtime?.dispose());
+    _realtime = null;
     super.dispose();
   }
 
@@ -68,18 +79,68 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     });
     if (session != null) {
       await _loadData();
-      _startTimer();
+      _startRealtime();
     }
   }
 
-  void _startTimer() {
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 20), (_) {
-      if (!_loading) {
-        _loadData(silent: true);
-      }
-    });
+  // ---------------- 实时链路 ----------------
+
+  void _startRealtime() {
+    if (_session == null) {
+      return;
+    }
+    _stopRealtime();
+    final url = ApiConfig.realtimeUrl(_baseUrl);
+    if (url.isEmpty) {
+      return;
+    }
+    final service = BoardRealtimeService(
+      url: url,
+      transportFactory: (uri, clientId) =>
+          MqttWebSocketTransport(url: uri, clientId: clientId),
+    );
+    _realtime = service;
+    _eventSub = service.events.listen(_onRealtimeEvent);
+    service.start();
   }
+
+  void _stopRealtime() {
+    _eventSub?.cancel();
+    _eventSub = null;
+    final service = _realtime;
+    _realtime = null;
+    if (service != null) {
+      unawaited(service.dispose());
+    }
+  }
+
+  void _onRealtimeEvent(RealtimeEvent event) {
+    if (!mounted) {
+      return;
+    }
+    switch (event) {
+      case AlertEvent(:final alert):
+        if (_alerts.any((item) => item.alertId == alert.alertId)) {
+          return;
+        }
+        setState(() {
+          _alerts = <AlertItem>[alert, ..._alerts].take(50).toList();
+        });
+      case ReportEvent(:final reading):
+        setState(() {
+          _readings = <SensorReading>[
+            reading,
+            ..._readings.where((item) => item.deviceId != reading.deviceId),
+          ];
+          _liveStatus[reading.deviceId] = 'online';
+        });
+      case StatusEvent(:final deviceId, :final status):
+        setState(() => _liveStatus[deviceId] = status);
+    }
+  }
+
+  bool _isOnline(DeviceSummary device) =>
+      (_liveStatus[device.deviceId] ?? device.status) == 'online';
 
   Future<void> _loadData({bool silent = false}) async {
     final session = _session;
@@ -107,6 +168,8 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
         _devices = results[0] as List<DeviceSummary>;
         _readings = results[1] as List<SensorReading>;
         _alerts = results[2] as List<AlertItem>;
+        // REST 快照比本地实时状态更新，清空后再由新事件补齐
+        _liveStatus.clear();
         _error = null;
       });
     } on ApiException catch (error) {
@@ -136,7 +199,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
   }
 
   Future<void> _handleExpired() async {
-    _timer?.cancel();
+    _stopRealtime();
     await _storage.clearSession();
     if (!mounted) {
       return;
@@ -153,7 +216,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
   }
 
   Future<void> _logout() async {
-    _timer?.cancel();
+    _stopRealtime();
     await _storage.clearSession();
     if (!mounted) {
       return;
@@ -225,6 +288,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     setState(() => _baseUrl = normalized);
     if (_session != null) {
       await _loadData();
+      _startRealtime();
     }
   }
 
@@ -237,7 +301,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
       _booting = false;
     });
     _loadData();
-    _startTimer();
+    _startRealtime();
   }
 
   SensorReading? _readingFor(String deviceId) {
@@ -287,6 +351,8 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
             children: [
               if (_error != null) _buildErrorBanner(),
               _buildAccountBar(session),
+              const SizedBox(height: 6),
+              _buildRealtimeBar(),
               const SizedBox(height: 10),
               _buildSummary(),
               const SizedBox(height: 14),
@@ -369,8 +435,72 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
     );
   }
 
+  /// 实时链路状态条：连接中 / 已连接 / 重连中，断线时不阻塞 REST 数据展示。
+  Widget _buildRealtimeBar() {
+    final service = _realtime;
+    if (service == null) {
+      return const SizedBox.shrink();
+    }
+    return ValueListenableBuilder<RealtimeState>(
+      valueListenable: service.state,
+      builder: (context, state, _) {
+        final color = switch (state) {
+          RealtimeState.connected => Colors.green,
+          RealtimeState.connecting => Colors.blueGrey,
+          RealtimeState.reconnecting => Colors.orange,
+          _ => Colors.grey,
+        };
+        final dot = state == RealtimeState.connecting ||
+                state == RealtimeState.reconnecting
+            ? const SizedBox(
+                width: 10,
+                height: 10,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: color,
+                  shape: BoxShape.circle,
+                ),
+              );
+        return Row(
+          children: [
+            dot,
+            const SizedBox(width: 6),
+            Expanded(
+              child: AnimatedBuilder(
+                animation: Listenable.merge([
+                  service.failure,
+                  service.attempts,
+                ]),
+                builder: (context, _) {
+                  final failure = service.failure.value;
+                  final attempts = service.attempts.value;
+                  final text = state == RealtimeState.reconnecting &&
+                          failure != null
+                      ? '$failure${attempts > 0 ? '（第 $attempts 次）' : ''}'
+                      : state.label;
+                  return Text(
+                    text,
+                    style: TextStyle(fontSize: 12, color: color),
+                  );
+                },
+              ),
+            ),
+            Text(
+              service.url,
+              style: const TextStyle(fontSize: 11, color: Colors.black38),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildSummary() {
-    final online = _devices.where((device) => device.online).length;
+    final online = _devices.where(_isOnline).length;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
       decoration: BoxDecoration(
@@ -460,7 +590,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
                       ),
                     ),
                   ),
-                  OnlineBadge(online: device.online),
+                  OnlineBadge(online: _isOnline(device)),
                 ],
               ),
               const SizedBox(height: 4),
@@ -558,6 +688,7 @@ class _MobileBoardPageState extends State<MobileBoardPage> {
       builder: (_) => _DeviceDetailSheet(
         device: device,
         reading: reading,
+        online: _isOnline(device),
         baseUrl: _baseUrl,
         token: session.token,
       ),
@@ -569,12 +700,14 @@ class _DeviceDetailSheet extends StatefulWidget {
   const _DeviceDetailSheet({
     required this.device,
     required this.reading,
+    required this.online,
     required this.baseUrl,
     required this.token,
   });
 
   final DeviceSummary device;
   final SensorReading? reading;
+  final bool online;
   final String baseUrl;
   final String token;
 
@@ -646,7 +779,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                     ),
                   ),
                 ),
-                OnlineBadge(online: widget.device.online),
+                OnlineBadge(online: widget.online),
               ],
             ),
             const SizedBox(height: 4),

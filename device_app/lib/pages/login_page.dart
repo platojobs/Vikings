@@ -75,8 +75,13 @@ class _LoginPageState extends State<LoginPage> {
     final client = ApiClient(baseUrl: baseUrl);
     try {
       final session = await client.login(username: username, password: password);
-      await _storage.saveBaseUrl(baseUrl);
-      await _storage.saveSession(session);
+      try {
+        await _storage.saveBaseUrl(baseUrl);
+        await _storage.saveSession(session);
+      } catch (_) {
+        // 安全存储不可用（如桌面缺 libsecret）时仍放行本次登录，
+        // 仅表现为重启后需重新登录，不影响看板使用
+      }
       if (!mounted) {
         return;
       }

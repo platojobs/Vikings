@@ -48,4 +48,17 @@ class ApiConfig {
   }
 
   String endpoint(String path) => '$baseUrl$path';
+
+  /// 由网关地址推导 MQTT over WebSocket 地址。
+  ///
+  /// 手机端与浏览器一样无法直连 TCP 1883，实时链路固定走 Broker 的 9001
+  /// WebSocket 端口；主机沿用网关地址，便于界面只维护一个网关输入框。
+  static String realtimeUrl(String baseUrl, {int port = 9001}) {
+    final uri = Uri.tryParse(normalize(baseUrl));
+    if (uri == null || uri.host.isEmpty) {
+      return '';
+    }
+    final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
+    return '$scheme://${uri.host}:$port';
+  }
 }

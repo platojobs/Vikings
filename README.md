@@ -103,7 +103,7 @@
 │       ├── config/            设备状态机与网关地址配置
 │       ├── models/            MQTT 报文与 REST 视图模型
 │       ├── pages/             设备模拟器 / 登录 / 移动看板 / 双模式入口
-│       ├── services/          MQTT 客户端、REST 客户端与本地存储
+│       ├── services/          MQTT 客户端、实时订阅、REST 客户端与安全存储
 │       └── widgets/           传感器卡片、在线徽标
 ├── scripts/
 │   ├── start_all.sh           一键启动 Broker + PostgreSQL + 网关
@@ -161,7 +161,7 @@ App 启动后底部有两个入口，默认进入「设备模拟」，原有模�
 | 入口 | 用途 | 依赖 |
 | --- | --- | --- |
 | 设备模拟 | 模拟电池传感器：间歇上线、周期上报、收指令、OTA | 只依赖 MQTT Broker |
-| 移动看板 | 登录网关后只读查看真实数据（设备/实时值/历史/告警/指令回执） | 依赖网关 REST（8000） |
+| 移动看板 | 登录网关后只读查看真实数据（设备/实时值/历史/告警/指令回执），实时增量走 WebSocket | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
 
 设备模拟页的「Broker 地址」按运行环境填写，填错会表现为一直连不上：
 
@@ -258,26 +258,36 @@ http://192.168.1.8:5173
 | --- | --- | --- |
 | 网关地址 | 登录页「网关地址」输入框，或看板右上角 `DNS` 图标 | iOS 模拟器 `http://127.0.0.1:8000`；Android 模拟器 `http://10.0.2.2:8000` |
 | 账号口令 | 登录页 | 以 `gateway/.env` 为准 |
-| token / 网关地址 | 登录成功后自动写入本地（`shared_preferences`） | 重启 App 免登录 |
+| token | 登录成功后写入系统安全存储（iOS Keychain / Android Keystore） | 重启 App 免登录 |
+| 网关地址 | `shared_preferences`（非敏感配置） | 重启 App 自动回填 |
 
 真机使用：手机与电脑同一 Wi-Fi，网关以 `--host 0.0.0.0` 启动（见 4.6 第 2 步），
-地址填电脑局域网 IP（如 `http://192.168.1.8:8000`），并放行 8000 端口。
+地址填电脑局域网 IP（如 `http://192.168.1.8:8000`），并放行 **8000 与 9001** 端口。
+实时链路会自动由网关地址推导为 `ws://<同一主机>:9001`，无需再单独填写。
 
-看板能力（全部只读，复用现有 REST，网关零改动）：
+看板数据来源：
 
-| 模块 | 数据来源 |
-| --- | --- |
-| 设备列表与在线状态 | `GET /api/devices` |
-| 每设备最新实时值 | `GET /api/records/latest` |
-| 单设备最近 10 条上报 | `GET /api/devices/{id}/records` |
-| 未处理告警 | `GET /api/alerts?status=open` |
-| 指令回执 | `GET /api/devices/{id}/commands` |
+| 模块 | 数据来源 | 方式 |
+| --- | --- | --- |
+| 设备列表与在线状态 | `GET /api/devices` | REST 首屏 + 手动下拉刷新 |
+| 每设备最新实时值 | `GET /api/records/latest`；`device/+/sensor/report` | REST 兜底 + 实时增量 |
+| 设备上下线 | `device/+/status` | 实时订阅（含 LWT 遗嘱离线） |
+| 未处理告警 | `GET /api/alerts?status=open`；`device/system/alert` | REST 兜底 + 实时插入 |
+| 单设备最近 10 条上报 | `GET /api/devices/{id}/records` | REST（详情页） |
+| 指令回执 | `GET /api/devices/{id}/commands` | REST（详情页） |
+
+实时链路说明：
+
+- 移动端与浏览器一样无法直连 TCP 1883，因此走 Broker 的 9001 WebSocket 端口；
+- 已移除 v1.7.0 的 20 秒轮询，改为 MQTT 增量推送，首屏仍由 REST 兜底；
+- 页面顶部状态条显示「实时连接中 / 已连接 / 重连中」，断线后按 3s→30s 指数退避自动重连；
+- 手动下拉刷新仍会重新拉取 REST 快照，用于校正设备列表与告警列表。
 
 异常处理：网络失败 / 超时给出地址与检查建议；401 自动清除本地 token 并回到登录页；
-未登录时不会白屏，设备模拟器始终可用。
+实时连接失败或断开只影响状态条，不影响已加载数据与设备模拟器。
 
-> 限制：本轮不提供下发指令、OTA、告警确认等写操作（避免手机端复制一套 RBAC）；
-> 演示阶段 token 明文存于 `shared_preferences`，生产应替换为 Keychain / Keystore。
+> 限制：本轮仍不提供下发指令、OTA、告警确认等写操作（避免手机端复制一套 RBAC）；
+> token 保存在系统安全存储，但账号口令不做本地记忆。
 
 ---
 
@@ -291,8 +301,9 @@ http://192.168.1.8:5173
 - 订阅云端指令：校准 / OTA / 重启 / 配置
 - OTA 全程保持唤醒，按 10/30/55/80/100 回执进度，完成后更新固件版本
 - 事件日志面板，便于现场讲解与排障
-- 只读移动看板（v1.7.0）：登录网关后查看设备列表、实时值、单设备历史上报、未处理告警与指令回执；
-  网关地址与登录态本地持久化，401 自动引导重新登录
+- 只读移动看板（v1.7.0 / v1.8.0）：登录网关后查看设备列表、实时值、单设备历史上报、未处理告警与指令回执；
+  MQTT over WebSocket 实时推送（9001）+ REST 首屏兜底，断线指数退避重连并显示连接状态；
+  token 存 iOS Keychain / Android Keystore，兼容旧版本明文会话自动迁移
 
 ### 网关（Python）
 
@@ -434,7 +445,7 @@ http://192.168.1.8:5173
 | 网关报 `permission denied for table device` | init.sql 用了超级用户执行，表归属错误。用 `iot` 账号执行 init.sql，或 `ALTER TABLE ... OWNER TO iot` |
 | `python3` 是 3.9.6 | macOS/Xcode 自带版本；用 `/opt/homebrew/bin/python3.14`，脚本已内置 |
 | 网关 `/api/health` 显示 `mqttConnected:false` | Broker 未启动或端口不符，查看 `logs/gateway.log` 与 `logs/mosquitto.log` |
-| 浏览器连不上 9001 | 确认 mosquitto.conf 已配置 `protocol websockets`，并检查防火墙 |
+| 浏览器 / 移动看板连不上 9001 | 确认 mosquitto.conf 已配置 `protocol websockets`，并检查防火墙与手机是否同网段 |
 | 设备一直离线 | 检查 LWT 报文、Topic 拼写；模拟器用 `--count 1` 时上报后会立即休眠，属正常现象 |
 | 告警只有模板文案 | 未配置 `LLM_API_KEY`，属预期降级行为 |
 
@@ -458,3 +469,4 @@ http://192.168.1.8:5173
 | `v1.5.0` | 设备全生命周期（注册/编辑/删除保护/批量导入）、设备分组与统计、设备列表 CSV 导出 |
 | `v1.6.0` | 系统状态运维页与 `/api/system/status`、CI Flutter 版本对齐、手机/局域网访问文档 |
 | `v1.7.0` | Flutter 只读移动看板：登录与网关地址配置、设备/实时值/历史/告警/指令回执，设备模拟器保留为默认入口 |
+| `v1.8.0` | 移动看板实时化（MQTT over WebSocket 9001，替换 20 秒轮询）与凭据安全存储（Keychain/Keystore + 旧 token 迁移） |
