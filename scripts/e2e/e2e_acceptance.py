@@ -493,20 +493,33 @@ def wait_report_round(ctx: Context, min_seq: int = 2) -> str:
 
 
 def verify_rest_device(ctx: Context) -> str:
-    data = api(
-        ctx,
-        "GET",
-        "/api/devices",
-        params={"page": 1, "pageSize": 100, "keyword": ctx.device_id},
-    )
-    items = data.get("items") or []
-    device = next((d for d in items if d.get("device_id") == ctx.device_id), None)
+    # WS 上报先到、REST 建档/入库稍慢（CI 上更明显），短轮询等待而非一次判定
+    deadline = time.monotonic() + 10
+    device: Optional[Dict[str, Any]] = None
+    reading: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        data = api(
+            ctx,
+            "GET",
+            "/api/devices",
+            params={"page": 1, "pageSize": 100, "keyword": ctx.device_id},
+        )
+        items = data.get("items") or []
+        device = next(
+            (d for d in items if d.get("device_id") == ctx.device_id), None
+        )
+        if device is not None:
+            latest = api(ctx, "GET", "/api/records/latest")
+            reading = next(
+                (r for r in latest if r.get("device_id") == ctx.device_id), None
+            )
+            if reading is not None:
+                break
+        time.sleep(0.3)
     if device is None:
-        raise RuntimeError("REST 设备列表未找到模拟设备")
-    latest = api(ctx, "GET", "/api/records/latest")
-    reading = next((r for r in latest if r.get("device_id") == ctx.device_id), None)
+        raise RuntimeError("REST 设备列表未找到模拟设备（等待 10s 仍未建档）")
     if reading is None:
-        raise RuntimeError("REST /api/records/latest 未返回模拟设备最新值")
+        raise RuntimeError("REST /api/records/latest 未返回模拟设备最新值（等待 10s）")
     return (
         f"REST 读到设备 status={device.get('status')}，"
         f"最新值 temperature={reading.get('temperature')} humidity={reading.get('humidity')}"
