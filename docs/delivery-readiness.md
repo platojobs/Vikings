@@ -250,7 +250,7 @@
   - 与移动端语义一致：同一端点、同一请求体、同一三类结果口径。
   - E2E `alert_center_bulk_ack` 在真实链路上验证 acked/not_found 与备注、`acked_by`。
 
-### P1-5 移动端无可发布产物：release 仍用 debug 签名，CI 无构建/制品/依赖扫描
+### P1-5 移动端无可发布产物：release 仍用 debug 签名，CI 无构建/制品/依赖扫描 ✅ 已完成（v1.22.0）
 
 - **现状证据**
   - `device_app/android/app/build.gradle.kts:32-37`：release `signingConfig = signingConfigs.getByName("debug")`，注释仍是 TODO。
@@ -261,6 +261,36 @@
 - **建议做法**：`key.properties` + CI secrets 配置 release 签名；CI 增加 `flutter build apk --release`（或 appbundle）并上传 artifact；启用 Dependabot（npm/pub/pip/actions）；升级 actions 到 v5/v6 消除 Node 20 提示；可选加入 `npm audit` / `pip-audit` 门禁。
 - **预估工作量**：1~2 人日。
 - **依赖关系**：签名密钥需在仓库 secrets 配置，需仓库管理员配合。
+- **完成证据（v1.22.0）**
+  - 签名：`device_app/android/app/build.gradle.kts` 支持环境变量
+    （`ANDROID_KEYSTORE_PATH/PASSWORD`、`ANDROID_KEY_ALIAS/KEY_PASSWORD`）或
+    `android/key.properties`（已 gitignore）注入 keystore；有材料时生成 release 签名配置。
+    缺材料时**不静默冒充**：Gradle 打印 `WARNING: ...回落到 debug 签名...不可分发`，
+    CI 产物名带 `-debug-signed`、`SIGNING.txt` 写明仅限内部测试；
+    `REQUIRE_SIGNED_RELEASE=true` 时构建直接失败并给出配置指引。
+  - 模板：新增 `device_app/android/key.properties.example`（口令均为占位符）；
+    `.gitignore` 覆盖 `device_app/android/key.properties` 与 `*.jks` / `*.keystore`。
+  - 版本：pubspec `1.22.0+21` 为唯一来源（versionName=1.22.0，versionCode=21）；
+    标签构建校验 `vX.Y.Z == pubspec 版本名` 且 build 大于上一 `v*` 标签；
+    main 快照用 `1.22.0-snapshot.<sha7>` + `GITHUB_RUN_NUMBER + 100000`，避免重号。
+  - CI：新增 `device_app_release` 作业，仅 main 推送与 `v*` 标签触发，PR 不产出制品；
+    构建 APK + AAB，上传 `iot-device-app-<version>-<signed|debug-signed>` artifact，
+    附 `SHA256SUMS` 与 `SIGNING.txt`；日志输出 `apksigner --print-certs` 与 `package:` 行。
+  - Actions：checkout/setup-python/setup-node/upload-artifact/cache/setup-buildx
+    全部升级到 Node 24 运行时版本（v7/v7/v7/v7/v6/v4），CI 日志无 Node.js 20 弃用提示。
+  - 依赖治理：新增 `.github/dependabot.yml`，覆盖 pub/pip/npm/github-actions，
+    周一 09:00 检查，minor/patch 分组、单生态最多 5 个 PR；
+    未引入阻断式 `npm audit` / `pip-audit` 门禁（避免无关长期红灯），
+    漏洞基线依赖仓库开启 Dependabot alerts，手动命令写入文档。
+  - 文档：新增 `docs/mobile-release.md`（生成 keystore → 配 secrets → 触发构建 →
+    取 artifact → 验签），README 顶部与目录树挂索引。
+  - 真实验证（本机）：
+    - 临时测试 keystore（`/tmp`，验证后删除）构建 release APK，
+      `apksigner verify --print-certs` 显示测试证书 DN，版本 `1.22.0 (21)`；
+    - 移除签名材料后重新构建，Gradle 输出降级 WARNING，
+      `apksigner` 显示 `CN=Android Debug`，产物按规则命名为 `-debug-signed`；
+    - CI 真实 run 的 artifact 名称/大小与「无 Node.js 20 警告」证据见
+      `docs/releases/v1.22.0.md`。
 
 ### P1-6 缺部署/运维手册，README 只覆盖 macOS 开发路径 ✅ 已完成（v1.18.0）
 
@@ -380,5 +410,6 @@
 - `v1.19.0`：P1-2 + P1-3（Alembic 迁移、数据生命周期、备份恢复）✅ 已完成；
 - `v1.20.0`：P1-1（结构化日志、请求 ID、分层健康检查、Prometheus 指标与告警规则）✅ 已完成；
 - `v1.21.0`：P1-4 + P2-2 + P2-1（Web 批量确认、处置备注、级别口径统一）✅ 已完成；
-- 下一批：P1-5 移动端发布工程、P1-7 剩余测试补强；
+- `v1.22.0`：P1-5（移动端 release 签名、CI 制品、构建号策略、依赖治理）✅ 已完成；
+- 下一批：P1-7 剩余测试补强（OTA E2E、故障注入、真机清单）；
 - P2 项穿插或单独小版本。

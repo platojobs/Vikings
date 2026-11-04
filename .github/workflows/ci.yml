@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   gateway:
@@ -14,10 +18,14 @@ jobs:
       run:
         working-directory: gateway
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            gateway/requirements.txt
+            gateway/requirements-dev.txt
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
@@ -63,10 +71,14 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://iot:ci_pass_123@127.0.0.1:5432/iot
       TEST_POSTGRES_URL: postgresql+asyncpg://iot:ci_pass_123@127.0.0.1:5432/iot
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            gateway/requirements.txt
+            gateway/requirements-dev.txt
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
@@ -88,10 +100,10 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: 安装依赖
@@ -108,7 +120,7 @@ jobs:
       run:
         working-directory: device_app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: subosito/flutter-action@v2
         with:
           # 与 device_app/pubspec.yaml 的 sdk: ^3.13.7 对齐：
@@ -119,14 +131,182 @@ jobs:
       - run: flutter analyze
       - run: flutter test
 
+  device_app_release:
+    name: Flutter 设备端（发布构建 + 制品）
+    # 只在 main 推送与版本标签构建，PR 不产出大文件、不拖慢评审。
+    # 标签构建额外校验「标签版本 == pubspec 版本」且 build 号严格递增。
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: device_app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 标签构建需要历史 tag 来校验 build 号不倒退
+          fetch-depth: 0
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.9"
+          channel: stable
+      - name: 解析版本与标签校验
+        id: meta
+        run: |
+          set -euo pipefail
+          version_string=$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}')
+          name="${version_string%%+*}"
+          code="${version_string##*+}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag" != "$name" ]]; then
+              echo "::error title=版本不一致::标签 v$tag 与 pubspec version $name 不一致"
+              exit 1
+            fi
+            prev_tag=$(git tag --list 'v*' --sort=-v:refname | grep -v "^v$tag$" | head -1 || true)
+            if [[ -n "$prev_tag" ]]; then
+              prev_version=$(git show "$prev_tag:device_app/pubspec.yaml" | grep -E '^version:' | head -1 | awk '{print $2}')
+              prev_code="${prev_version##*+}"
+              if (( code <= prev_code )); then
+                echo "::error title=版本号倒退::pubspec build=$code 不大于上一发布 ${prev_tag} 的 build=$prev_code"
+                exit 1
+              fi
+              echo "build 号校验通过：$prev_tag($prev_code) → v$tag($code)"
+            fi
+            build_name="$name"
+            build_code="$code"
+          else
+            # main 快照：versionName 带提交前缀，versionCode 用 run number 偏移，
+            # 保证同一快照通道严格递增、不会重号；正式发布仍以 pubspec 的 build 为准。
+            sha7="${GITHUB_SHA::7}"
+            build_name="$name-snapshot.$sha7"
+            build_code=$(( GITHUB_RUN_NUMBER + 100000 ))
+          fi
+          {
+            echo "name=$build_name"
+            echo "code=$build_code"
+            echo "version=$name"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建版本：$build_name（versionCode=$build_code）"
+
+      - name: 检测签名材料
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          REQUIRE_SIGNED_RELEASE: ${{ vars.REQUIRE_SIGNED_RELEASE || 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64:-}" ]]; then
+            echo "state=signed" >> "$GITHUB_OUTPUT"
+            echo "签名：使用仓库 secrets 中的 release keystore"
+          else
+            if [[ "${REQUIRE_SIGNED_RELEASE}" == "true" ]]; then
+              echo "::error title=签名缺失::REQUIRE_SIGNED_RELEASE=true 但未配置 ANDROID_KEYSTORE_BASE64"
+              exit 1
+            fi
+            echo "state=debug-signed" >> "$GITHUB_OUTPUT"
+            echo "::warning title=release 未签名::未配置签名 secrets，产物使用 debug 签名，仅限内部测试，不可分发"
+          fi
+
+      - name: 写入 keystore
+        if: steps.signing.outputs.state == 'signed'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keystore"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/keystore/release.jks"
+          chmod 600 "$RUNNER_TEMP/keystore/release.jks"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/keystore/release.jks"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('device_app/android/**/*.gradle*', 'device_app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: 构建 APK / AAB
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --build-name "${{ steps.meta.outputs.name }}" \
+            --build-number "${{ steps.meta.outputs.code }}"
+          flutter build appbundle --release \
+            --build-name "${{ steps.meta.outputs.name }}" \
+            --build-number "${{ steps.meta.outputs.code }}"
+
+      - name: 校验签名与版本
+        run: |
+          set -euo pipefail
+          apk=build/app/outputs/flutter-apk/app-release.apk
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          apksigner=$(find "$sdk/build-tools" -maxdepth 2 -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [[ -n "$apksigner" ]]; then
+            "$apksigner" verify --print-certs "$apk"
+          else
+            echo "::warning::未找到 apksigner，跳过证书打印"
+          fi
+          aapt2=$(find "$sdk/build-tools" -maxdepth 2 -name aapt2 -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [[ -n "$aapt2" ]]; then
+            "$aapt2" dump badging "$apk" | grep -E "^package:" || true
+          fi
+
+      - name: 归档并命名产物
+        env:
+          SIGNING_STATE: ${{ steps.signing.outputs.state }}
+          BUILD_NAME: ${{ steps.meta.outputs.name }}
+          BUILD_CODE: ${{ steps.meta.outputs.code }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          out=build/release-artifacts
+          mkdir -p "$out"
+          apk_name="iot-device-app-${BUILD_NAME}-${SIGNING_STATE}.apk"
+          aab_name="iot-device-app-${BUILD_NAME}-${SIGNING_STATE}.aab"
+          cp build/app/outputs/flutter-apk/app-release.apk "$out/$apk_name"
+          cp build/app/outputs/bundle/release/app-release.aab "$out/$aab_name"
+          (cd "$out" && shasum -a 256 "$apk_name" "$aab_name" > SHA256SUMS)
+          {
+            echo "versionName=$BUILD_NAME"
+            echo "versionCode=$BUILD_CODE"
+            echo "pubspecVersion=$VERSION"
+            echo "signing=$SIGNING_STATE"
+            echo "commit=$GITHUB_SHA"
+            echo "ref=$GITHUB_REF"
+            if [[ "$SIGNING_STATE" == "signed" ]]; then
+              echo "note=已使用仓库配置的 release keystore 签名"
+            else
+              echo "note=未配置签名密钥，使用 debug 签名，仅限内部测试，不可分发"
+            fi
+          } > "$out/SIGNING.txt"
+          ls -lh "$out"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: iot-device-app-${{ steps.meta.outputs.name }}-${{ steps.signing.outputs.state }}
+          path: device_app/build/release-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
   images:
     name: 生产镜像构建（gateway + web）
     runs-on: ubuntu-latest
     # 只验证镜像能构建成功，不起全栈，避免与 e2e 端口冲突
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - name: 构建 gateway 镜像
         run: docker build -f gateway/Dockerfile -t iot-gateway:ci .
       - name: 构建 web 镜像
@@ -138,10 +318,14 @@ jobs:
     # 安装依赖 + 真实 Broker/网关/模拟器全链路，正常 2~3 分钟；超时兜底防卡死
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            gateway/requirements.txt
+            scripts/e2e/requirements.txt
       - name: 安装 Mosquitto（1883 TCP + 9001 WebSocket）
         run: |
           sudo apt-get update

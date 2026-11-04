@@ -16,6 +16,10 @@ dist-ssr/
 .vite/
 
 # ---- Flutter ----
+# Android 发布签名（v1.22.0）：key.properties 与 keystore 一律不入库
+device_app/android/key.properties
+device_app/android/**/*.jks
+device_app/android/**/*.keystore
 .dart_tool/
 .packages
 build/
