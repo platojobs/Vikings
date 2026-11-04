@@ -89,15 +89,35 @@ def read_password_file(path: Path) -> Dict[str, str]:
     return entries
 
 
+def password_file_mode() -> int:
+    """密码文件权限：默认 0600。
+
+    Docker 生产编排中网关与 Broker 以不同 uid 运行，且共享同一份 passwd
+    绑定挂载；Broker 需要能读、网关需要能写，因此通过环境变量放宽到 0644。
+    文件只含 PBKDF2 hash，不含明文口令；默认值仍是更严格的 0600。
+    """
+    raw = os.environ.get("MQTT_PASSWORD_FILE_MODE", "").strip()
+    if not raw:
+        return 0o600
+    try:
+        mode = int(raw, 8)
+    except ValueError:
+        raise ValueError(f"MQTT_PASSWORD_FILE_MODE 不是合法的八进制权限：{raw}")
+    if mode & 0o002:
+        raise ValueError("MQTT_PASSWORD_FILE_MODE 不允许 world-writable")
+    return mode
+
+
 def write_password_file(path: Path, entries: Dict[str, str]) -> None:
-    """原子写入密码文件，权限 0600；Broker 对 world-readable 会告警。"""
+    """原子写入密码文件；默认 0600，Broker 对 world-readable 会告警。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     body = "".join(f"{user}:{stored}\n" for user, stored in entries.items())
     tmp.write_text(body, encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    mode = password_file_mode()
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
-    os.chmod(path, 0o600)
+    os.chmod(path, mode)
 
 
 def upsert_credential(path: Path, username: str, password: str) -> str:

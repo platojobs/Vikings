@@ -130,7 +130,7 @@ void main() {
     );
     expect(
       ApiConfig.realtimeUrl('https://iot.example.com'),
-      'wss://iot.example.com:9001',
+      'wss://iot.example.com/mqtt',
     );
     expect(ApiConfig.realtimeUrl(''), '');
   });

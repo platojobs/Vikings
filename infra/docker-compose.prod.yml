@@ -1,0 +1,193 @@
+# 生产编排（v1.18.0）。与 infra/docker-compose.yml（本地开发）用途不同：
+#   - 开发编排面向本机快速起依赖；本文件面向一台干净机器的完整对外服务。
+#   - 使用方式见 docs/deployment.md；推荐直接执行 scripts/prod_up.sh。
+#
+# 对外暴露：80/443（反代）与 1883（设备 MQTT）。
+# 不暴露：gateway:8000、web:8080、mosquitto:9001、postgres:5432（仅容器网络可达）。
+#
+# 启动：
+#   docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env up -d --build
+
+name: iot-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER 未配置}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未配置}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB 未配置}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    restart: unless-stopped
+    environment:
+      # 仅用于健康检查：以网关服务身份发布一条无副作用的状态报文，
+      # 同时验证 Broker 存活、口令文件可用与 ACL 生效。
+      MQTT_HEALTH_USERNAME: iot-gateway
+      MQTT_HEALTH_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD 未配置}
+    volumes:
+      - ./mosquitto/acl.device:/mosquitto/config/acl.device:ro
+      - ./mosquitto/acl.client:/mosquitto/config/acl.client:ro
+      - ./prod/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # 密码文件由 scripts/prod_up.sh 生成（gitignored，仅含 PBKDF2 hash）
+      - ./prod/secrets/mosquitto.passwd:/mosquitto/config/passwd:ro
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -u $$MQTT_HEALTH_USERNAME -P $$MQTT_HEALTH_PASSWORD -t gateway/status -m health -q 0"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    # 覆盖镜像内默认的 10001，改为宿主机部署用户 uid/gid：
+    # 非 root，且能写共享密码文件（Broker 以独立 uid 只读同一文件）。
+    user: "${DEPLOY_UID:-10001}:${DEPLOY_GID:-10001}"
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未配置}
+      JWT_EXPIRE_MINUTES: 720
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD 未配置}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-8}
+      SEED_DEMO_USERS: "false"
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-5}
+      LOGIN_FAILURE_WINDOW_SECONDS: ${LOGIN_FAILURE_WINDOW_SECONDS:-300}
+      LOGIN_LOCKOUT_SECONDS: ${LOGIN_LOCKOUT_SECONDS:-900}
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USERNAME: iot-gateway
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD 未配置}
+      MQTT_CLIENT_ID: iot-gateway
+      MQTT_PASSWORD_FILE: /run/secrets/mosquitto.passwd
+      MQTT_PASSWORD_FILE_MODE: 644
+      MQTT_RELOAD_COMMAND: ""
+      MQTT_WEB_USERNAME: ${MQTT_WEB_USERNAME:-web-console}
+      MQTT_WEB_PASSWORD: ${MQTT_WEB_PASSWORD:?MQTT_WEB_PASSWORD 未配置}
+      MQTT_MOBILE_USERNAME: ${MQTT_MOBILE_USERNAME:-mobile-console}
+      MQTT_MOBILE_PASSWORD: ${MQTT_MOBILE_PASSWORD:?MQTT_MOBILE_PASSWORD 未配置}
+      CORS_ORIGINS: ${PUBLIC_ORIGIN:-https://localhost}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 目录级挂载：凭证轮换需要同目录原子写临时文件
+      - ./prod/secrets:/run/secrets:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+      args:
+        VITE_API_BASE: ""
+        VITE_MQTT_WS: "/mqtt"
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./prod/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./prod/nginx/snippets:/etc/nginx/snippets:ro
+      - ./prod/nginx/certs:/etc/nginx/certs:ro
+      - ./prod/nginx/acme:/var/www/acme:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  postgres-data:
+  mosquitto-data:
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+    # 数据库网络不出网：postgres 只连 backend，gateway 同时连 edge/backend
+    internal: true

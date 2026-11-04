@@ -60,14 +60,21 @@ class ApiConfig {
 
   /// 由网关地址推导 MQTT over WebSocket 地址。
   ///
-  /// 手机端与浏览器一样无法直连 TCP 1883，实时链路固定走 Broker 的 9001
-  /// WebSocket 端口；主机沿用网关地址，便于界面只维护一个网关输入框。
+  /// 手机端与浏览器一样无法直连 TCP 1883，实时链路固定走 Broker 的
+  /// WebSocket 监听；主机沿用网关地址，便于界面只维护一个网关输入框。
+  ///
+  /// - 开发 HTTP：直连 Broker 的 9001（`ws://host:9001`）；
+  /// - 生产 HTTPS：经反代走 443 的 `/mqtt`（`wss://host/mqtt`），
+  ///   与 Web 后台同一入口，不在公网暴露 9001。
   static String realtimeUrl(String baseUrl, {int port = 9001}) {
     final uri = Uri.tryParse(normalize(baseUrl));
     if (uri == null || uri.host.isEmpty) {
       return '';
     }
-    final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
-    return '$scheme://${uri.host}:$port';
+    if (uri.scheme == 'https') {
+      final portPart = uri.hasPort ? ':${uri.port}' : '';
+      return 'wss://${uri.host}$portPart/mqtt';
+    }
+    return 'ws://${uri.host}:$port';
   }
 }

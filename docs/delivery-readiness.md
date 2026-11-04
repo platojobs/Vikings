@@ -1,12 +1,14 @@
-# 交付就绪审计（v1.15.1）
+# 交付就绪审计（v1.15.1，状态更新至 v1.18.0）
 
 > 审计日期：2026-11-05
 > 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
 > 审计基线：`v1.15.0`（提交 `f77af2d`）
+> 状态更新：P0-2 于 v1.16.0 完成、P0-3 于 v1.17.0 完成、P0-1 于 v1.18.0 完成；
+> P0 阻断项已全部关闭。
 
 ## 总体结论
 
-**功能闭环和自动化测试已经达到「可演示、可验收」；P0-2（默认凭据与登录防护）已于 v1.16.0 完成，P0-3（Broker 鉴权与设备凭证）已于 v1.17.0 完成，但离「别人拿到就能安全部署上线」仍有 1 个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）。** 补齐 P0-1 后即可交付；其余 P1 决定上线后的可运维性与口碑。
+**功能闭环、自动化测试与生产部署入口均已就绪。P0-2（默认凭据与登录防护）于 v1.16.0 完成，P0-3（Broker 鉴权与设备凭证）于 v1.17.0 完成，P0-1（生产部署入口：Dockerfile / 反代 / HTTPS）于 v1.18.0 完成并已真实起栈验收。** 三个 P0 阻断项全部关闭，可以交付；其余 P1 决定上线后的可运维性与口碑。
 
 已确认做得好、不需要返工的部分：
 
@@ -19,7 +21,7 @@
 
 ## P0（阻断交付，必须做）
 
-### P0-1 生产部署入口缺失：无 Dockerfile、无反代/HTTPS，一键脚本仅支持 macOS
+### P0-1 生产部署入口缺失：无 Dockerfile、无反代/HTTPS，一键脚本仅支持 macOS ✅ 已完成（v1.18.0）
 
 - **现状证据**
   - `infra/docker-compose.yml:1-4` 明确写着「本文件只编排基础设施；生产部署请为 gateway / web 补 Dockerfile」；实际仅 `mosquitto` 与 `postgres` 两个服务（同文件 `services:` 下）。
@@ -34,6 +36,42 @@
   4. 新增 `.env.production.example` 与 `docker compose up -d` 启动说明；保留 `start_all.sh` 作为 macOS 开发路径。
 - **预估工作量**：2~3 人日（含一次云主机实测）。
 - **依赖关系**：依赖 P0-2 的密钥注入方式与 P0-3 的 Broker 凭证配置；可先起骨架，最后联调。
+- **完成证据（v1.18.0）**
+  - **镜像**：`gateway/Dockerfile`（`python:3.12-slim` 多阶段、uid/gid 10001 非 root、
+    `HEALTHCHECK` 要求 `mqttConnected == true`）；`web/Dockerfile`（`node:20-alpine` 构建 →
+    `nginxinc/nginx-unprivileged:1.27-alpine` 静态托管，监听 8080）。
+    本机 `docker build` 均 exit 0：`iot-gateway:verify` 345MB、`iot-web:verify` 78.9MB。
+  - **生产编排**：`infra/docker-compose.prod.yml`（`name: iot-prod`）含 postgres / mosquitto /
+    gateway / web / proxy；`depends_on.condition: service_healthy`、`restart: unless-stopped`、
+    命名卷持久化、`backend` 网络 `internal: true`；只发布 80/443 与 1883，
+    gateway:8000 / web:8080 / broker:9001 / postgres:5432 均不出网。
+  - **反代与 HTTPS**：`infra/prod/nginx/` 提供 80→443 跳转、ACME webroot、TLS 1.2/1.3、
+    HSTS/nosniff/DENY/Referrer-Policy/Permissions-Policy/CSP；`/api` 透传 Authorization 与
+    `X-Forwarded-*`，`= /mqtt` 升级 WebSocket；登录 `limit_req` 以 snippet 形式可选启用。
+  - **一键启动**：`scripts/prod_up.sh` 只依赖 docker/compose/openssl/python3，首次自动生成
+    `infra/prod/.env`（随机 JWT/PG/管理员口令、`DEPLOY_UID/GID`）、Mosquitto 服务/客户端凭证、
+    自签证书，再 `up -d --build` 并轮询 5 服务健康（最多 180s）；拒绝 root 部署。
+  - **密钥治理**：`infra/prod/.env.example` 列全量必填项并标注生成方式；`.env`、`secrets/`、
+    `cert/`、ACME 目录与 Broker 数据全部进 `.gitignore`；`.dockerignore` 排除密钥与构建产物。
+  - **真实起栈验收（macOS + colima，HTTP_PORT=8080 HTTPS_PORT=8443）**
+    - 5 服务全部 `healthy`：postgres、mosquitto、gateway、web、proxy；
+    - `https://localhost:8443` 管理员登录 `token_len=144`；`mqtt-credentials` web/mobile
+      均 `code:0`（口令长度 43）；`/api/devices` total=4（dev-0001..dev-0004）；
+      `/api/records/latest` 返回真实记录（id=5，23.42°C，`2026-11-04T18:43:26.714Z`）；
+    - HTTP 80 返回 301，HTTPS 响应含全部安全头；
+    - `simulate_device.py` 带凭证走 1883 上报成功，WSS `GET /mqtt` 101 + CONNACK rc=0，
+      收到 `device/dev-0001/sensor/report`，与 REST latest 一致；
+    - 匿名 `tcp:1883` 与 `websockets:8443/mqtt` 均 CONNACK rc=135（回归 P0-3）；
+    - `APP_ENV=production` + 默认密钥运行镜像退出码 3，列出 JWT/ADMIN/DB/MQTT 缺失或弱值
+      （回归 P0-2）；
+    - `docker compose down`（保留卷）后 `up -d`：5 服务重新 healthy，设备仍为 4 台，
+      latest 记录 id/温度/时间戳完全一致（持久化成立）。
+  - **CI**：新增 `images` 作业，只构建 gateway/web 镜像，不起栈；既有四作业保持不变。
+  - **文档**：`docs/deployment.md`（从零部署、端口网络、证书、升级、备份衔接、故障排查、
+    人工验收清单、已知边界）、`docs/operations.md`（启停/日志/凭证轮换/备份恢复/回滚/
+    证书续期）、README 顶部生产部署入口、`docs/contracts.md` 1.2 反代与外部端点。
+  - **回归**：gateway `pytest` 87 passed；`flutter analyze` 无问题；`flutter test` 67 passed；
+    `web npm run test` 7 passed；`web npm run build` 成功；真实 E2E 25/25 PASS。
 
 ### P0-2 默认密钥与演示账号可直接登录，且无登录限流 ✅ 已完成（v1.16.0）
 
@@ -99,7 +137,8 @@
   - README「4.2.2 Broker 鉴权与凭证管理」、`docs/contracts.md` 1.1 鉴权矩阵与凭证接口、
     `docs/releases/v1.17.0.md` 已同步。
 
-> P0 共 3 项，其中 P0-2 已在 v1.16.0 完成、P0-3 已在 v1.17.0 完成；剩余 P0-1。不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
+> P0 共 3 项：P0-2 已在 v1.16.0 完成、P0-3 已在 v1.17.0 完成、P0-1 已在 v1.18.0 完成；
+> **P0 阻断清单已清空**。不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
 
 ---
 
@@ -162,7 +201,7 @@
 - **预估工作量**：1~2 人日。
 - **依赖关系**：签名密钥需在仓库 secrets 配置，需仓库管理员配合。
 
-### P1-6 缺部署/运维手册，README 只覆盖 macOS 开发路径
+### P1-6 缺部署/运维手册，README 只覆盖 macOS 开发路径 ✅ 已完成（v1.18.0）
 
 - **现状证据**
   - `README.md:120-176` 快速开始全部围绕 `brew`、本机地址与开发脚本；`docs/` 仅有 `architecture.md` / `contracts.md` / `releases/`。
@@ -172,6 +211,13 @@
 - **建议做法**：新增 `docs/deployment.md`（Docker/反代/HTTPS/环境变量/端口/凭据）与 `docs/operations.md`（监控、备份恢复、升级回滚、证书续期、故障排查）；README 快速开始保留并链接。
 - **预估工作量**：1 人日。
 - **依赖关系**：P0-1、P1-2 落地后按实际命令编写，避免文档与实现再次漂移。
+- **完成证据（v1.18.0）**
+  - 新增 `docs/deployment.md`：前置条件、两步启动、端口与网络隔离、自签与 ACME/正式证书替换、
+    环境变量表、健康检查与日志、升级回滚、备份衔接、故障排查、人工验收清单、已知边界；
+  - 新增 `docs/operations.md`：启停与状态、日志查看、凭证轮换（设备/吊销/客户端/新增）、
+    备份与恢复、回滚、证书续期、数据保留与安全例行检查；
+  - `README.md` 顶部新增「生产部署（v1.18.0）」区块，指向以上两份文档。
+  - P1-2 的定时备份与恢复演练仍待补，文档中已给出当前可用的 `pg_dump`/卷备份命令。
 
 ### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证
 

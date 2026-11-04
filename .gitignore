@@ -45,3 +45,10 @@ data/
 infra/mosquitto/passwd
 infra/mosquitto/passwd.tmp
 infra/mosquitto/*.passwd
+infra/mosquitto/data/
+
+# ---- 生产部署密钥 / 证书 / 本地环境（只放 .env.example 模板）----
+infra/prod/.env
+infra/prod/secrets/
+infra/prod/nginx/certs/
+infra/prod/nginx/acme/

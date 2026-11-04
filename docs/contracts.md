@@ -44,6 +44,38 @@ Broker 的 1883（MQTT over TCP）与 9001（MQTT over WebSocket）**均关闭�
 - Web / 移动端是独立只读主体，即使拿到口令也无法通过 9001 发布设备上报 Topic；
 - Mosquitto 对 ACL 拒绝的订阅可能仍返回 SUBACK granted，**隔离以投递结果为准**（收不到消息）。
 
+### 1.2 生产反代与外部端点（v1.18.0）
+
+生产部署只暴露 `80/443/1883`；Broker 的 9001、网关 8000、Web 8080 与 PostgreSQL 5432
+都只在 Docker 内网可达。外部访问语义如下：
+
+| 外部端点 | 内部目标 | 说明 |
+| --- | --- | --- |
+| `https://<host>/api/*` | `gateway:8000` 同路径 | REST 契约不变；`Authorization` 透传，追加 `X-Forwarded-For/Proto` |
+| `https://<host>/mqtt` | `mosquitto:9001` | MQTT over WebSocket；Mosquitto 固定要求路径 `/mqtt` |
+| `https://<host>/` | `web:8080` | 管理后台静态资源与 SPA 回退 |
+| `http://<host>/` | — | 301 跳转 HTTPS（`/.well-known/acme-challenge/` 除外） |
+| `<host>:1883` | `mosquitto:1883` | 设备 MQTT over TCP，账号口令 + ACL 不变 |
+
+客户端地址推导（v1.18.0 起）：
+
+- **Web**：生产构建写入 `VITE_API_BASE=""`、`VITE_MQTT_WS="/mqtt"`，
+  运行时按页面协议拼成同源 `https://<host>/api` 与 `wss://<host>/mqtt`；
+- **移动端**：网关填 `https://<host>` 时自动推导 `wss://<host>/mqtt`；
+  开发 HTTP 仍推导 `ws://<host>:9001`；也可在实时地址字段手动覆盖；
+- 客户端凭证仍由 `GET /api/auth/mqtt-credentials?client=web|mobile` 下发，
+  反代只透传请求，不参与鉴权，也不改变任何 Topic 语义。
+
+反代附加的安全头（不影响 JSON 契约）：
+
+- `Strict-Transport-Security`（HSTS）、`X-Content-Type-Options: nosniff`、
+  `X-Frame-Options: DENY`、`Referrer-Policy: strict-origin-when-cross-origin`、
+  `Permissions-Policy`、CSP（`default-src 'self'`，允许同源 `wss` 与内联样式）。
+- 登录路径 `/api/auth/login` 支持可选 `limit_req`（默认关闭，网关自身已有 IP+账号锁定）；
+  `limit_req_status=429`，与网关限流的 429 语义一致。
+
+自签证书验证时 `curl` 需 `-k` 或 `--cacert`；正式部署必须替换为受信任证书。
+
 ---
 
 ## 2. MQTT 消息体（JSON，UTF-8）

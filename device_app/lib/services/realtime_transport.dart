@@ -57,7 +57,7 @@ class MqttWebSocketTransport implements RealtimeTransport {
     ],
   });
 
-  /// 形如 `ws://192.168.1.8:9001`。
+  /// 形如 `ws://192.168.1.8:9001`；生产 HTTPS 可为 `wss://域名/mqtt`。
   final String url;
   final String clientId;
 
@@ -86,10 +86,12 @@ class MqttWebSocketTransport implements RealtimeTransport {
     if (uri.host.isEmpty) {
       throw RealtimeConnectException('实时地址无效：$url');
     }
+    // mqtt_client 的 WebSocket 连接需要完整 ws(s):// URL（裸主机名会因缺少
+    // scheme 被拒绝）；传完整 URL 还能保留路径，生产环境可走反代的 /mqtt。
     final client = MqttServerClient.withPort(
-      uri.host,
+      url,
       clientId,
-      uri.hasPort ? uri.port : 9001,
+      uri.hasPort ? uri.port : (uri.scheme == 'wss' ? 443 : 9001),
     );
     client.useWebSocket = true;
     client.logging(on: false);

@@ -1,0 +1,25 @@
+# Docker 构建上下文排除项：避免把依赖、构建产物与本地密钥打进镜像
+.git
+.gitignore
+.github
+docs
+device_app
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/node_modules
+web/dist
+web/.vite
+web/*.local
+logs
+data
+.run
+infra/prod/.env
+infra/prod/secrets
+infra/prod/nginx/certs
+infra/mosquitto/passwd
+infra/mosquitto/passwd.tmp
+infra/mosquitto/data
+*.db
+*.sqlite3

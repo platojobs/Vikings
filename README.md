@@ -6,6 +6,11 @@
 
 架构目标：贴合真实中小 IoT 公司的生产架构，而不是"学生玩具项目"。
 
+> **生产部署（v1.18.0）**：一台干净机器执行 `./scripts/prod_up.sh`，
+> 即可构建并拉起 PostgreSQL + Mosquitto + 网关 + Web + HTTPS 反代（含健康检查、数据卷与网络隔离）。
+> 完整步骤、端口、证书替换、升级备份与人工验收命令见 **[docs/deployment.md](docs/deployment.md)**；
+> 日常启停、日志、凭证轮换与回滚见 [docs/operations.md](docs/operations.md)。
+
 ---
 
 ## 1. 技术栈
@@ -80,9 +85,11 @@
 │   ├── architecture.md        架构设计与决策说明
 │   └── contracts.md           三端接口契约（Topic / REST / 表结构 / 阈值）
 ├── infra/
-│   ├── mosquitto/mosquitto.conf   双端口 Broker 配置
+│   ├── mosquitto/                 双端口 Broker 配置 + ACL
 │   ├── postgres/init.sql          建表 + 索引 + 种子数据（幂等）
-│   └── docker-compose.yml         Broker + PostgreSQL 编排
+│   ├── docker-compose.yml         本地开发依赖编排
+│   └── docker-compose.prod.yml    生产全栈编排（反代 / HTTPS / 健康检查）
+├── infra/prod/                    生产 env 模板、nginx、Broker 配置、密钥目录（gitignored）
 ├── gateway/                   Python IoT 网关
 │   ├── app/
 │   │   ├── main.py            FastAPI 入口与生命周期

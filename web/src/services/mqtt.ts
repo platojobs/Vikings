@@ -44,6 +44,22 @@ function notifyStatus(next: boolean): void {
   statusHandlers.forEach((handler) => handler(connected))
 }
 
+/**
+ * 解析 MQTT WebSocket 地址。
+ * - 未配置：开发默认 ws://127.0.0.1:9001
+ * - 以 `/` 开头（生产构建传 `/mqtt`）：按当前页面同源拼成 ws(s)://<host>/mqtt，
+ *   由反代转发到 Broker 的 WebSocket 监听，页面无需知道内部端口。
+ */
+function resolveMqttUrl(configured?: string): string {
+  const value = configured?.trim()
+  if (!value) return 'ws://127.0.0.1:9001'
+  if (value.startsWith('/')) {
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    return `${scheme}://${window.location.host}${value}`
+  }
+  return value
+}
+
 /** 懒创建连接，全应用只保留一个 client；先换取只读凭证再连 Broker */
 function ensureClient(): void {
   if (client || initStarted) return
@@ -59,7 +75,8 @@ async function initClient(): Promise<void> {
       throw new Error('未登录，无法换取 MQTT 只读凭证')
     }
     const apiBase = (
-      import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+      import.meta.env.VITE_API_BASE ||
+      (import.meta.env.PROD ? '' : 'http://127.0.0.1:8000')
     ).replace(/\/+$/, '')
     const response = await fetch(
       `${apiBase}/api/auth/mqtt-credentials?client=web`,
@@ -86,7 +103,7 @@ async function initClient(): Promise<void> {
     return
   }
 
-  const url = import.meta.env.VITE_MQTT_WS || 'ws://127.0.0.1:9001'
+  const url = resolveMqttUrl(import.meta.env.VITE_MQTT_WS)
   const clientId = `web-console-${Math.random().toString(16).slice(2, 10)}-${Date.now().toString(36)}`
 
   client = mqtt.connect(url, {

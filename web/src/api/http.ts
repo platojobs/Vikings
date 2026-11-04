@@ -1,7 +1,8 @@
 /**
  * 统一 HTTP 封装（不引入 axios，基于原生 fetch）。
  *
- * - Base URL 来自环境变量 VITE_API_BASE，默认 http://127.0.0.1:8000
+ * - Base URL 来自环境变量 VITE_API_BASE：
+ *   开发默认 http://127.0.0.1:8000；生产构建（PROD）默认同源，由反代转发 /api
  * - 自动携带 Authorization: Bearer <token>
  * - 按契约解析 { code, message, data }，code !== 0 统一 ElMessage 报错并抛异常
  */
@@ -10,7 +11,10 @@ import { ElMessage } from 'element-plus'
 import { clearAuth, getToken } from '@/utils/auth'
 import type { ApiEnvelope } from '@/types'
 
-const API_BASE = (import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000').replace(/\/+$/, '')
+const API_BASE = (
+  import.meta.env.VITE_API_BASE ||
+  (import.meta.env.PROD ? '' : 'http://127.0.0.1:8000')
+).replace(/\/+$/, '')
 
 type QueryValue = string | number | boolean | null | undefined
 

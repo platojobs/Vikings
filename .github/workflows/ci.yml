@@ -65,6 +65,19 @@ jobs:
       - run: flutter analyze
       - run: flutter test
 
+  images:
+    name: 生产镜像构建（gateway + web）
+    runs-on: ubuntu-latest
+    # 只验证镜像能构建成功，不起全栈，避免与 e2e 端口冲突
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: 构建 gateway 镜像
+        run: docker build -f gateway/Dockerfile -t iot-gateway:ci .
+      - name: 构建 web 镜像
+        run: docker build -f web/Dockerfile -t iot-web:ci .
+
   e2e:
     name: 真实 Broker 端到端验收
     runs-on: ubuntu-latest
