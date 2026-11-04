@@ -12,7 +12,7 @@
 
 - 所有写操作都有审计：`grep audit_service.log(` 覆盖登录、设备、告警、指令、OTA、阈值、账号，动作常量集中在 `gateway/app/services/audit_service.py`；
 - 已有 `/api/health` 存活探针并暴露 Broker 连接状态（`gateway/app/api/routes/stats.py:22-35`）；
-- 自动化基线真实可跑：gateway `pytest` 86 条、Flutter 67 条、Web 7 条、真实 Broker E2E 25/25；
+- 自动化基线真实可跑：gateway `pytest` 87 条、Flutter 67 条、Web 7 条、真实 Broker E2E 25/25；
 - OTA 代码链路完整（任务创建 → 指令下发 → 模拟器进度回执），只是缺 E2E 覆盖（`gateway/app/api/routes/ota.py:14-47`、`scripts/simulate_device.py:111-116`）。
 
 ---
@@ -176,7 +176,7 @@
 ### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证
 
 - **现状证据**
-  - 本地真实执行：gateway `pytest -q` 86 条、`flutter test` 67 条、`npm run test` 7 条、E2E 25/25 PASS。
+  - 本地真实执行：gateway `pytest -q` 87 条、`flutter test` 67 条、`npm run test` 7 条、E2E 25/25 PASS。
   - `scripts/e2e/e2e_acceptance.py` 覆盖上报/状态/告警/指令/分组/批量确认，但 `grep -n 'ota|OTA'` 无命中——OTA 未进 E2E。
   - 网关测试使用临时 SQLite（`gateway/tests/test_http_regression.py` 的 `sqlite+aiosqlite`），CI 无 PostgreSQL 作业。
   - 无「数据库不可用/磁盘满/网络超时」故障注入；无真机/真网络自动化（Widget 测试注入 fake）。

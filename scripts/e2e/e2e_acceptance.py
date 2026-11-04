@@ -220,6 +220,8 @@ def provision_mqtt_credentials(ctx: Context) -> str:
         if not source.exists():
             raise RuntimeError(f"缺少 ACL 文件：{source}")
         shutil.copy2(source, mosq_dir / name)
+        # Mosquitto 对 world-readable 的 ACL 会告警，未来版本将拒绝加载
+        os.chmod(mosq_dir / name, 0o600)
 
     password_file = mosq_dir / "passwd"
     write_password_file(password_file, {})

@@ -185,6 +185,9 @@ python scripts/mqtt_credentials.py init \
   --device-id dev-0001 --device-id dev-0002
 ```
 
+口令文件使用 PBKDF2-SHA512，盐固定 12 字节：Ubuntu 自带的 Mosquitto 2.0.x
+只接受 12 字节盐，2.1.x 同时接受 12/64，因此该格式可在两者间迁移。
+
 **签发 / 轮换 / 吊销设备凭证**（用户名恒等于 `deviceId`）：
 
 ```bash

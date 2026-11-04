@@ -1,6 +1,7 @@
 """v1.17.0：设备凭证签发/轮换、客户端只读凭证与 Broker 口令文件格式。"""
 
 import asyncio
+import base64
 import stat
 
 from httpx import ASGITransport, AsyncClient
@@ -42,6 +43,16 @@ def test_hash_format_is_mosquitto_pbkdf2_sha512():
     assert stored.startswith("$7$1000$")
     assert verify_hash("device-secret", stored)
     assert not verify_hash("wrong-secret", stored)
+
+
+def test_hash_salt_is_12_bytes_for_mosquitto_2_0_compat():
+    """Ubuntu 自带的 Mosquitto 2.0.x 只接受 12 字节盐，2.1.x 接受 12/64。"""
+    stored = hash_password("device-secret")
+    _empty, prefix, iterations, salt_b64, digest_b64 = stored.split("$")
+    assert prefix == "7"
+    assert int(iterations) == 1000
+    assert len(base64.b64decode(salt_b64)) == 12
+    assert len(base64.b64decode(digest_b64)) == 64
 
 
 def test_password_file_contains_hash_only(tmp_path):

@@ -6,8 +6,10 @@ Mosquitto 2.x 的 `sha512-pbkdf2` 密码文件格式为（默认 iterations=1000
 
     username:$7$1000$<base64 salt>$<base64 pbkdf2-sha512 digest>
 
-本模块生成的记录与 `mosquitto_passwd -H sha512-pbkdf2` 完全兼容；
-Broker 仍使用官方实现的校验逻辑，网关与脚本不参与登录校验。
+盐固定使用 12 字节：Ubuntu 20.04/22.04/24.04 自带的 Mosquitto 2.0.x
+只接受 `salt_len == 12`，而 2.1.x 同时接受 12 与 64，因此 12 字节是跨版本安全值。
+摘要固定 64 字节（SHA-512 输出）。Broker 仍使用官方实现的校验逻辑，
+网关与脚本不参与登录校验。
 """
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 # Mosquitto 2.x 默认 PBKDF2-SHA512 迭代次数；与 mosquitto_passwd 输出一致
 PBKDF2_SHA512_ITERATIONS = 1000
-SALT_BYTES = 64
+# 12 字节：兼容 Mosquitto 2.0.x（只接受 12）与 2.1.x（接受 12/64）
+SALT_BYTES = 12
 HASH_BYTES = 64
 
 # 固定服务/客户端身份名称：与 infra/mosquitto/acl.* 严格对应
@@ -163,7 +166,7 @@ topic write device/system/alert
 topic write device/system/group
 topic readwrite gateway/status
 
-pattern read device/%u/cmd
+pattern read device/%u/#
 pattern write device/%u/sensor/report
 pattern write device/%u/status
 pattern write device/%u/cmd/ack
