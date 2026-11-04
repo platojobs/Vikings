@@ -8,7 +8,7 @@ uvicorn[standard]>=0.29
 aiomqtt>=2.0
 
 # 异步 ORM + 驱动
-SQLAlchemy[asyncio]>=2.0
+SQLAlchemy[asyncio]>=2.1.6
 asyncpg>=0.29          # PostgreSQL 生产驱动
 aiosqlite>=0.19        # SQLite 本地开箱即用驱动（零依赖启动）
 
