@@ -289,8 +289,12 @@
       `apksigner verify --print-certs` 显示测试证书 DN，版本 `1.22.0 (21)`；
     - 移除签名材料后重新构建，Gradle 输出降级 WARNING，
       `apksigner` 显示 `CN=Android Debug`，产物按规则命名为 `-debug-signed`；
-    - CI 真实 run 的 artifact 名称/大小与「无 Node.js 20 警告」证据见
-      `docs/releases/v1.22.0.md`。
+    - CI 真实 run（[41912873049](https://github.com/platojobs/Vikings/actions/runs/41912873049)，
+      `e3a21f2`）7 作业全绿；artifact
+      `iot-device-app-1.22.0-snapshot.e3a21f2-debug-signed` 大小 78,180,722 bytes，
+      APK 52M / AAB 51M；日志无 `Node.js 20` 弃用提示，
+      实际运行 checkout@v7、setup-node@v7、setup-python@v7、upload-artifact@v7、
+      cache@v6、setup-buildx@v4。
 
 ### P1-6 缺部署/运维手册，README 只覆盖 macOS 开发路径 ✅ 已完成（v1.18.0）
 
