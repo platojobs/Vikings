@@ -1,0 +1,222 @@
+# 交付就绪审计（v1.15.1）
+
+> 审计日期：2026-11-05
+> 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
+> 审计基线：`v1.15.0`（提交 `f77af2d`）
+
+## 总体结论
+
+**功能闭环和自动化测试已经达到「可演示、可验收」，但离「别人拿到就能安全部署上线」仍有三个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）、默认凭据与登录防护不足、Broker 匿名接入且无设备凭证。** 补齐这 3 项 P0 后即可交付；其余 P1 决定上线后的可运维性与口碑。
+
+已确认做得好、不需要返工的部分：
+
+- 所有写操作都有审计：`grep audit_service.log(` 覆盖登录、设备、告警、指令、OTA、阈值、账号，动作常量集中在 `gateway/app/services/audit_service.py`；
+- 已有 `/api/health` 存活探针并暴露 Broker 连接状态（`gateway/app/api/routes/stats.py:22-35`）；
+- 自动化基线真实可跑：gateway `pytest` 67 条、Flutter 67 条、Web 7 条、真实 Broker E2E 23/23；
+- OTA 代码链路完整（任务创建 → 指令下发 → 模拟器进度回执），只是缺 E2E 覆盖（`gateway/app/api/routes/ota.py:14-47`、`scripts/simulate_device.py:111-116`）。
+
+---
+
+## P0（阻断交付，必须做）
+
+### P0-1 生产部署入口缺失：无 Dockerfile、无反代/HTTPS，一键脚本仅支持 macOS
+
+- **现状证据**
+  - `infra/docker-compose.yml:1-4` 明确写着「本文件只编排基础设施；生产部署请为 gateway / web 补 Dockerfile」；实际仅 `mosquitto` 与 `postgres` 两个服务（同文件 `services:` 下）。
+  - 全仓 `find . -maxdepth 4 \( -iname 'Dockerfile*' -o -iname 'nginx*' -o -iname 'Caddyfile*' \)` 无输出。
+  - `scripts/start_all.sh:12-15` 使用 `/opt/homebrew/...` 绝对路径，`README.md:122-126` 前置依赖是 `brew install ...`；Linux/云主机无法直接跑。
+  - `README.md:140-146` 入口全部是 `http://127.0.0.1:*`，无 TLS/域名/反代说明。
+- **缺口**：拿到仓库的人无法在 Linux/云主机上一条命令起完整服务；生产只能裸 HTTP，移动端与 Web 的凭据在网络上明文传输。
+- **建议做法**
+  1. 新增 `gateway/Dockerfile`（Python 3.12 + uvicorn）、`web/Dockerfile`（Node 构建 + nginx 静态托管）；
+  2. 扩展 `infra/docker-compose.yml` 增加 `gateway` / `web` / `reverse-proxy` 服务与 healthcheck，复用现有 `mosquitto` / `postgres`；
+  3. 提供 `infra/Caddyfile` 或 nginx 配置（443 + 自动证书 + WebSocket 升级 9001/API 代理）；
+  4. 新增 `.env.production.example` 与 `docker compose up -d` 启动说明；保留 `start_all.sh` 作为 macOS 开发路径。
+- **预估工作量**：2~3 人日（含一次云主机实测）。
+- **依赖关系**：依赖 P0-2 的密钥注入方式与 P0-3 的 Broker 凭证配置；可先起骨架，最后联调。
+
+### P0-2 默认密钥与演示账号可直接登录，且无登录限流
+
+- **现状证据**
+  - `gateway/app/config.py:33-36`：`jwt_secret = "change-me-in-production"`、`admin_username = "admin"`、`admin_password = "admin123"`（注释写「禁止硬编码」，但默认值仍是硬编码口令）。
+  - `gateway/app/services/user_service.py:25-29,32-68`：表为空时无条件创建 `operator/operator123`、`viewer/viewer123`，并与默认 admin 一起落库；`README.md:148-150` 公开写明这些账号。
+  - `gateway/app/schemas.py:100-102` 登录入参只要求 `min_length=1`；`gateway/app/api/routes/auth.py:16-33` 无失败计数、无锁定、无限流。
+  - `infra/docker-compose.yml:27-30` PostgreSQL 口令硬编码 `iot_pass`。
+  - `gateway/app/config.py:34` token 固定 720 分钟，`gateway/app/security.py` 无刷新/吊销机制。
+- **缺口**：公网暴露即等同默认管理员权限；暴力破解无成本；口令可任意短；数据库口令随仓库分发。
+- **建议做法**
+  1. 启动时若 `jwt_secret` 仍为默认值或 `admin_password` 仍为 `admin123` 且 `APP_ENV=production`，直接 fail-fast 拒绝启动；
+  2. 生产关闭演示账号种子（新增 `seed_demo_accounts=false` 开关），`admin_password` 从 secret 注入；
+  3. 登录限流（网关内 `slowapi` 或反代层限制 IP+用户名，5 次/分钟、失败指数退避）；
+  4. 新建/重置口令最小长度 8~12 并做基础强度校验；PostgreSQL 口令改为 compose 环境变量注入；
+  5. token 策略至少做到「短 TTL + 刷新」，或提供服务端吊销（P2 可细化）。
+- **预估工作量**：1~2 人日。
+- **依赖关系**：与 P0-1 的环境变量体系一起落地；限流可独立先做。
+
+### P0-3 Broker 匿名接入，设备无凭证/无 ACL
+
+- **现状证据**
+  - `infra/mosquitto/mosquitto.conf:7,12`：1883 与 9001 均 `allow_anonymous true`，注释自认「生产环境请关闭」。
+  - `gateway/app/models.py:32-49` 的 `Device` 无凭证/密钥字段；`gateway/app/api/routes/devices.py` 的注册/导入只建元数据，不签发设备身份。
+  - `gateway/app/config.py:27-28` 网关自身支持 `mqtt_username/password`，但没有按设备维度的账号体系。
+- **缺口**：任何能访问 1883/9001 的人都能伪造上报、状态、告警、指令回执，污染数据并绕过云端权限（Web 端 JWT 只能保护 REST，保护不了 MQTT）。
+- **建议做法**
+  1. Mosquitto 启用 `password_file` + `acl_file`，设备只能发布自己的 `device/{id}/...`、订阅自己的 `cmd`；
+  2. 网关新增设备凭证签发/轮换（注册或首次激活时下发，密码只存哈希/加密值）；
+  3. Web/移动端连接使用独立只读账号或短期 token（9001 侧按角色限 Topic）；
+  4. 开发环境保留匿名 profile，生产 profile 强制鉴权；contracts 与部署文档同步。
+- **预估工作量**：2~3 人日（含凭证生命周期与迁移）。
+- **依赖关系**：依赖 P0-1 的部署 profile 划分；与设备注册流程（当前仅元数据）一起改。
+
+> P0 只保留以上 3 项：不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
+
+---
+
+## P1（可交付，但上线后会被运维/客户抱怨）
+
+### P1-1 可观测性只有存活探针，缺请求日志、指标与自身健康告警
+
+- **现状证据**
+  - `gateway/app/main.py:26-29` 仅 `logging.basicConfig` 文本日志，无请求 ID / 访问日志 / 状态码与耗时。
+  - `gateway/app/api/routes/stats.py:22-35` 的 `/api/health` 只返回 `mqttConnected` 等字段，不查数据库，无法区分「进程活着但 DB 不可用」。
+  - 全仓 `grep -RilE 'prometheus|opentelemetry|sentry' gateway/app web/src` 无业务侧命中；无 `/metrics`。
+- **缺口**：线上 5xx、慢查询、Broker 掉线、DB 故障没有统一观测入口；也没有「网关自身健康」的告警规则。
+- **建议做法**：JSON 结构化日志 + 请求 ID 中间件；新增 `/api/health/ready`（DB `SELECT 1` + Broker 状态）；暴露 Prometheus 指标（请求数/延迟/5xx、MQTT 消息数、告警未处理数）；为 `mqttConnected=false`、5xx 比例、健康探针失败配置告警。
+- **预估工作量**：1~2 人日。
+- **依赖关系**：无强依赖，可与 P0-1 并行；指标暴露依赖部署侧抓取配置。
+
+### P1-2 数据生命周期只清理 records，告警/审计无限增长，且无备份恢复方案
+
+- **现状证据**
+  - `gateway/app/background_tasks.py:45-70` 只删除 `SensorRecord`，保留期来自 `gateway/app/config.py:47`（90 天）。
+  - `device_alert` 与 `audit_log` 无任何清理逻辑（同上文件仅 import `Device, SensorRecord`）。
+  - `gateway/app/models.py:77-80` 告警索引只有 `created_at` 与 `(device_id, metric, created_at)`，没有 `status` 索引；而告警中心默认查 `status=open`。
+  - `grep -nE '备份|pg_dump|restore|恢复策略' README.md docs/*.md` 无结果。
+- **缺口**：告警表长期膨胀、open 查询随数据量变慢；误删/磁盘故障无恢复路径。
+- **建议做法**：按表配置保留期（如 acked 告警 180 天、审计 365 天），分批删除；新增 `(status, created_at)` 索引；补充 `pg_dump` 定时备份 + 恢复演练 runbook（含 SQLite 演示路径）。
+- **预估工作量**：1~2 人日。
+- **依赖关系**：与 P1-3 的迁移机制一起做，避免直接改表无版本记录。
+
+### P1-3 无正式数据库迁移机制，`create_all` + 手写补列不可持续
+
+- **现状证据**
+  - `gateway/app/database.py:53-77`：启动时 `Base.metadata.create_all`，仅手写补 `device.group_name` 一列。
+  - `infra/postgres/init.sql` 只在容器首次初始化执行（`infra/docker-compose.yml:36`），后续结构变更无版本化。
+  - 全仓无 `alembic` / `migrations` 目录。
+- **缺口**：升级已有环境时新列/新索引/类型变更容易漏，回滚无依据；SQLite 与 PostgreSQL 两套结构易漂移。
+- **建议做法**：引入 Alembic，以当前结构为 baseline，后续每次变更生成 revision；CI 增加「空库升级到 head」与「旧库升级」测试；保留 `create_all` 仅用于测试。
+- **预估工作量**：1~2 人日。
+- **依赖关系**：P1-2 的表结构变更应排在迁移机制之后。
+
+### P1-4 Web 后台未复用批量确认，告警操作能力落后于移动端
+
+- **现状证据**
+  - `web/src/api/alerts.ts:18-22` 只有单条 `ackAlert`，全文件无 `bulk-ack`。
+  - `web/src/views/AlertsView.vue:8` 只导入 `ackAlert`；页面无多选与批量操作。
+  - 网关 `POST /api/alerts/bulk-ack` 已在 v1.15.0 提供（`gateway/app/api/routes/alerts.py`）。
+- **缺口**：同一产品两端操作能力不一致；Web 值班场景仍要逐条点确认。
+- **建议做法**：Web 告警页增加多选 + 批量确认，复用同一端点；错误按 `acked/already_acked/not_found` 分类提示。
+- **预估工作量**：0.5~1 人日（含路由守卫/组件测试）。
+- **依赖关系**：无；可直接复用既有接口。
+
+### P1-5 移动端无可发布产物：release 仍用 debug 签名，CI 无构建/制品/依赖扫描
+
+- **现状证据**
+  - `device_app/android/app/build.gradle.kts:32-37`：release `signingConfig = signingConfigs.getByName("debug")`，注释仍是 TODO。
+  - `.github/workflows/ci.yml:50-66` 的 `device_app` 作业只有 `pub get / analyze / test`，无 `flutter build`、无 `upload-artifact`。
+  - 全仓无 `.github/dependabot.yml`；`web/package.json` 无 `audit` 脚本，CI 无依赖安全扫描。
+  - v1.15.0 CI 运行日志出现 Node.js 20 弃用提示（actions/checkout@v4、setup-node@v4 被强制跑在 Node 24）。
+- **缺口**：无法产出可安装的正式包；每次发版靠本地手工；供应链风险无基线。
+- **建议做法**：`key.properties` + CI secrets 配置 release 签名；CI 增加 `flutter build apk --release`（或 appbundle）并上传 artifact；启用 Dependabot（npm/pub/pip/actions）；升级 actions 到 v5/v6 消除 Node 20 提示；可选加入 `npm audit` / `pip-audit` 门禁。
+- **预估工作量**：1~2 人日。
+- **依赖关系**：签名密钥需在仓库 secrets 配置，需仓库管理员配合。
+
+### P1-6 缺部署/运维手册，README 只覆盖 macOS 开发路径
+
+- **现状证据**
+  - `README.md:120-176` 快速开始全部围绕 `brew`、本机地址与开发脚本；`docs/` 仅有 `architecture.md` / `contracts.md` / `releases/`。
+  - 部署、反代、证书续期、备份恢复、升级回滚均无独立文档；全仓 `grep` 备份相关无结果。
+  - `infra/docker-compose.yml` 注释要求阅读者自行补生产配置，但没有对应文档。
+- **缺口**：交接/上线依赖原作者口述；新人按 README 只能跑开发环境。
+- **建议做法**：新增 `docs/deployment.md`（Docker/反代/HTTPS/环境变量/端口/凭据）与 `docs/operations.md`（监控、备份恢复、升级回滚、证书续期、故障排查）；README 快速开始保留并链接。
+- **预估工作量**：1 人日。
+- **依赖关系**：P0-1、P1-2 落地后按实际命令编写，避免文档与实现再次漂移。
+
+### P1-7 测试底线存在明确盲区：OTA、PostgreSQL、故障注入与真机验证
+
+- **现状证据**
+  - 本地真实执行：gateway `pytest -q` 67 条、`flutter test` 67 条、`npm run test` 7 条、E2E 23/23 PASS。
+  - `scripts/e2e/e2e_acceptance.py` 覆盖上报/状态/告警/指令/分组/批量确认，但 `grep -n 'ota|OTA'` 无命中——OTA 未进 E2E。
+  - 网关测试使用临时 SQLite（`gateway/tests/test_http_regression.py` 的 `sqlite+aiosqlite`），CI 无 PostgreSQL 作业。
+  - 无「数据库不可用/磁盘满/网络超时」故障注入；无真机/真网络自动化（Widget 测试注入 fake）。
+- **缺口**：OTA 端到端、PostgreSQL 方言差异、基础设施故障路径只能手工验；测试全绿不代表生产同构可用。
+- **建议做法**：E2E 增加 OTA 任务（创建 → 模拟器进度 → 成功/版本更新）；CI 增加 Postgres service 跑一遍 pytest 与迁移；为 DB 断连、Broker 断连补网关降级测试；发布前保留一份真机手工清单（弱网、切后台、权限拒绝、推送）。
+- **预估工作量**：2~3 人日。
+- **依赖关系**：OTA E2E 依赖 P1-5 的模拟器/发布环境无关，可直接做；Postgres CI 依赖 P1-3 迁移骨架。
+
+---
+
+## P2（体验与质量，不阻断交付）
+
+### P2-1 告警级别口径三端不一致
+
+- **现状证据**：规则引擎仅产出 `warning` / `critical`（`gateway/app/rules.py` 与 `docs/contracts.md` 的阈值表）；移动端告警中心暴露 info/notice/warning/critical 四个筛选（`device_app/lib/pages/alert_center_page.dart` 的 `_levelOptions`）；Web 告警页筛选仍为 warning/critical（`web/src/views/AlertsView.vue`）。
+- **缺口**：用户会问「info/notice 为什么永远为空」；两端筛选能力也不对齐。
+- **做法**：明确产品口径——要么规则引擎补充 info/notice 产出，要么移动端隐藏这两级（保留接口兼容）；文档写清楚。
+- **预估**：0.5 人日。**依赖**：无。
+
+### P2-2 告警处置备注缺失
+
+- **现状证据**：`gateway/app/models.py:73-94` 的 `DeviceAlert` 无备注字段；`POST /api/alerts/{id}/ack` 只改状态；`web/src/api/alerts.ts` 与移动端批量确认均无备注入参。
+- **缺口**：确认后无法记录「谁、为什么、怎么处理」，审计只有动作没有处置内容。
+- **做法**：新增 `ack_note` / `acked_by` / `acked_at` 字段与可选入参，单条与批量都支持；列表展示处置人/备注。
+- **预估**：1~1.5 人日。**依赖**：P1-3 迁移机制。
+
+### P2-3 移动端规模化上限写死在页面
+
+- **现状证据**：设备筛选一次拉 200 台（`alert_center_page.dart` 的 `fetchDevices(pageSize: 200)`）；批量确认上限 100 条（`gateway/app/schemas.py` 的 `AlertBulkAckRequest`）。
+- **缺口**：超过 200 台后部分设备无法在下拉中选择；超过 100 条要手工分批。
+- **做法**：设备筛选改远程搜索/下拉分页；批量确认在客户端自动分批并汇总 `acked/not_found`。
+- **预估**：1 人日。**依赖**：无。
+
+### P2-4 认证生命周期与 API 安全头不完整
+
+- **现状证据**：`gateway/app/config.py:34` 固定 720 分钟；无 refresh/ logout/吊销；`gateway/app/main.py` 的 CORS 白名单按 `cors_origins` 配置，但无 CSP/HSTS/安全响应头。
+- **缺口**：token 泄露后 12 小时内无法失效；浏览器侧缺纵深防御。
+- **做法**：短 TTL + refresh token + 服务端 token 版本号（吊销）；反代加 HSTS/CSP/X-Frame-Options；CORS 生产按域名收紧。
+- **预估**：1~2 人日。**依赖**：P0-1 反代、P0-2 token 策略。
+
+### P2-5 CI/运维体验细节
+
+- **现状证据**：`.github/workflows/ci.yml:17-18,37-40` actions 仍为 v4/v5，v1.15.0 运行出现 Node 20 弃用提示；无缓存策略说明（已有 npm cache）；无构建耗时/失败趋势看板。
+- **缺口**：提示噪音、长期维护成本。
+- **做法**：升级 actions、按需加 `concurrency` 取消旧运行、把 E2E 日志 artifact 化（失败时上传）。
+- **预估**：0.5 人日。**依赖**：无。
+
+---
+
+## 建议执行顺序
+
+**第一批（P0，串行启动、部分可并行）**
+
+1. P0-2 默认凭据与登录限流（1~2 天）：先定环境变量与 fail-fast 规则，风险最低、收益最大。
+2. P0-3 Broker 凭证/ACL（2~3 天）：与 P0-2 同期设计，依赖设备注册流程改造。
+3. P0-1 容器化 + 反代/HTTPS（2~3 天）：在 P0-2/P0-3 的 env 方案稳定后做集成，最后用云主机做一次从零部署验收。
+   - 三者可在同一迭代并行设计，但**合并验收必须串行**（先密钥/凭证，再部署）。
+
+**第二批（P1，可并行分组）**
+
+- 可并行：P1-1 可观测性、P1-4 Web 批量确认、P1-5 移动端发布工程（互不冲突）。
+- 需串行：P1-3 迁移机制 → P1-2 数据保留/索引；P1-6 运维文档在 P0/P1-2 落地后编写。
+- P1-7 测试补强贯穿两批：OTA E2E 先做（不依赖部署），PostgreSQL CI 等 P1-3。
+
+**第三批（P2，按客户反馈排序）**
+
+- 优先 P2-1 级别口径与 P2-2 处置备注（直接影响演示解释成本），其余随迭代补齐。
+
+**建议版本切分**
+
+- `v1.16.0`：P0-2 + P0-3 + P1-1（安全与可观测性）；
+- `v1.17.0`：P0-1 + P1-3 + P1-6（可部署与可运维）；
+- `v1.18.0`：P1-2 + P1-4 + P1-5 + P1-7（数据、Web 对齐、发布工程与测试补强）；
+- P2 项穿插或单独小版本。

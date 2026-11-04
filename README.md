@@ -54,7 +54,8 @@
                     └─────────────────┘
 ```
 
-设计要点详见 [docs/architecture.md](docs/architecture.md)，接口契约详见 [docs/contracts.md](docs/contracts.md)。
+设计要点详见 [docs/architecture.md](docs/architecture.md)，接口契约详见 [docs/contracts.md](docs/contracts.md)，
+交付就绪审计与 P0/P1/P2 分级清单详见 [docs/delivery-readiness.md](docs/delivery-readiness.md)。
 
 ### 2.1 为什么这样设计
 
