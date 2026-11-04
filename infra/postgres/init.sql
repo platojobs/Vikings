@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS device (
     name             varchar(128) NOT NULL,
     model            varchar(64)  NOT NULL DEFAULT 'VG-S100',
     firmware_version varchar(32)  NOT NULL DEFAULT '1.0.0',
+    group_name       varchar(64)  NOT NULL DEFAULT '默认分组',
     status           varchar(16)  NOT NULL DEFAULT 'offline',
     last_report_at   timestamptz,
     last_online_at   timestamptz,
@@ -20,6 +21,10 @@ CREATE TABLE IF NOT EXISTS device (
 
 COMMENT ON TABLE  device IS '设备元数据表：一个设备一行，状态由 Broker 的 retained/LWT 报文驱动';
 COMMENT ON COLUMN device.status IS 'online / offline，由 device/{id}/status 消息更新';
+COMMENT ON COLUMN device.group_name IS '设备分组：列表筛选与批量运维使用';
+
+-- 灰度升级：老库补列（新建库时该列已存在，IF NOT EXISTS 保证幂等）
+ALTER TABLE device ADD COLUMN IF NOT EXISTS group_name varchar(64) NOT NULL DEFAULT '默认分组';
 
 -- ---------- 2. 传感器时序表 ----------
 CREATE TABLE IF NOT EXISTS sensor_record (

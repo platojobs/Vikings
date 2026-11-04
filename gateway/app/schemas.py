@@ -117,11 +117,51 @@ class DeviceOut(BaseModel):
     name: str
     model: str
     firmware_version: str
+    group_name: str = "默认分组"
     status: str
     last_report_at: Optional[datetime] = None
     last_online_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+# ==================== 设备注册与分组 ====================
+
+class DeviceCreateRequest(BaseModel):
+    """手工注册设备：device_id 幂等，重复注册返回 409。"""
+
+    device_id: str = Field(min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=128)
+    model: str = Field(default="VG-S100", max_length=64)
+    firmware_version: str = Field(default="1.0.0", max_length=32)
+    group_name: str = Field(default="默认分组", max_length=64)
+
+
+class DeviceUpdateRequest(BaseModel):
+    """编辑设备元数据：设备 ID 不可改，状态仍由 MQTT 驱动。"""
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    model: Optional[str] = Field(default=None, max_length=64)
+    firmware_version: Optional[str] = Field(default=None, max_length=32)
+    group_name: Optional[str] = Field(default=None, max_length=64)
+
+
+class DeviceBulkCreateRequest(BaseModel):
+    """批量注册：单次最多 200 台，已存在的设备跳过而不是整批失败。"""
+
+    devices: List[DeviceCreateRequest] = Field(min_length=1, max_length=200)
+
+
+class DeviceBulkResult(BaseModel):
+    created: List[str]
+    skipped: List[str]
+
+
+class DeviceGroupOut(BaseModel):
+    group_name: str
+    total: int
+    online: int
+    offline: int
 
 
 class SensorRecordOut(BaseModel):

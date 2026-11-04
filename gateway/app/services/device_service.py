@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,6 +96,7 @@ async def list_devices(
     keyword: Optional[str],
     page: int,
     page_size: int,
+    group_name: Optional[str] = None,
 ) -> Tuple[List[Device], int]:
     stmt = select(Device)
     count_stmt = select(func.count()).select_from(Device)
@@ -103,6 +104,9 @@ async def list_devices(
     if status:
         stmt = stmt.where(Device.status == status)
         count_stmt = count_stmt.where(Device.status == status)
+    if group_name:
+        stmt = stmt.where(Device.group_name == group_name)
+        count_stmt = count_stmt.where(Device.group_name == group_name)
     if keyword:
         like = "%" + keyword + "%"
         cond = Device.device_id.ilike(like) | Device.name.ilike(like)
@@ -115,6 +119,126 @@ async def list_devices(
     total = (await session.execute(count_stmt)).scalar_one()
     rows = (await session.execute(stmt)).scalars().all()
     return list(rows), int(total)
+
+
+async def create_device(
+    session: AsyncSession,
+    device_id: str,
+    name: str,
+    model: str,
+    firmware_version: str,
+    group_name: str,
+) -> Tuple[Optional[Device], str]:
+    """手工注册设备；重复 ID 返回错误文案，由路由转 409。"""
+    if await session.get(Device, device_id) is not None:
+        return None, "设备 ID 已存在"
+    device = Device(
+        device_id=device_id,
+        name=name,
+        model=model,
+        firmware_version=firmware_version,
+        group_name=group_name,
+        status=DEVICE_STATUS_OFFLINE,
+    )
+    session.add(device)
+    await session.flush()
+    return device, ""
+
+
+async def bulk_create_devices(
+    session: AsyncSession, items: List[dict]
+) -> Tuple[List[str], List[str]]:
+    """批量注册：一次性查询已有 ID，重复项跳过而不整批失败。"""
+    if not items:
+        return [], []
+
+    ids = [item["device_id"] for item in items]
+    existing = set(
+        (await session.execute(select(Device.device_id).where(Device.device_id.in_(ids))))
+        .scalars()
+        .all()
+    )
+
+    created: List[str] = []
+    skipped: List[str] = []
+    seen: set = set()
+    for item in items:
+        device_id = item["device_id"]
+        if device_id in existing or device_id in seen:
+            skipped.append(device_id)
+            continue
+        seen.add(device_id)
+        session.add(Device(status=DEVICE_STATUS_OFFLINE, **item))
+        created.append(device_id)
+
+    await session.flush()
+    return created, skipped
+
+
+async def update_device(
+    session: AsyncSession,
+    device_id: str,
+    changes: dict,
+) -> Tuple[Optional[Device], str]:
+    """编辑设备元数据：只覆盖传入的字段，状态不由后台直接修改。"""
+    device = await session.get(Device, device_id)
+    if device is None:
+        return None, "设备不存在"
+    for key, value in changes.items():
+        if value is not None:
+            setattr(device, key, value)
+    await session.flush()
+    return device, ""
+
+
+async def delete_device(session: AsyncSession, device_id: str) -> Tuple[bool, str]:
+    """删除设备：存在时序数据时拒绝，避免产生孤儿数据。"""
+    device = await session.get(Device, device_id)
+    if device is None:
+        return False, "设备不存在"
+
+    record_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(SensorRecord)
+                .where(SensorRecord.device_id == device_id)
+            )
+        ).scalar_one()
+    )
+    if record_count > 0:
+        return False, f"设备存在 {record_count} 条历史数据，请先清理后再删除"
+
+    await session.delete(device)
+    await session.flush()
+    return True, ""
+
+
+async def list_groups(session: AsyncSession) -> List[dict]:
+    """分组概览：每组设备数与在线/离线数量，用于列表筛选与拓扑概览。"""
+    stmt = (
+        select(
+            Device.group_name.label("group_name"),
+            func.count().label("total"),
+            func.sum(case((Device.status == DEVICE_STATUS_ONLINE, 1), else_=0)).label("online"),
+        )
+        .group_by(Device.group_name)
+        .order_by(Device.group_name)
+    )
+    rows = (await session.execute(stmt)).all()
+    result = []
+    for row in rows:
+        total = int(row.total)
+        online = int(row.online or 0)
+        result.append(
+            {
+                "group_name": row.group_name,
+                "total": total,
+                "online": online,
+                "offline": total - online,
+            }
+        )
+    return result
 
 
 async def get_device(session: AsyncSession, device_id: str) -> Optional[Device]:

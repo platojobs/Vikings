@@ -7,9 +7,13 @@ import type {
   CommandItem,
   CommandType,
   Device,
+  DeviceBulkResult,
+  DeviceCreateBody,
   DeviceDetail,
+  DeviceGroupStat,
   DeviceListQuery,
   DeviceRecordsQuery,
+  DeviceUpdateBody,
   PageResult,
   SensorRecord,
 } from '@/types'
@@ -19,9 +23,40 @@ export function fetchDevices(query: DeviceListQuery = {}): Promise<PageResult<De
     params: {
       status: query.status,
       keyword: query.keyword,
+      group: query.group,
       page: query.page,
       pageSize: query.pageSize,
     },
+  })
+}
+
+/** 分组概览：每组设备数与在线/离线数量 */
+export function fetchDeviceGroups(): Promise<DeviceGroupStat[]> {
+  return request<DeviceGroupStat[]>('/api/devices/groups')
+}
+
+export function createDevice(body: DeviceCreateBody): Promise<Device> {
+  return request<Device>('/api/devices', { method: 'POST', body })
+}
+
+export function updateDevice(deviceId: string, body: DeviceUpdateBody): Promise<Device> {
+  return request<Device>(`/api/devices/${encodeURIComponent(deviceId)}`, {
+    method: 'PATCH',
+    body,
+  })
+}
+
+export function deleteDevice(deviceId: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(`/api/devices/${encodeURIComponent(deviceId)}`, {
+    method: 'DELETE',
+  })
+}
+
+/** 批量注册：重复设备 ID 会被跳过，返回成功与跳过明细 */
+export function bulkCreateDevices(devices: DeviceCreateBody[]): Promise<DeviceBulkResult> {
+  return request<DeviceBulkResult>('/api/devices/bulk', {
+    method: 'POST',
+    body: { devices },
   })
 }
 

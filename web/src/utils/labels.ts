@@ -76,6 +76,10 @@ export function auditActionLabel(action: string): string {
     'user.create': '新建账号',
     'user.update': '修改账号',
     'user.delete': '删除账号',
+    'device.create': '注册设备',
+    'device.update': '编辑设备',
+    'device.delete': '删除设备',
+    'device.bulk_create': '批量注册设备',
   }
   return labels[action] ?? action
 }
@@ -91,6 +95,13 @@ export function auditActionTagType(action: string): TagType {
     case 'user.create':
     case 'user.update':
     case 'user.delete':
+      return 'danger'
+    case 'device.create':
+    case 'device.bulk_create':
+      return 'success'
+    case 'device.update':
+      return 'primary'
+    case 'device.delete':
       return 'danger'
     default:
       return 'primary'

@@ -75,6 +75,7 @@ export interface Device {
   name: string
   model: string
   firmware_version: string
+  group_name: string
   status: DeviceStatus
   last_report_at: string | null
   last_online_at: string | null
@@ -101,8 +102,40 @@ export interface DeviceDetail extends Device {
 export interface DeviceListQuery {
   status?: DeviceStatus
   keyword?: string
+  group?: string
   page?: number
   pageSize?: number
+}
+
+/** 手工注册设备 */
+export interface DeviceCreateBody {
+  device_id: string
+  name: string
+  model: string
+  firmware_version: string
+  group_name: string
+}
+
+/** 编辑设备元数据（设备 ID 不可改） */
+export interface DeviceUpdateBody {
+  name?: string
+  model?: string
+  firmware_version?: string
+  group_name?: string
+}
+
+/** 批量注册结果 */
+export interface DeviceBulkResult {
+  created: string[]
+  skipped: string[]
+}
+
+/** 分组概览 */
+export interface DeviceGroupStat {
+  group_name: string
+  total: number
+  online: number
+  offline: number
 }
 
 export interface DeviceRecordsQuery {

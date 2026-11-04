@@ -189,7 +189,9 @@ docker compose -f infra/docker-compose.yml up -d
 - 指令状态机 `issued → received → progress → success/failed`，禁止状态回退
 - OTA 任务汇总（成功/失败计数）与设备固件版本同步
 - 账号体系与 RBAC：admin / operator / viewer 三角色，PBKDF2 口令哈希 + JWT
-- 管理动作全量审计：登录、指令、OTA、告警确认、阈值修改、账号变更
+- 设备全生命周期：手工注册、元数据编辑、删除保护、批量注册（重复 ID 跳过）
+- 设备分组：分组维度筛选与在线/离线统计，支撑按产线批量运维
+- 管理动作全量审计：登录、指令、OTA、告警确认、阈值修改、账号与设备变更
 - 阈值在线配置：`rule_config` 持久化覆盖环境变量，改完即时生效
 - 时序数据按小时/天聚合接口，支撑长周期趋势视图
 - critical 告警 Webhook 外推（钉钉/飞书/企业微信机器人兼容）
@@ -199,7 +201,8 @@ docker compose -f infra/docker-compose.yml up -d
 
 - 登录页 + 路由守卫 + 角色驱动的菜单与按钮权限
 - 实时仪表盘：指标卡、多设备实时曲线、实时告警流
-- 设备列表：状态筛选、搜索、分页、详情抽屉（历史曲线 + 指令历史 + 指令下发）
+- 设备列表：状态 / 分组 / 关键字筛选，注册与编辑、批量导入（CSV 文件或粘贴）、
+  导出 CSV、删除保护，详情抽屉（历史曲线 + 指令历史 + 指令下发）
 - 历史查询：明细 / 按小时 / 按天聚合视图，CSV 导出
 - 告警中心：统计卡片、实时告警推送、在线确认、阈值配置抽屉
 - 审计日志：动作/操作人筛选，变更详情可查看
@@ -226,7 +229,11 @@ docker compose -f infra/docker-compose.yml up -d
 | --- | --- | --- |
 | POST | `/api/auth/login` | 登录换取 JWT |
 | GET | `/api/auth/me` | 当前账号最新信息（角色刷新） |
-| GET | `/api/devices` | 设备列表（status / keyword / 分页） |
+| GET | `/api/devices` | 设备列表（status / keyword / group / 分页） |
+| GET | `/api/devices/groups` | 分组概览（总数 / 在线 / 离线） |
+| POST | `/api/devices` | 注册设备 |
+| POST | `/api/devices/bulk` | 批量注册（重复跳过） |
+| PATCH/DELETE | `/api/devices/{id}` | 编辑元数据 / 删除（删除仅 admin） |
 | GET | `/api/devices/{id}` | 设备详情 + 最新数据 |
 | GET | `/api/devices/{id}/records` | 历史数据（start / end / limit） |
 | GET | `/api/devices/{id}/records/aggregate` | 按小时/天聚合（avg/min/max） |
@@ -252,7 +259,7 @@ docker compose -f infra/docker-compose.yml up -d
 
 | 表 | 作用 | 关键设计 |
 | --- | --- | --- |
-| `device` | 设备元数据 | `status` 由 MQTT retained/LWT 驱动 |
+| `device` | 设备元数据 | `status` 由 MQTT retained/LWT 驱动，`group_name` 支撑分组运维 |
 | `sensor_record` | 时序数据 | `(device_id, ts DESC)` 查询索引；`(device_id, seq, ts)` 唯一索引做幂等 |
 | `device_alert` | AI 告警 | `(device_id, metric, created_at)` 索引支撑告警抑制 |
 | `device_command` | 指令与回执状态 | 状态机 + OTA 进度持久化 |
@@ -331,3 +338,4 @@ docker compose -f infra/docker-compose.yml up -d
 | `v1.2.0` | 设备指令下发面板、cmd/ack 实时回执、CSV 导出、ECharts 按需引入（主包 1.41MB→685KB） |
 | `v1.3.0` | 告警中心、阈值在线配置、审计日志、时序聚合接口、critical 告警 Webhook |
 | `v1.4.0` | 账号体系与 RBAC（三角色）、账号管理页、按钮级权限收口、登录页演示账号 |
+| `v1.5.0` | 设备全生命周期（注册/编辑/删除保护/批量导入）、设备分组与统计、设备列表 CSV 导出 |

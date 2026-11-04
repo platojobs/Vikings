@@ -54,12 +54,27 @@ async def init_models() -> None:
     """开发/演示环境自动建表。
 
     生产环境请使用 infra/postgres/init.sql 显式管理结构变更，
-    这里的 create_all 是幂等的，仅补齐缺失的表，不会改已有表结构。
+    这里的 create_all 是幂等的，仅补齐缺失的表；已有表的新增列由轻量迁移补齐。
     """
     from app import models  # noqa: F401  确保模型已注册到 Base.metadata
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_columns)
+
+
+def _migrate_columns(sync_conn) -> None:
+    """轻量列迁移：create_all 不会修改已有表，灰度升级时补齐新增字段。
+
+    只处理可空或带默认值的加列，避免老库启动即失败。
+    """
+    from sqlalchemy import inspect, text
+
+    columns = {col["name"] for col in inspect(sync_conn).get_columns("device")}
+    if "group_name" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE device ADD COLUMN group_name VARCHAR(64) NOT NULL DEFAULT '默认分组'")
+        )
 
 
 async def dispose_engine() -> None:

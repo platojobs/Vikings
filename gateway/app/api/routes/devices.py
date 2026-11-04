@@ -1,4 +1,4 @@
-"""设备路由：列表 / 详情 / 历史数据 / 数据聚合 / 指令下发与查询。"""
+"""设备路由：注册/编辑/删除、列表 / 详情 / 历史数据 / 数据聚合 / 指令下发与查询。"""
 
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -10,13 +10,18 @@ from app.schemas import (
     ApiResponse,
     CommandCreateRequest,
     CommandOut,
+    DeviceBulkCreateRequest,
+    DeviceBulkResult,
+    DeviceCreateRequest,
     DeviceDetailOut,
+    DeviceGroupOut,
     DeviceOut,
+    DeviceUpdateRequest,
     PageOut,
     SensorRecordOut,
     to_utc_datetime,
 )
-from app.security import ROLE_OPERATOR, require_role, require_user
+from app.security import ROLE_ADMIN, ROLE_OPERATOR, require_role, require_user
 from app.services import audit_service, command_service, device_service
 
 router = APIRouter(prefix="/api", tags=["devices"])
@@ -26,12 +31,15 @@ router = APIRouter(prefix="/api", tags=["devices"])
 async def list_devices(
     status: Optional[str] = Query(default=None, pattern="^(online|offline)$"),
     keyword: Optional[str] = Query(default=None, max_length=64),
+    group: Optional[str] = Query(default=None, max_length=64),
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
-    items, total = await device_service.list_devices(session, status, keyword, page, pageSize)
+    items, total = await device_service.list_devices(
+        session, status, keyword, page, pageSize, group
+    )
     return ApiResponse(
         data=PageOut[DeviceOut](
             items=[DeviceOut.model_validate(item) for item in items],
@@ -40,6 +48,114 @@ async def list_devices(
             page_size=pageSize,
         )
     )
+
+
+@router.get("/devices/groups", response_model=ApiResponse[list[DeviceGroupOut]])
+async def list_device_groups(
+    session: AsyncSession = Depends(get_session),
+    _: dict = Depends(require_user),
+):
+    """分组概览：默认分组也会统计，前端用于下拉筛选与数量提示。"""
+    groups = await device_service.list_groups(session)
+    return ApiResponse(data=[DeviceGroupOut(**item) for item in groups])
+
+
+@router.post("/devices", response_model=ApiResponse[DeviceOut])
+async def create_device(
+    body: DeviceCreateRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    device, err = await device_service.create_device(
+        session,
+        body.device_id,
+        body.name,
+        body.model,
+        body.firmware_version,
+        body.group_name,
+    )
+    if device is None:
+        raise HTTPException(status_code=409, detail=err)
+
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_CREATE,
+        target_type="device",
+        target_id=device.device_id,
+        detail={"name": device.name, "group": device.group_name},
+    )
+    await session.commit()
+    return ApiResponse(data=DeviceOut.model_validate(device))
+
+
+@router.post("/devices/bulk", response_model=ApiResponse[DeviceBulkResult])
+async def bulk_create_devices(
+    body: DeviceBulkCreateRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    """批量注册设备：返回成功与跳过明细，重复 ID 不会导致整批失败。"""
+    created, skipped = await device_service.bulk_create_devices(
+        session, [item.model_dump() for item in body.devices]
+    )
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_BULK,
+        target_type="device",
+        target_id=",".join(created[:5]),
+        detail={"created": len(created), "skipped": len(skipped)},
+    )
+    await session.commit()
+    return ApiResponse(data=DeviceBulkResult(created=created, skipped=skipped))
+
+
+@router.patch("/devices/{device_id}", response_model=ApiResponse[DeviceOut])
+async def update_device(
+    device_id: str,
+    body: DeviceUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    changes = {key: value for key, value in body.model_dump().items() if value is not None}
+    device, err = await device_service.update_device(session, device_id, changes)
+    if device is None:
+        raise HTTPException(status_code=404, detail=err)
+
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_UPDATE,
+        target_type="device",
+        target_id=device_id,
+        detail=changes,
+    )
+    await session.commit()
+    return ApiResponse(data=DeviceOut.model_validate(device))
+
+
+@router.delete("/devices/{device_id}", response_model=ApiResponse[dict])
+async def delete_device(
+    device_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_ADMIN)),
+):
+    """删除设备：仅管理员可操作，且要求该设备没有历史时序数据。"""
+    ok, err = await device_service.delete_device(session, device_id)
+    if not ok:
+        status = 404 if "不存在" in err else 409
+        raise HTTPException(status_code=status, detail=err)
+
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_DELETE,
+        target_type="device",
+        target_id=device_id,
+    )
+    await session.commit()
+    return ApiResponse(data={"deleted": device_id})
 
 
 @router.get("/devices/{device_id}", response_model=ApiResponse[DeviceDetailOut])

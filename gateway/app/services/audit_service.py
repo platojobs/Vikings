@@ -20,6 +20,10 @@ ACTION_THRESHOLD_UPDATE = "threshold.update"
 ACTION_USER_CREATE = "user.create"
 ACTION_USER_UPDATE = "user.update"
 ACTION_USER_DELETE = "user.delete"
+ACTION_DEVICE_CREATE = "device.create"
+ACTION_DEVICE_UPDATE = "device.update"
+ACTION_DEVICE_DELETE = "device.delete"
+ACTION_DEVICE_BULK = "device.bulk_create"
 
 
 async def log(

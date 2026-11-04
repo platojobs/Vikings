@@ -153,11 +153,18 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`page`、`pageSize` |
+| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`group`、`page`、`pageSize` |
+| GET | `/api/devices/groups` | 分组概览：每组 `total` / `online` / `offline` |
+| POST | `/api/devices` | 手工注册设备，入参 `device_id`（3~64 位字母数字 _-）、`name`、`model`、`firmware_version`、`group_name`；重复 ID 返回 409 |
+| POST | `/api/devices/bulk` | 批量注册，单次最多 200 台，返回 `{created, skipped}`，重复 ID 跳过 |
+| PATCH | `/api/devices/{deviceId}` | 编辑名称 / 型号 / 固件版本 / 分组；设备 ID 与状态不可改 |
+| DELETE | `/api/devices/{deviceId}` | 删除设备（仅 admin）；存在历史时序数据时返回 409 |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit` |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
 | GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底） |
+
+写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
 
 ### 3.3 告警
 
@@ -230,6 +237,7 @@ fire-and-forget，不阻塞告警主链路。
 | name | varchar(128) | 设备名称 |
 | model | varchar(64) | 型号 |
 | firmware_version | varchar(32) | 当前固件版本 |
+| group_name | varchar(64) | 设备分组，默认「默认分组」 |
 | status | varchar(16) | online / offline |
 | last_report_at | timestamptz | 最后上报时间 |
 | last_online_at | timestamptz | 最后上线时间 |
@@ -311,7 +319,7 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 | --- | --- | --- |
 | id | bigserial PK | 自增 |
 | operator | varchar(64) | 操作人（登录用户名） |
-| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / user.* |
+| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / user.* / device.* |
 | target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config / app_user） |
 | target_id | varchar(64) | 目标标识 |
 | detail | jsonb | 动作上下文（如指令类型、阈值变更明细） |

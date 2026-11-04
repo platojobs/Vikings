@@ -4,33 +4,42 @@
  * 点击任意行打开抽屉，展示详情、历史数据折线图与指令历史。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  bulkCreateDevices,
+  createDevice,
+  deleteDevice,
   fetchDeviceCommands,
   fetchDeviceDetail,
+  fetchDeviceGroups,
   fetchDeviceRecords,
   fetchDevices,
   sendCommand,
+  updateDevice,
 } from '@/api/devices'
 import { formatDateTime, formatMetric } from '@/utils/format'
 import { commandStateLabel, commandStateTagType } from '@/utils/labels'
 import DeviceStatusTag from '@/components/DeviceStatusTag.vue'
 import SensorChart from '@/components/SensorChart.vue'
 import { subscribe } from '@/services/mqtt'
-import { canOperate } from '@/utils/permissions'
+import { canOperate, isAdmin } from '@/utils/permissions'
 import type {
   CommandAckMessage,
   CommandItem,
   CommandType,
   Device,
+  DeviceBulkResult,
+  DeviceCreateBody,
   DeviceDetail,
+  DeviceGroupStat,
   DeviceStatus,
   SensorRecord,
 } from '@/types'
 
-const query = reactive<{ status: DeviceStatus | ''; keyword: string }>({
+const query = reactive<{ status: DeviceStatus | ''; keyword: string; group: string }>({
   status: '',
   keyword: '',
+  group: '',
 })
 
 const devices = ref<Device[]>([])
@@ -45,6 +54,7 @@ async function loadDevices(): Promise<void> {
     const result = await fetchDevices({
       status: query.status || undefined,
       keyword: query.keyword.trim() || undefined,
+      group: query.group || undefined,
       page: page.value,
       pageSize: pageSize.value,
     })
@@ -65,6 +75,7 @@ function handleSearch(): void {
 function handleReset(): void {
   query.status = ''
   query.keyword = ''
+  query.group = ''
   page.value = 1
   loadDevices()
 }
@@ -72,6 +83,221 @@ function handleReset(): void {
 function handleSizeChange(): void {
   page.value = 1
   loadDevices()
+}
+
+// ==================== 分组与设备注册 ====================
+
+const groups = ref<DeviceGroupStat[]>([])
+/** 只读账号隐藏注册、编辑、下发等写操作，与后端 require_role(operator) 保持一致 */
+const canWrite = computed(() => canOperate())
+const isAdminOnly = computed(() => isAdmin())
+
+async function loadGroups(): Promise<void> {
+  try {
+    groups.value = await fetchDeviceGroups()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  }
+}
+
+const formVisible = ref(false)
+const formMode = ref<'create' | 'edit'>('create')
+const editingId = ref('')
+const formSaving = ref(false)
+
+/** 新建与编辑复用同一表单，device_id 在编辑态只读 */
+const deviceForm = reactive<DeviceCreateBody>({
+  device_id: '',
+  name: '',
+  model: 'VG-S100',
+  firmware_version: '1.0.0',
+  group_name: '默认分组',
+})
+
+function openCreateDevice(): void {
+  formMode.value = 'create'
+  editingId.value = ''
+  Object.assign(deviceForm, {
+    device_id: '',
+    name: '',
+    model: 'VG-S100',
+    firmware_version: '1.0.0',
+    group_name: '默认分组',
+  })
+  formVisible.value = true
+}
+
+function openEditDevice(row: Device): void {
+  formMode.value = 'edit'
+  editingId.value = row.device_id
+  Object.assign(deviceForm, {
+    device_id: row.device_id,
+    name: row.name,
+    model: row.model,
+    firmware_version: row.firmware_version,
+    group_name: row.group_name || '默认分组',
+  })
+  formVisible.value = true
+}
+
+async function handleSaveDevice(): Promise<void> {
+  if (!deviceForm.name.trim()) {
+    ElMessage.warning('请填写设备名称')
+    return
+  }
+  if (formMode.value === 'create' && !/^[a-zA-Z0-9_-]{3,64}$/.test(deviceForm.device_id.trim())) {
+    ElMessage.warning('设备 ID 需为 3~64 位字母、数字、_ 或 -')
+    return
+  }
+
+  formSaving.value = true
+  try {
+    if (formMode.value === 'create') {
+      const created = await createDevice({
+        ...deviceForm,
+        device_id: deviceForm.device_id.trim(),
+        name: deviceForm.name.trim(),
+        group_name: deviceForm.group_name.trim() || '默认分组',
+      })
+      ElMessage.success(`设备 ${created.device_id} 已注册`)
+      page.value = 1
+    } else {
+      await updateDevice(editingId.value, {
+        name: deviceForm.name.trim(),
+        model: deviceForm.model,
+        firmware_version: deviceForm.firmware_version,
+        group_name: deviceForm.group_name.trim() || '默认分组',
+      })
+      ElMessage.success('设备信息已更新')
+    }
+    formVisible.value = false
+    loadDevices()
+    loadGroups()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    formSaving.value = false
+  }
+}
+
+async function handleDeleteDevice(row: Device): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除设备 ${row.device_id}（${row.name}）？该操作不可恢复。`,
+      '删除设备',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteDevice(row.device_id)
+    devices.value = devices.value.filter((d) => d.device_id !== row.device_id)
+    total.value -= 1
+    ElMessage.success('设备已删除')
+    loadGroups()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理（存在历史数据时返回 409）
+  }
+}
+
+// ==================== 批量导入 ====================
+
+const bulkVisible = ref(false)
+const bulkText = ref('')
+const bulkSaving = ref(false)
+const bulkResult = ref<DeviceBulkResult | null>(null)
+
+function openBulkImport(): void {
+  bulkText.value = ''
+  bulkResult.value = null
+  bulkVisible.value = true
+}
+
+/** 解析「设备ID,名称,型号,分组」四列，后两列可省略 */
+function parseBulkRows(text: string): DeviceCreateBody[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    // 允许首行是表头
+    .filter((line) => !/^device_?id\s*,/i.test(line))
+    .map((line) => {
+      const [deviceId = '', name = '', model = 'VG-S100', group = '默认分组'] = line
+        .split(',')
+        .map((cell) => cell.trim())
+      return {
+        device_id: deviceId,
+        name: name || `设备 ${deviceId}`,
+        model: model || 'VG-S100',
+        firmware_version: '1.0.0',
+        group_name: group || '默认分组',
+      }
+    })
+}
+
+async function handleBulkImport(): Promise<void> {
+  const rows = parseBulkRows(bulkText.value)
+  if (rows.length === 0) {
+    ElMessage.warning('请粘贴至少一行设备数据')
+    return
+  }
+  const invalid = rows.find((row) => !/^[a-zA-Z0-9_-]{3,64}$/.test(row.device_id))
+  if (invalid) {
+    ElMessage.warning(`设备 ID 不合法：${invalid.device_id || '（空）'}`)
+    return
+  }
+
+  bulkSaving.value = true
+  try {
+    bulkResult.value = await bulkCreateDevices(rows)
+    ElMessage.success(`已注册 ${bulkResult.value.created.length} 台设备`)
+    loadDevices()
+    loadGroups()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    bulkSaving.value = false
+  }
+}
+
+/** 选择 CSV 文件后读入文本框，用户仍可手动调整 */
+function handleCsvFile(file: { raw?: File }): void {
+  const raw = file.raw
+  if (!raw) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    bulkText.value = String(reader.result ?? '')
+  }
+  reader.readAsText(raw, 'utf-8')
+}
+
+function exportDevicesCsv(): void {
+  if (devices.value.length === 0) {
+    ElMessage.warning('当前页无设备可导出')
+    return
+  }
+  const header = ['device_id', 'name', 'model', 'firmware_version', 'group_name', 'status', 'last_report_at']
+  const rows = devices.value.map((d) => [
+    d.device_id,
+    d.name,
+    d.model,
+    d.firmware_version,
+    d.group_name,
+    d.status,
+    d.last_report_at ?? '',
+  ])
+  const csv = [header, ...rows]
+    .map((line) => line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+    .join('\n')
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `devices_${Date.now()}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${devices.value.length} 台设备`)
 }
 
 // ==================== 详情抽屉 ====================
@@ -106,9 +332,6 @@ async function openDevice(row: Device): Promise<void> {
 }
 
 // ==================== 指令下发面板 ====================
-
-/** 只读账号隐藏下发能力，与后端 require_role(operator) 保持一致 */
-const canWrite = computed(() => canOperate())
 
 const commandType = ref<CommandType>('config')
 const submittingCmd = ref(false)
@@ -206,7 +429,10 @@ function exportCsv(): void {
   ElMessage.success(`已导出 ${historyRecords.value.length} 条数据`)
 }
 
-onMounted(loadDevices)
+onMounted(() => {
+  loadDevices()
+  loadGroups()
+})
 
 // ==================== 实时状态刷新 ====================
 // 订阅 device/+/status，设备上下线时直接更新对应行，无需整页重拉。
@@ -274,6 +500,14 @@ onUnmounted(() => {
           <el-option label="在线" value="online" />
           <el-option label="离线" value="offline" />
         </el-select>
+        <el-select v-model="query.group" placeholder="全部分组" clearable class="group-select">
+          <el-option
+            v-for="item in groups"
+            :key="item.group_name"
+            :label="`${item.group_name}（${item.total}）`"
+            :value="item.group_name"
+          />
+        </el-select>
         <el-input
           v-model="query.keyword"
           class="keyword-input"
@@ -284,6 +518,12 @@ onUnmounted(() => {
         <el-button type="primary" @click="handleSearch">查询</el-button>
         <el-button @click="handleReset">重置</el-button>
         <span class="total-hint">共 {{ total }} 台设备</span>
+        <div class="filter-spacer" />
+        <template v-if="canWrite">
+          <el-button plain @click="openBulkImport">批量导入</el-button>
+          <el-button type="primary" @click="openCreateDevice">新建设备</el-button>
+        </template>
+        <el-button plain @click="exportDevicesCsv">导出 CSV</el-button>
       </div>
     </el-card>
 
@@ -298,6 +538,13 @@ onUnmounted(() => {
         <el-table-column prop="device_id" label="设备 ID" min-width="120" />
         <el-table-column prop="name" label="设备名称" min-width="160" />
         <el-table-column prop="model" label="型号" min-width="110" />
+        <el-table-column label="分组" width="130">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" type="info">
+              {{ row.group_name || '默认分组' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="firmware_version" label="固件版本" width="110" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
@@ -309,9 +556,20 @@ onUnmounted(() => {
             {{ formatDateTime(row.last_report_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="90">
+        <el-table-column label="操作" width="190">
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openDevice(row)">详情</el-button>
+            <el-button v-if="canWrite" link type="primary" @click.stop="openEditDevice(row)">
+              编辑
+            </el-button>
+            <el-button
+              v-if="isAdminOnly"
+              link
+              type="danger"
+              @click.stop="handleDeleteDevice(row)"
+            >
+              删除
+            </el-button>
           </template>
         </el-table-column>
         <template #empty>
@@ -345,6 +603,7 @@ onUnmounted(() => {
           <el-descriptions-item label="设备 ID">{{ detail.device_id }}</el-descriptions-item>
           <el-descriptions-item label="设备名称">{{ detail.name }}</el-descriptions-item>
           <el-descriptions-item label="型号">{{ detail.model }}</el-descriptions-item>
+          <el-descriptions-item label="分组">{{ detail.group_name || '默认分组' }}</el-descriptions-item>
           <el-descriptions-item label="固件版本">{{ detail.firmware_version }}</el-descriptions-item>
           <el-descriptions-item label="状态">
             <DeviceStatusTag :status="detail.status" />
@@ -513,6 +772,80 @@ onUnmounted(() => {
         </section>
       </div>
     </el-drawer>
+
+    <el-dialog
+      v-model="formVisible"
+      :title="formMode === 'create' ? '新建设备' : `编辑设备 · ${editingId}`"
+      width="460px"
+    >
+      <el-form label-position="top">
+        <el-form-item label="设备 ID">
+          <el-input
+            v-model="deviceForm.device_id"
+            :disabled="formMode === 'edit'"
+            placeholder="如 dev-1001，注册后不可修改"
+          />
+        </el-form-item>
+        <el-form-item label="设备名称">
+          <el-input v-model="deviceForm.name" placeholder="如 包装线温湿度传感器" />
+        </el-form-item>
+        <el-form-item label="型号">
+          <el-input v-model="deviceForm.model" placeholder="VG-S100" />
+        </el-form-item>
+        <el-form-item label="固件版本">
+          <el-input v-model="deviceForm.firmware_version" placeholder="1.0.0" />
+        </el-form-item>
+        <el-form-item label="分组">
+          <el-input v-model="deviceForm.group_name" placeholder="默认分组" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="formVisible = false">取消</el-button>
+        <el-button type="primary" :loading="formSaving" @click="handleSaveDevice">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="bulkVisible" title="批量注册设备" width="620px">
+      <el-alert type="info" :closable="false" class="bulk-tip">
+        每行一台设备，格式：<code>设备ID,名称,型号,分组</code>，后两列可省略，重复 ID 自动跳过。
+      </el-alert>
+
+      <div class="bulk-toolbar">
+        <el-upload
+          :auto-upload="false"
+          :show-file-list="false"
+          accept=".csv,text/csv"
+          :on-change="handleCsvFile"
+        >
+          <el-button size="small" plain>从 CSV 文件导入</el-button>
+        </el-upload>
+        <el-button size="small" link @click="bulkText = 'dev-1001,一号线温湿度,一号车间\ndev-1002,二号线温湿度,二号车间'">
+          填入示例
+        </el-button>
+      </div>
+
+      <el-input
+        v-model="bulkText"
+        type="textarea"
+        :rows="8"
+        placeholder="dev-1001,一号线温湿度,一号车间&#10;dev-1002,二号线温湿度,二号车间"
+      />
+
+      <el-alert
+        v-if="bulkResult"
+        :title="`注册完成：新增 ${bulkResult.created.length} 台，跳过 ${bulkResult.skipped.length} 台`"
+        :description="bulkResult.skipped.length ? `已跳过已存在设备：${bulkResult.skipped.slice(0, 6).join('、')}` : ''"
+        type="success"
+        :closable="false"
+        show-icon
+        class="bulk-result"
+      />
+
+      <template #footer>
+        <el-button @click="bulkVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="bulkSaving" @click="handleBulkImport">开始导入</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -525,11 +858,34 @@ onUnmounted(() => {
 }
 
 .status-select {
-  width: 150px;
+  width: 130px;
+}
+
+.group-select {
+  width: 160px;
+}
+
+.filter-spacer {
+  flex: 1;
 }
 
 .keyword-input {
-  width: 280px;
+  width: 240px;
+}
+
+.bulk-tip {
+  margin-bottom: 12px;
+}
+
+.bulk-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.bulk-result {
+  margin-top: 12px;
 }
 
 .total-hint {
