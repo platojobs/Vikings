@@ -155,7 +155,7 @@
 { "code": 0, "message": "ok", "data": {} }
 ```
 
-`code != 0` 表示业务失败，HTTP 状态码同时给出（400/401/404/500）。
+`code != 0` 表示业务失败，HTTP 状态码同时给出（400/401/404/429/500）。
 
 ### 3.1 认证
 
@@ -174,6 +174,22 @@
 | `viewer` | 只读：仅设备/告警/OTA/审计查询 |
 
 越权访问返回 HTTP 403，未登录或令牌失效返回 401。
+
+**登录失败限流（v1.16.0 新增）**：按「直连客户端 IP + 用户名」在进程内计数，
+窗口内失败达到 `LOGIN_MAX_FAILURES`（默认 5）后锁定 `LOGIN_LOCKOUT_SECONDS`（默认 900 秒）：
+
+| 场景 | 状态码 | 响应 |
+| --- | --- | --- |
+| 账号/口令错误、账号停用 | 401 | `{code:401, message:"用户名或密码错误", data:null}` |
+| 窗口内失败次数达到阈值后的再次尝试 | 429 | 同结构；响应头 `Retry-After: <剩余秒数>` |
+| 成功登录 | 200 | 原有 `{token, user}` 结构不变；该 IP+账号计数清零 |
+
+限流状态为**进程内内存**实现：多进程/多副本之间不共享，重启清零；生产需要全局一致时
+应在反向代理层（如 nginx `limit_req`）或 Redis 中实现。网关默认不读取 `X-Forwarded-For`。
+
+**口令强度（v1.16.0）**：`POST /api/users` 与 `PATCH /api/users/{username}` 新写入的口令
+至少 `PASSWORD_MIN_LENGTH`（默认 8）位，且拒绝常见弱口令；不合规返回 400 与可读文案。
+既有账号的口令不做回溯校验，继续可登录。
 
 ### 3.2 设备
 
@@ -540,9 +556,11 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 | last_login_at | timestamptz | 最近登录时间 |
 | created_at / updated_at | timestamptz | 时间戳 |
 
-首次启动且表为空时，网关按环境变量 `ADMIN_USERNAME/ADMIN_PASSWORD` 初始化管理员，
-并额外创建 `operator/operator123` 与 `viewer/viewer123` 两个演示账号；
-已有账号时不再覆盖，避免重启重置运维改过的口令。
+首次启动且表为空时，网关按环境变量 `ADMIN_USERNAME/ADMIN_PASSWORD` 初始化管理员；
+演示账号 `operator/operator123` 与 `viewer/viewer123` 仅在 `SEED_DEMO_USERS` 生效时写入
+（开发/测试默认开启，生产默认关闭，显式设为 `true` 才写入并打印 warning）。
+已有账号时不再覆盖，避免重启重置运维改过的口令。`APP_ENV=production` 且仍使用默认
+JWT/管理员口令/SQLite 时，网关启动直接失败。
 
 ---
 

@@ -369,7 +369,8 @@ class UserCreateRequest(BaseModel):
     """新建账号：用户名限定字母数字与 _.-，避免特殊字符带来的注入与展示问题。"""
 
     username: str = Field(min_length=2, max_length=32, pattern=r"^[a-zA-Z0-9_.-]+$")
-    password: str = Field(min_length=6, max_length=128)
+    # 最小长度与弱口令由 user_service 按配置校验，返回可读的 400 文案
+    password: str = Field(min_length=1, max_length=128)
     role: UserRole = "viewer"
 
 
@@ -378,7 +379,7 @@ class UserUpdateRequest(BaseModel):
 
     role: Optional[UserRole] = None
     active: Optional[bool] = None
-    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 # ==================== 系统状态 ====================

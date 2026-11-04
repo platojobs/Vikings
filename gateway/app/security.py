@@ -16,7 +16,7 @@ from typing import Optional
 import jwt
 from fastapi import Depends, HTTPException, Request
 
-from app.config import get_settings
+from app.config import KNOWN_WEAK_PASSWORDS, get_settings
 
 settings = get_settings()
 ALGORITHM = "HS256"
@@ -60,6 +60,18 @@ def verify_password(password: str, stored: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except (ValueError, TypeError):
         return False
+
+
+def validate_password_strength(password: str, min_length: int = 8) -> Optional[str]:
+    """新建/重置口令的强度校验；返回错误文案，合规返回 None。
+
+    只约束新写入的口令，既有账号继续可登录，避免升级后把运维锁在门外。
+    """
+    if len(password) < min_length:
+        return f"口令至少需要 {min_length} 位"
+    if password.strip().lower() in KNOWN_WEAK_PASSWORDS:
+        return "口令过于常见，请更换为不包含默认账号特征的口令"
+    return None
 
 
 def create_access_token(username: str, role: str = ROLE_ADMIN) -> str:

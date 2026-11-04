@@ -4,12 +4,13 @@
 但已签发的 JWT 不主动失效（演示级取舍，生产可配合短 TTL + 刷新令牌）。
 """
 
+import logging
 from typing import List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.models import AppUser
 from app.security import (
     ALL_ROLES,
@@ -17,9 +18,11 @@ from app.security import (
     ROLE_OPERATOR,
     ROLE_VIEWER,
     hash_password,
+    validate_password_strength,
     verify_password,
 )
 
+logger = logging.getLogger("app.user_service")
 settings = get_settings()
 
 # 首次启动时额外初始化的演示账号，便于直接演示角色差异
@@ -29,42 +32,59 @@ _DEMO_ACCOUNTS = (
 )
 
 
-async def ensure_bootstrap_users(session: AsyncSession) -> List[str]:
+async def ensure_bootstrap_users(
+    session: AsyncSession, cfg: Optional[Settings] = None
+) -> List[str]:
     """首次启动初始化账号，返回本次新建的用户名列表。
 
-    幂等策略：表为空时初始化 admin + 两个演示账号；已有账号时不再覆盖，
-    避免运维改过的口令在重启后被环境变量「重置」。
+    幂等策略：表为空时初始化 admin；演示账号是否写入由 `demo_users_enabled` 决定
+    （开发/测试默认写入，生产默认不写入，`SEED_DEMO_USERS=true` 可显式开启）。
+    已有账号时不再覆盖，避免运维改过的口令在重启后被环境变量「重置」，
+    因此升级不会让现存部署的账号消失。
     """
+    cfg = cfg or settings
     total = int((await session.execute(select(func.count()).select_from(AppUser))).scalar_one())
     if total > 0:
         return []
 
     created: List[str] = []
-    if settings.admin_username:
+    if cfg.admin_username:
         session.add(
             AppUser(
-                username=settings.admin_username,
-                password_hash=hash_password(settings.admin_password),
+                username=cfg.admin_username,
+                password_hash=hash_password(cfg.admin_password),
                 role=ROLE_ADMIN,
                 active=True,
             )
         )
-        created.append(settings.admin_username)
+        created.append(cfg.admin_username)
 
-    for username, password, role, _ in _DEMO_ACCOUNTS:
-        if username == settings.admin_username:
-            continue
-        session.add(
-            AppUser(
-                username=username,
-                password_hash=hash_password(password),
-                role=role,
-                active=True,
+    demo_created: List[str] = []
+    if cfg.demo_users_enabled:
+        for username, password, role, _ in _DEMO_ACCOUNTS:
+            if username == cfg.admin_username:
+                continue
+            session.add(
+                AppUser(
+                    username=username,
+                    password_hash=hash_password(password),
+                    role=role,
+                    active=True,
+                )
             )
-        )
-        created.append(username)
+            demo_created.append(username)
+            created.append(username)
 
     await session.flush()
+
+    if demo_created:
+        if cfg.is_production:
+            logger.warning(
+                "生产环境已显式启用 SEED_DEMO_USERS，写入演示账号：%s（请尽快替换口令或停用）",
+                ", ".join(demo_created),
+            )
+        else:
+            logger.info("已初始化演示账号：%s", ", ".join(demo_created))
     return created
 
 
@@ -93,6 +113,9 @@ async def create_user(
     """新建账号；用户名重复时返回错误文案由路由转 409。"""
     if role not in ALL_ROLES:
         return None, "角色非法"
+    password_error = validate_password_strength(password, settings.password_min_length)
+    if password_error:
+        return None, password_error
     if await session.get(AppUser, username) is not None:
         return None, "用户名已存在"
     user = AppUser(username=username, password_hash=hash_password(password), role=role, active=True)
@@ -112,6 +135,11 @@ async def update_user(
     user = await session.get(AppUser, username)
     if user is None:
         return None, "账号不存在"
+
+    if password:
+        password_error = validate_password_strength(password, settings.password_min_length)
+        if password_error:
+            return None, password_error
 
     losing_admin = (
         role is not None and role != ROLE_ADMIN and user.role == ROLE_ADMIN

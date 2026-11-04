@@ -33,7 +33,13 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("网关启动，数据库: %s", settings.database_url)
+    # 生产环境先做配置安全校验：默认/弱密钥、弱口令或 SQLite 直接拒绝启动。
+    # 开发/测试环境允许默认值，但用醒目 warning 提醒风险。
+    settings.validate_for_production()
+    for warning in settings.security_warnings():
+        logger.warning("安全配置提醒：%s", warning)
+
+    logger.info("网关启动（APP_ENV=%s），数据库: %s", settings.app_env, settings.safe_database_url)
     app.state.started_at = datetime.now(timezone.utc)
     await init_models()
 
@@ -97,6 +103,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"code": exc.status_code, "message": exc.detail, "data": None},
+        headers=exc.headers,
     )
 
 

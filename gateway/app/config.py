@@ -1,9 +1,43 @@
 """网关配置：全部通过环境变量注入，禁止在代码里硬编码连接信息。"""
 
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
+from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 仓库内公开过的 JWT 默认值：生产环境一律视为不安全，即使长度达标
+KNOWN_WEAK_JWT_SECRETS = frozenset(
+    {
+        "change-me-in-production",
+        "iot-platform-dev-secret-key-please-change-in-prod",
+        "secret",
+        "dev-secret",
+        "jwt-secret",
+        "your-secret-key",
+    }
+)
+
+# 常见弱口令（含本仓库演示账号）与默认数据库口令
+KNOWN_WEAK_PASSWORDS = frozenset(
+    {
+        "admin123",
+        "operator123",
+        "viewer123",
+        "password",
+        "password123",
+        "123456",
+        "12345678",
+        "123456789",
+        "qwerty",
+        "abc123",
+        "letmein",
+        "welcome",
+        "changeme",
+        "test1234",
+    }
+)
+KNOWN_WEAK_DB_PASSWORDS = frozenset({"iot_pass", "postgres", "password", "admin123"})
 
 
 class Settings(BaseSettings):
@@ -17,6 +51,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # ---- 运行环境：development / test / production ----
+    # production 下启动会校验密钥、口令与数据库，仍使用默认值直接拒绝启动
+    app_env: str = "development"
 
     # ---- 数据库：默认 SQLite 保证零依赖可跑，生产通过 .env 指向 PostgreSQL ----
     database_url: str = "sqlite+aiosqlite:///./data/iot.db"
@@ -34,6 +72,14 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 720
     admin_username: str = "admin"
     admin_password: str = "admin123"
+    # 口令最小长度（新建/重置账号时校验，既有账号不受影响）
+    password_min_length: int = 8
+    # 演示账号 operator/viewer：None 表示按环境决定（开发/测试种，生产不种）
+    seed_demo_users: Optional[bool] = None
+    # 登录失败限流：同一 IP + 账号在窗口内失败达到阈值后锁定
+    login_max_failures: int = 5
+    login_failure_window_seconds: int = 300
+    login_lockout_seconds: int = 900
 
     # ---- AI 诊断 ----
     llm_base_url: str = "https://api.openai.com/v1"
@@ -76,6 +122,81 @@ class Settings(BaseSettings):
     @property
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() == "production"
+
+    @property
+    def demo_users_enabled(self) -> bool:
+        """演示账号开关：显式配置优先，否则开发/测试默认开启、生产默认关闭。"""
+        if self.seed_demo_users is not None:
+            return self.seed_demo_users
+        return not self.is_production
+
+    @property
+    def safe_database_url(self) -> str:
+        """日志用数据库地址：保留主机/库名，隐藏口令。"""
+        parsed = urlsplit(self.database_url)
+        if not parsed.password:
+            return self.database_url
+        netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@", 1)
+        return parsed._replace(netloc=netloc).geturl()
+
+    def security_warnings(self) -> List[str]:
+        """开发/测试环境的醒目告警；生产环境由 validate_for_production 直接拦截。"""
+        warnings: List[str] = []
+        secret = self.jwt_secret.strip()
+        if len(secret) < 32 or secret.lower() in KNOWN_WEAK_JWT_SECRETS:
+            warnings.append(
+                f"JWT_SECRET 仍为默认/弱密钥（长度 {len(secret)}），仅适合本地开发"
+            )
+        if (
+            self.admin_password.strip().lower() in KNOWN_WEAK_PASSWORDS
+            or len(self.admin_password) < self.password_min_length
+        ):
+            warnings.append("ADMIN_PASSWORD 仍为默认/弱口令，仅适合本地开发")
+        if self.is_sqlite:
+            warnings.append("DATABASE_URL 使用 SQLite 默认值，仅适合本地开发")
+        return warnings
+
+    def validate_for_production(self) -> None:
+        """生产环境启动校验：任何默认/弱密钥、弱口令、SQLite 都直接拒绝启动。"""
+        if not self.is_production:
+            return
+
+        errors: List[str] = []
+        secret = self.jwt_secret.strip()
+        if len(secret) < 32:
+            errors.append(
+                "JWT_SECRET 长度不足 32 位；生成命令："
+                "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+            )
+        elif secret.lower() in KNOWN_WEAK_JWT_SECRETS:
+            errors.append("JWT_SECRET 仍是仓库公开的默认值，必须替换为随机密钥")
+
+        password = self.admin_password.strip()
+        if password.lower() in KNOWN_WEAK_PASSWORDS or len(password) < self.password_min_length:
+            errors.append(
+                f"ADMIN_PASSWORD 仍是默认/弱口令（至少 {self.password_min_length} 位且不能是常见口令）"
+            )
+
+        if self.is_sqlite:
+            errors.append("DATABASE_URL 仍是默认 SQLite；生产必须使用 PostgreSQL")
+        else:
+            db_password = urlsplit(self.database_url).password or ""
+            if not db_password:
+                errors.append("DATABASE_URL 未显式设置数据库口令")
+            elif (
+                db_password.lower() in KNOWN_WEAK_DB_PASSWORDS
+                or len(db_password) < 8
+            ):
+                errors.append("DATABASE_URL 的数据库口令仍是默认/弱口令")
+
+        if errors:
+            raise RuntimeError(
+                "生产环境配置不安全，拒绝启动：\n- " + "\n- ".join(errors)
+            )
 
 
 @lru_cache

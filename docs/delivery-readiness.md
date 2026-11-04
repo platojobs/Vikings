@@ -6,7 +6,7 @@
 
 ## 总体结论
 
-**功能闭环和自动化测试已经达到「可演示、可验收」，但离「别人拿到就能安全部署上线」仍有三个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）、默认凭据与登录防护不足、Broker 匿名接入且无设备凭证。** 补齐这 3 项 P0 后即可交付；其余 P1 决定上线后的可运维性与口碑。
+**功能闭环和自动化测试已经达到「可演示、可验收」；P0-2（默认凭据与登录防护）已于 v1.16.0 完成，但离「别人拿到就能安全部署上线」仍有 2 个硬阻断：缺生产部署入口（无 Dockerfile / 反代 / HTTPS）、Broker 匿名接入且无设备凭证。** 补齐剩余 P0 后即可交付；其余 P1 决定上线后的可运维性与口碑。
 
 已确认做得好、不需要返工的部分：
 
@@ -35,23 +35,31 @@
 - **预估工作量**：2~3 人日（含一次云主机实测）。
 - **依赖关系**：依赖 P0-2 的密钥注入方式与 P0-3 的 Broker 凭证配置；可先起骨架，最后联调。
 
-### P0-2 默认密钥与演示账号可直接登录，且无登录限流
+### P0-2 默认密钥与演示账号可直接登录，且无登录限流 ✅ 已完成（v1.16.0）
 
 - **现状证据**
-  - `gateway/app/config.py:33-36`：`jwt_secret = "change-me-in-production"`、`admin_username = "admin"`、`admin_password = "admin123"`（注释写「禁止硬编码」，但默认值仍是硬编码口令）。
-  - `gateway/app/services/user_service.py:25-29,32-68`：表为空时无条件创建 `operator/operator123`、`viewer/viewer123`，并与默认 admin 一起落库；`README.md:148-150` 公开写明这些账号。
-  - `gateway/app/schemas.py:100-102` 登录入参只要求 `min_length=1`；`gateway/app/api/routes/auth.py:16-33` 无失败计数、无锁定、无限流。
+  - `gateway/app/config.py:71-84`（审计时 33-36）：`jwt_secret = "change-me-in-production"`、`admin_username = "admin"`、`admin_password = "admin123"`（注释写「禁止硬编码」，但默认值仍是硬编码口令）。
+  - `gateway/app/services/user_service.py:35-75`（审计时 25-68）：表为空时无条件创建 `operator/operator123`、`viewer/viewer123`，并与默认 admin 一起落库；`README.md:148-150` 公开写明这些账号。
+  - `gateway/app/schemas.py:100-102` 登录入参只要求 `min_length=1`；`gateway/app/api/routes/auth.py:16-52`（审计时 16-33）无失败计数、无锁定、无限流。
   - `infra/docker-compose.yml:27-30` PostgreSQL 口令硬编码 `iot_pass`。
-  - `gateway/app/config.py:34` token 固定 720 分钟，`gateway/app/security.py` 无刷新/吊销机制。
+  - `gateway/app/config.py:72` token 固定 720 分钟，`gateway/app/security.py` 无刷新/吊销机制。
 - **缺口**：公网暴露即等同默认管理员权限；暴力破解无成本；口令可任意短；数据库口令随仓库分发。
 - **建议做法**
   1. 启动时若 `jwt_secret` 仍为默认值或 `admin_password` 仍为 `admin123` 且 `APP_ENV=production`，直接 fail-fast 拒绝启动；
-  2. 生产关闭演示账号种子（新增 `seed_demo_accounts=false` 开关），`admin_password` 从 secret 注入；
-  3. 登录限流（网关内 `slowapi` 或反代层限制 IP+用户名，5 次/分钟、失败指数退避）；
-  4. 新建/重置口令最小长度 8~12 并做基础强度校验；PostgreSQL 口令改为 compose 环境变量注入；
-  5. token 策略至少做到「短 TTL + 刷新」，或提供服务端吊销（P2 可细化）。
+  2. 生产关闭演示账号种子（`SEED_DEMO_USERS`，生产默认关闭），`admin_password` 从 secret 注入；
+  3. 登录限流（网关内进程内计数按 IP+账号；多进程部署需反代层或 Redis 做全局限制）；
+  4. 新建/重置口令最小长度与弱口令校验（已实现）；PostgreSQL 口令的 compose 注入随 P0-1 落地；
+  5. token 短 TTL / 刷新 / 吊销不在本轮范围，见 P2-4。
 - **预估工作量**：1~2 人日。
 - **依赖关系**：与 P0-1 的环境变量体系一起落地；限流可独立先做。
+- **完成证据（v1.16.0）**
+  - `gateway/app/config.py` 新增 `APP_ENV`、`validate_for_production()`（密钥长度 + 已知弱值 + 管理员口令 + PostgreSQL 口令）与 `security_warnings()`；
+  - `gateway/app/main.py:35-42` 在 lifespan 最先执行生产校验，失败即拒绝启动；日志中的数据库地址改为脱敏；
+  - `gateway/app/services/user_service.py` 的 `ensure_bootstrap_users` 由 `demo_users_enabled` 控制，生产默认不种演示账号；
+  - `gateway/app/services/login_guard.py` + `gateway/app/api/routes/auth.py` 实现 IP+账号限流，超限 429 + `Retry-After`，成功登录清零；
+  - `gateway/app/security.py` 的 `validate_password_strength()` 接入新建/重置账号；
+  - 新增 `gateway/tests/test_auth_protection.py` 11 条用例，gateway `pytest` 78 passed；
+  - README 4.2.1 必改项、`docs/contracts.md` 429/口令/种子语义、`docs/releases/v1.16.0.md` 已同步。
 
 ### P0-3 Broker 匿名接入，设备无凭证/无 ACL
 
@@ -68,7 +76,7 @@
 - **预估工作量**：2~3 人日（含凭证生命周期与迁移）。
 - **依赖关系**：依赖 P0-1 的部署 profile 划分；与设备注册流程（当前仅元数据）一起改。
 
-> P0 只保留以上 3 项：不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
+> P0 共 3 项，其中 P0-2 已在 v1.16.0 完成；剩余 P0-1 / P0-3。不把「告警备注」「指标美化」「依赖扫描」等体验/质量项混入阻断清单。
 
 ---
 
@@ -216,7 +224,7 @@
 
 **建议版本切分**
 
-- `v1.16.0`：P0-2 + P0-3 + P1-1（安全与可观测性）；
+- `v1.16.0`：P0-2 + P0-3 + P1-1（安全与可观测性）；P0-2 已完成，P0-3/P1-1 待做；
 - `v1.17.0`：P0-1 + P1-3 + P1-6（可部署与可运维）；
 - `v1.18.0`：P1-2 + P1-4 + P1-5 + P1-7（数据、Web 对齐、发布工程与测试补强）；
 - P2 项穿插或单独小版本。

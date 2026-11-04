@@ -147,8 +147,29 @@ brew install mosquitto postgresql@16 python@3.14
 | MQTT（浏览器） | ws://127.0.0.1:9001 |
 
 默认后台账号：`admin / admin123`（见 `gateway/.env`，生产必须改）。
-首次启动还会创建两个演示账号：`operator / operator123`（运维）、`viewer / viewer123`（只读），
-用于直接演示角色权限差异。
+开发/测试环境首次启动还会创建两个演示账号：`operator / operator123`（运维）、
+`viewer / viewer123`（只读），用于直接演示角色权限差异；生产环境默认**不创建**演示账号。
+
+#### 4.2.1 生产部署前的必改项（v1.16.0）
+
+`APP_ENV=production` 时，网关启动会先校验配置；只要仍有默认/弱密钥、弱口令或 SQLite，
+就打印具体原因并**拒绝启动**。开发环境允许默认值，但启动日志会出现「安全配置提醒」。
+
+| 必改项 | 环境变量 | 要求 | 示例 / 命令 |
+| --- | --- | --- | --- |
+| 运行环境 | `APP_ENV` | 生产必须为 `production` | `APP_ENV=production` |
+| JWT 密钥 | `JWT_SECRET` | ≥ 32 位随机值，且不能是仓库公开的默认值 | `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| 管理员口令 | `ADMIN_PASSWORD` | ≥ `PASSWORD_MIN_LENGTH`（默认 8），且不在常见弱口令表 | 手工设置强口令，不要沿用 `admin123` |
+| 数据库 | `DATABASE_URL` | 必须 PostgreSQL，且口令 ≥ 8 位、不能是 `iot_pass` | `postgresql+asyncpg://iot:<强口令>@db:5432/iot` |
+| 演示账号 | `SEED_DEMO_USERS` | 生产默认不种子；仅在明确需要演示时设为 `true` | 留空（推荐） |
+| 登录限流 | `LOGIN_MAX_FAILURES` / `LOGIN_FAILURE_WINDOW_SECONDS` / `LOGIN_LOCKOUT_SECONDS` | 默认 5 次 / 300 秒窗口 / 锁定 900 秒 | 按暴露面调整 |
+
+说明：
+
+- 已有账号表非空时不会再写入任何种子账号，升级不会让现存账号消失，也不会重置运维改过的口令。
+- 限流按「直连客户端 IP + 用户名」在**进程内**计数，成功登录清零；多进程/多副本部署时各进程独立计数，
+  真实阈值会被放大，生产建议同时在反向代理层做限流。
+- 新建/重置账号的口令强度校验只影响后续写入，既有账号继续可登录。
 
 ### 4.3 启动设备端
 
@@ -686,3 +707,5 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.13.1` | Web 测试基建：vitest + jsdom 复用生产 Vite 配置，7 条路由守卫用例（未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底）接入 CI `web` 作业（[发布说明](docs/releases/v1.13.1.md)） |
 | `v1.14.0` | 设备分组变更实时化：网关在 `PATCH` 落库后发布 `device/system/group`，移动看板就地更新分组名、移出当前筛选并防抖重拉 chips / total / 汇总卡；E2E 增加真实 Broker 的分组变更验收（[发布说明](docs/releases/v1.14.0.md)） |
 | `v1.15.0` | 移动端新增「告警中心」第三 tab：级别 / 状态 / 设备筛选、滚动分页、多选批量确认、实时入顶与未读角标；网关新增 `POST /api/alerts/bulk-ack`（部分失败逐类可见），告警级别校验放宽到 info/notice/warning/critical；补 `PATCH /api/devices/{id}` HTTP 回归与真实 Broker 告警中心验收（[发布说明](docs/releases/v1.15.0.md)） |
+| `v1.15.1` | 交付就绪只读审计：按安全、部署、可观测性、数据生命周期、功能闭环、发布工程、文档与测试边界产出 P0/P1/P2 分级清单与执行顺序（[交付就绪清单](docs/delivery-readiness.md)） |
+| `v1.16.0` | P0-2 默认凭据与登录防护：`APP_ENV=production` 启动校验默认 JWT/管理员口令/数据库并在不合规时拒绝启动；演示账号仅开发/测试默认种子；登录按 IP+账号限流（429 + `Retry-After`）；新建/重置口令最小长度与弱口令校验；登录响应结构与既有鉴权语义不变（[发布说明](docs/releases/v1.16.0.md)） |
