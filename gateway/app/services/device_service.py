@@ -255,18 +255,40 @@ async def latest_record(session: AsyncSession, device_id: str) -> Optional[Senso
     return (await session.execute(stmt)).scalars().first()
 
 
-async def latest_records_all(session: AsyncSession) -> List[SensorRecord]:
-    """全局每个设备的最新一条（仪表盘首屏兜底，避免前端空窗）。"""
+async def latest_records_all(
+    session: AsyncSession,
+    status: Optional[str] = None,
+    keyword: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[SensorRecord]:
+    """全局每个设备的最新一条（仪表盘首屏兜底，避免前端空窗）。
+
+    过滤与分页均为可选：不传时与历史行为完全一致（无过滤、无截断、按时间倒序）。
+    设备状态 / 关键词过滤需要关联设备表，仅在传入时才做 join。
+    """
     subq = (
         select(SensorRecord.device_id, func.max(SensorRecord.ts).label("max_ts"))
         .group_by(SensorRecord.device_id)
         .subquery()
     )
-    stmt = (
-        select(SensorRecord)
-        .join(subq, (SensorRecord.device_id == subq.c.device_id) & (SensorRecord.ts == subq.c.max_ts))
-        .order_by(SensorRecord.ts.desc())
+    stmt = select(SensorRecord).join(
+        subq, (SensorRecord.device_id == subq.c.device_id) & (SensorRecord.ts == subq.c.max_ts)
     )
+
+    if status or keyword:
+        stmt = stmt.join(Device, Device.device_id == SensorRecord.device_id)
+        if status:
+            stmt = stmt.where(Device.status == status)
+        if keyword:
+            like = "%" + keyword + "%"
+            stmt = stmt.where(Device.device_id.ilike(like) | Device.name.ilike(like))
+
+    stmt = stmt.order_by(SensorRecord.ts.desc())
+    if offset:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
     return list((await session.execute(stmt)).scalars().all())
 
 

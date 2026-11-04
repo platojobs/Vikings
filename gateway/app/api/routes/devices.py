@@ -215,10 +215,19 @@ async def device_records_aggregate(
 
 @router.get("/records/latest", response_model=ApiResponse[list[SensorRecordOut]])
 async def latest_records(
+    status: Optional[str] = Query(default=None, pattern="^(online|offline)$"),
+    keyword: Optional[str] = Query(default=None, max_length=64),
+    limit: Optional[int] = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
-    rows = await device_service.latest_records_all(session)
+    """全局最新值。
+
+    status / keyword / limit / offset 均为可选参数；不传时返回结构与语义与历史一致
+    （全部设备各自最新一条、按时间倒序、不截断），因此老客户端无需改动。
+    """
+    rows = await device_service.latest_records_all(session, status, keyword, limit, offset)
     return ApiResponse(data=[SensorRecordOut.model_validate(row) for row in rows])
 
 

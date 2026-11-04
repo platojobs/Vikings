@@ -279,6 +279,20 @@ http://192.168.1.8:5173
 | 单设备最近 10 条上报 | `GET /api/devices/{id}/records` | REST（详情页） |
 | 指令回执 | `GET /api/devices/{id}/commands` | REST（详情页，写完自动刷新） |
 
+搜索与筛选（v1.10.0）：
+
+| 能力 | 行为 |
+| --- | --- |
+| 搜索框 | 按设备名称 / ID 模糊匹配，大小写不敏感；输入 300ms 防抖，避免逐字符请求 |
+| 状态筛选 | 全部 / 在线 / 离线 / 有告警（未处理告警按设备聚合）；切换后重拉首屏快照 |
+| 列表分页 | 首屏 REST 快照最多 100 台，列表每次渲染 20 条，底部「加载更多」增量展示 |
+| 汇总联动 | 汇总卡始终保留全量统计，并标注「筛选结果 N 台 / 全部 M 台」；筛选无结果时给出可读空状态，不清空汇总卡 |
+| 实时协同 | 筛选只作用于渲染层，MQTT 上报 / 上下线 / 告警仍写入完整快照；上下线事件会即时改变「在线 / 离线」筛选结果，实时值不会因筛选丢失 |
+
+> 分页策略：设备快照一次性取回（`pageSize=100`），列表按 20 条递增渲染，
+> 避免首屏一次性构造大量卡片；网关已支持 `page/pageSize/status/keyword` 服务端分页，
+> 设备规模超过 100 台时可平滑切换为服务端分页。
+
 写操作（仅 admin / operator，viewer 只读）：
 
 | 操作 | 入口 | 复用的网关接口 | 行为 |
@@ -387,7 +401,7 @@ http://192.168.1.8:5173
 | GET | `/api/devices/{id}` | 设备详情 + 最新数据 |
 | GET | `/api/devices/{id}/records` | 历史数据（start / end / limit） |
 | GET | `/api/devices/{id}/records/aggregate` | 按小时/天聚合（avg/min/max） |
-| GET | `/api/records/latest` | 全局最新数据（看板首屏兜底） |
+| GET | `/api/records/latest` | 全局最新数据（可选 status / keyword / limit / offset，不传时行为不变） |
 | GET | `/api/alerts` | 告警列表（deviceId / level / status） |
 | POST | `/api/alerts/{id}/ack` | 告警确认 |
 | GET | `/api/alerts/summary` | 告警统计 |
@@ -560,3 +574,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.9.1` | 移动看板 Widget 测试补强：登录、写操作确认/取消/回执、告警移除、权限禁用、实时降级与 401 路径 |
 | `v1.9.2` | 真实 Broker 端到端验收：WebSocket 实时增量、指令回执、告警 acked、停 Broker 降级与恢复；验收固化为可重复脚本 |
 | `v1.9.3` | E2E 纳入 GitHub Actions 独立作业（mosquitto + 端口检查 + 超时 + 清理）；E2E 使用临时 Broker 数据目录与 Python/Mosquitto 路径自适应 |
+| `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试 |

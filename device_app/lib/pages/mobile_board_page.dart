@@ -88,6 +88,18 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   /// 正在确认的告警 ID，用于防重复点击与按钮 loading。
   String? _ackingAlertId;
 
+  /// 顶部搜索框与状态筛选：只影响列表渲染，不影响实时事件落库。
+  final TextEditingController _searchController = TextEditingController();
+  Timer? _searchDebounce;
+  String _keyword = '';
+  _BoardStatusFilter _statusFilter = _BoardStatusFilter.all;
+
+  /// 列表按批懒加载，避免一次性渲染全量设备卡片。
+  int _visibleCount = _boardPageSize;
+
+  static const int _boardPageSize = 20;
+  static const Duration _searchDebounceDelay = Duration(milliseconds: 300);
+
   static const Duration _pollInterval = Duration(seconds: 15);
 
   @override
@@ -129,6 +141,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _searchDebounce?.cancel();
+    _searchController.dispose();
     _pollTimer?.cancel();
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
@@ -649,6 +663,86 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     _syncRealtimeLifecycle();
   }
 
+  // ---------------- 搜索与状态筛选 ----------------
+
+  /// 输入防抖：300ms 内连续输入只触发一次过滤与首屏重拉。
+  void _onSearchChanged(String value) {
+    // 立即重建一次以同步输入框清除按钮显隐，实际过滤等防抖结束后执行。
+    if (mounted) {
+      setState(() {});
+    }
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(_searchDebounceDelay, () {
+      if (!mounted) {
+        return;
+      }
+      final keyword = value.trim().toLowerCase();
+      if (keyword == _keyword) {
+        return;
+      }
+      setState(() {
+        _keyword = keyword;
+        _visibleCount = _boardPageSize;
+      });
+      unawaited(_loadData(silent: true));
+    });
+  }
+
+  void _clearSearch() {
+    _searchDebounce?.cancel();
+    _searchController.clear();
+    if (_keyword.isEmpty) {
+      setState(() {});
+      return;
+    }
+    setState(() {
+      _keyword = '';
+      _visibleCount = _boardPageSize;
+    });
+    unawaited(_loadData(silent: true));
+  }
+
+  /// 切换筛选后重拉首屏，保证列表与汇总卡基于同一份最新快照。
+  void _onStatusChanged(_BoardStatusFilter filter) {
+    if (_statusFilter == filter) {
+      return;
+    }
+    setState(() {
+      _statusFilter = filter;
+      _visibleCount = _boardPageSize;
+    });
+    unawaited(_loadData(silent: true));
+  }
+
+  /// 未处理告警按设备聚合，供「有告警」筛选使用。
+  Set<String> get _alertDeviceIds => _alerts
+      .where((item) => item.status == 'open')
+      .map((item) => item.deviceId)
+      .toSet();
+
+  /// 只在渲染层过滤：实时事件仍然落在完整快照上，筛选期间不会丢实时值。
+  List<DeviceSummary> get _filteredDevices {
+    final alertIds = _alertDeviceIds;
+    return _devices.where((device) {
+      if (_keyword.isNotEmpty) {
+        final id = device.deviceId.toLowerCase();
+        final name = device.name.toLowerCase();
+        if (!id.contains(_keyword) && !name.contains(_keyword)) {
+          return false;
+        }
+      }
+      return switch (_statusFilter) {
+        _BoardStatusFilter.all => true,
+        _BoardStatusFilter.online => _isOnline(device),
+        _BoardStatusFilter.offline => !_isOnline(device),
+        _BoardStatusFilter.alert => alertIds.contains(device.deviceId),
+      };
+    }).toList(growable: false);
+  }
+
+  bool get _filterActive =>
+      _keyword.isNotEmpty || _statusFilter != _BoardStatusFilter.all;
+
   SensorReading? _readingFor(String deviceId) {
     for (final reading in _readings) {
       if (reading.deviceId == deviceId) {
@@ -673,6 +767,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         apiClientFactory: _createApiClient,
       );
     }
+    final filtered = _filteredDevices;
+    final visibleDevices = filtered.take(_visibleCount).toList(growable: false);
     return Scaffold(
       appBar: AppBar(
         title: const Text('移动看板'),
@@ -705,8 +801,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                 _buildWriteHint(_writeDisabledHint),
               ],
               const SizedBox(height: 10),
-              _buildSummary(),
-              const SizedBox(height: 14),
+              _buildSummary(filtered.length),
+              const SizedBox(height: 12),
+              _buildFilterPanel(),
+              const SizedBox(height: 12),
               _buildSectionTitle('设备与实时值'),
               if (_loading && _devices.isEmpty)
                 const Padding(
@@ -715,7 +813,19 @@ class _MobileBoardPageState extends State<MobileBoardPage>
                 ),
               if (!_loading && _devices.isEmpty)
                 _buildEmpty('暂无设备。请先在 Web 后台注册设备，或启动设备模拟器上报。'),
-              ..._devices.map(_buildDeviceCard),
+              if (!_loading && _devices.isNotEmpty && filtered.isEmpty)
+                _buildFilterEmpty(),
+              ...visibleDevices.map(_buildDeviceCard),
+              if (filtered.length > _visibleCount)
+                Center(
+                  child: TextButton(
+                    onPressed: () =>
+                        setState(() => _visibleCount += _boardPageSize),
+                    child: Text(
+                      '加载更多（已显示 ${visibleDevices.length} / ${filtered.length}）',
+                    ),
+                  ),
+                ),
               const SizedBox(height: 8),
               _buildSectionTitle('未处理告警（${_alerts.length}）'),
               if (_alerts.isEmpty) _buildEmpty('当前没有未处理告警'),
@@ -876,7 +986,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     );
   }
 
-  Widget _buildSummary() {
+  Widget _buildSummary(int matched) {
     final online = _devices.where(_isOnline).length;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
@@ -885,11 +995,105 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
-      child: Row(
+      child: Column(
         children: [
-          _summaryItem('设备总数', '${_devices.length}'),
-          _summaryItem('在线', '$online'),
-          _summaryItem('未处理告警', '${_alerts.length}'),
+          Row(
+            children: [
+              _summaryItem('设备总数', '${_devices.length}'),
+              _summaryItem('在线', '$online'),
+              _summaryItem('未处理告警', '${_alerts.length}'),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Container(height: 1, color: const Color(0xFFE2E8F0)),
+          const SizedBox(height: 8),
+          Text(
+            _filterActive
+                ? '筛选结果：$matched 台 / 全部 ${_devices.length} 台'
+                : '全部 ${_devices.length} 台设备，实时值随 MQTT 增量更新',
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 顶部搜索框 + 状态筛选；筛选只作用于列表，汇总卡保留全量口径。
+  Widget _buildFilterPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        TextField(
+          controller: _searchController,
+          onChanged: _onSearchChanged,
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            hintText: '搜索设备名称或 ID',
+            isDense: true,
+            prefixIcon: const Icon(Icons.search, size: 20),
+            suffixIcon: _searchController.text.isEmpty
+                ? null
+                : IconButton(
+                    tooltip: '清空搜索',
+                    onPressed: _clearSearch,
+                    icon: const Icon(Icons.close, size: 18),
+                  ),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              for (final filter in _BoardStatusFilter.values) ...[
+                ChoiceChip(
+                  label: Text(filter.label),
+                  selected: _statusFilter == filter,
+                  onSelected: (_) => _onStatusChanged(filter),
+                ),
+                const SizedBox(width: 8),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 筛选无结果时的可读空状态：明确说明原因是筛选，而不是设备不存在。
+  Widget _buildFilterEmpty() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.search_off, size: 18, color: Colors.black45),
+              const SizedBox(width: 8),
+              Text(
+                '没有匹配的设备',
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '当前筛选：${_statusFilter.label}'
+            '${_keyword.isEmpty ? '' : ' · 关键词「$_keyword」'}；'
+            '可清空关键词或切回「全部」。上方汇总卡仍为全部 ${_devices.length} 台设备。',
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
         ],
       ),
     );
@@ -1409,6 +1613,18 @@ class _GatewaySettings {
 
   final String baseUrl;
   final String realtimeUrl;
+}
+
+/// 顶部状态筛选：全部 / 在线 / 离线 / 有告警。
+enum _BoardStatusFilter {
+  all('全部'),
+  online('在线'),
+  offline('离线'),
+  alert('有告警');
+
+  const _BoardStatusFilter(this.label);
+
+  final String label;
 }
 
 String _formatTime(DateTime? time) {

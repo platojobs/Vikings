@@ -162,7 +162,12 @@
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit` |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
-| GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底） |
+| GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`，均可选 |
+
+`/api/records/latest` 的过滤与分页参数全部可选：不传时语义与历史一致（每个设备各自最新一条、
+按时间倒序、不截断）；`keyword` 同时匹配设备 ID 与名称，`status` 依赖设备表关联。
+`/api/devices` 的 `status` / `keyword` / `group` / `page` / `pageSize` 同样为可选参数，
+不传时默认第一页 20 台、不加过滤。
 
 写操作权限：注册 / 批量注册 / 编辑为 operator+admin，删除为 admin。
 
