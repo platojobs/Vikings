@@ -142,10 +142,12 @@ class _FakeApiClient extends ApiClient {
     List<DeviceSummary>? devices,
     List<SensorReading>? readings,
     List<AlertItem>? alerts,
+    List<SensorReading>? records,
     this.stats,
   }) : devices = devices ?? const <DeviceSummary>[_device],
        readings = readings ?? const <SensorReading>[_reading],
        alerts = alerts ?? const <AlertItem>[_openAlert],
+       records = records ?? const <SensorReading>[],
        super(baseUrl: 'http://192.168.1.8:8000');
 
   /// 仅在对应用例注入；为空时返回固定测试数据。
@@ -154,6 +156,9 @@ class _FakeApiClient extends ApiClient {
   final List<DeviceSummary> devices;
   final List<SensorReading> readings;
   final List<AlertItem> alerts;
+
+  /// 详情页历史上报：按网关语义（时间倒序取切片后翻转正序）返回。
+  final List<SensorReading> records;
   final StatsOverview? stats;
 
   int loginCalls = 0;
@@ -168,6 +173,10 @@ class _FakeApiClient extends ApiClient {
   String? lastGroup;
   bool lastHasAlert = false;
   int alertFetchCalls = 0;
+  int recordFetchCalls = 0;
+  int lastRecordLimit = 0;
+  int lastRecordOffset = 0;
+  final List<int> recordOffsets = <int>[];
 
   @override
   Future<AuthSession> login({
@@ -344,7 +353,19 @@ class _FakeApiClient extends ApiClient {
     required String token,
     required String deviceId,
     int limit = 10,
-  }) async => const <SensorReading>[];
+    int offset = 0,
+  }) async {
+    recordFetchCalls += 1;
+    lastRecordLimit = limit;
+    lastRecordOffset = offset;
+    recordOffsets.add(offset);
+    // 模拟网关：按时间倒序跳过 offset 取 limit 条，再翻转成时间正序
+    final owned = records
+        .where((item) => item.deviceId == deviceId)
+        .toList(growable: false);
+    final page = owned.reversed.skip(offset).take(limit).toList();
+    return page.reversed.toList(growable: false);
+  }
 
   @override
   Future<CommandItem> sendCommand({
@@ -445,6 +466,41 @@ Future<void> _scrollTo(WidgetTester tester, Finder finder) async {
     scrollable: find.byType(Scrollable).first,
   );
   await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+}
+
+/// 构造历史上报：温度逐条递增（文案唯一），时间随序号递增。
+List<SensorReading> _recordBatch(int count) => List<SensorReading>.generate(
+  count,
+  (index) => SensorReading(
+    deviceId: 'dev-0001',
+    temperature: 20.0 + index,
+    humidity: 50,
+    voltage: 3.8,
+    rssi: -60,
+    battery: 80,
+    seq: index + 1,
+    ts: DateTime.utc(2026, 11, 4).add(Duration(minutes: index)),
+  ),
+);
+
+/// 详情弹层的 ListView（看板列表 padding 为 12，弹层为 16/0/16/16，可据此唯一定位）。
+final Finder _sheetList = find.byWidgetPredicate(
+  (widget) =>
+      widget is ListView &&
+      widget.padding == const EdgeInsets.fromLTRB(16, 0, 16, 16),
+);
+
+/// 单独滚动详情弹层到目标控件，避免误滚看板列表。
+Future<void> _scrollSheetTo(WidgetTester tester, Finder finder) async {
+  await tester.scrollUntilVisible(
+    finder,
+    200,
+    scrollable: find.descendant(
+      of: _sheetList,
+      matching: find.byType(Scrollable),
+    ),
+  );
   await tester.pumpAndSettle();
 }
 
@@ -1011,6 +1067,103 @@ void main() {
     expect(find.text('未分组设备'), findsOneWidget);
     expect(find.text('一号机'), findsNothing);
     expect(find.text('筛选结果：1 台 / 全部 2 台'), findsOneWidget);
+  });
+
+  testWidgets('设备详情历史：首屏一页，滚到底自动加载更早', (tester) async {
+    final api = _FakeApiClient(records: _recordBatch(30));
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+
+    // 首屏只取一页：limit=pageSize+1 作为「是否还有更早」的探测
+    expect(api.recordFetchCalls, 1);
+    expect(api.lastRecordLimit, 11);
+    expect(api.lastRecordOffset, 0);
+
+    // 最新一条（seq 30）排在历史上报区顶部
+    await _scrollSheetTo(tester, find.text('49.0℃ / 50% / 80%'));
+    expect(find.text('49.0℃ / 50% / 80%'), findsOneWidget);
+
+    // 滚到底触发下一页：offset 按页大小递增，不会漏取或重取
+    await tester.drag(_sheetList, const Offset(0, -900));
+    await tester.pumpAndSettle();
+    expect(api.recordFetchCalls, greaterThanOrEqualTo(2));
+    expect(api.recordOffsets, contains(10));
+    expect(api.recordOffsets.every((value) => value % 10 == 0), isTrue);
+
+    // 第二页（seq 11..20）已追加到列表
+    await _scrollSheetTo(tester, find.text('39.0℃ / 50% / 80%'));
+    expect(find.text('39.0℃ / 50% / 80%'), findsOneWidget);
+  });
+
+  testWidgets('设备详情历史：取完最后一页展示「没有更早数据」', (tester) async {
+    final api = _FakeApiClient(records: _recordBatch(10));
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+
+    // 10 条不足一页 + 探测条，说明已到底，不再发第二次请求
+    expect(api.recordFetchCalls, 1);
+    expect(find.text('加载更早'), findsNothing);
+    await _scrollSheetTo(tester, find.text('没有更早数据'));
+    expect(find.text('没有更早数据'), findsOneWidget);
+    expect(api.recordFetchCalls, 1);
+  });
+
+  testWidgets('设备详情历史：实时新上报插到顶部且不打断当前浏览位置', (tester) async {
+    final api = _FakeApiClient(records: _recordBatch(10));
+    final realtime = _FakeRealtimeService(RealtimeState.connected);
+    await _pumpBoard(
+      tester,
+      api: api,
+      session: _adminSession,
+      realtime: realtime,
+    );
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+
+    // 向下浏览一段，模拟用户正在看较早的历史数据
+    await tester.drag(_sheetList, const Offset(0, -200));
+    await tester.pumpAndSettle();
+    final sheetScrollable = find.descendant(
+      of: _sheetList,
+      matching: find.byType(Scrollable),
+    );
+    final positionBefore = tester
+        .state<ScrollableState>(sheetScrollable)
+        .position
+        .pixels;
+    expect(positionBefore, greaterThan(0));
+
+    // 选一条已渲染的历史记录作为锚点，记录其屏幕位置
+    final anchor = find.text('24.0℃ / 50% / 80%');
+    final anchorBefore = tester.getTopLeft(anchor).dy;
+
+    realtime.emit(
+      const ReportEvent(
+        SensorReading(
+          deviceId: 'dev-0001',
+          temperature: 30.0,
+          humidity: 50,
+          voltage: 3.9,
+          rssi: -58,
+          battery: 88,
+          seq: 99,
+          ts: null,
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    // 新上报进入列表（顶部），旧数据锚点仍在原屏幕位置
+    expect(find.text('30.0℃ / 50% / 88%'), findsOneWidget);
+    expect(tester.getTopLeft(anchor).dy, closeTo(anchorBefore, 1.0));
+    final positionAfter = tester
+        .state<ScrollableState>(sheetScrollable)
+        .position
+        .pixels;
+    expect(positionAfter, greaterThan(positionBefore));
   });
 }
 

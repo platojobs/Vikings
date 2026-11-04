@@ -276,7 +276,7 @@ http://192.168.1.8:5173
 | 每设备最新实时值 | `GET /api/records/latest`；`device/+/sensor/report` | REST 兜底 + 实时增量 |
 | 设备上下线 | `device/+/status` | 实时订阅（含 LWT 遗嘱离线） |
 | 未处理告警 | `GET /api/alerts?status=open`；`device/system/alert` | REST 兜底 + 实时插入 |
-| 单设备最近 10 条上报 | `GET /api/devices/{id}/records` | REST（详情页） |
+| 单设备历史上报 | `GET /api/devices/{id}/records?limit=11&offset=N` | REST 分页（详情页，每页 10 条） |
 | 指令回执 | `GET /api/devices/{id}/commands` | REST（详情页，写完自动刷新） |
 
 搜索、筛选与分页（v1.11.0 起全部走服务端）：
@@ -299,6 +299,15 @@ http://192.168.1.8:5173
 > 已知边界：手动下拉刷新 / 筛选切换会重置到第 1 页（已加载的后续页不保留）；
 > 实时新增设备不即时插入当前列表，需等下一次刷新；「有告警」筛选依赖网关 v1.11.0 的
 > `hasAlert` / `withAlertCount` 参数，旧网关会忽略未知参数（此时请升级网关）。
+
+设备详情页「历史上报」（v1.13.0 起分页）：
+
+| 能力 | 行为 |
+| --- | --- |
+| 首屏 | 只取 1 页：`GET /api/devices/{id}/records?limit=11&offset=0`，多取 1 条仅用于判断是否还有更早数据，列表展示最新 10 条（时间倒序） |
+| 加载更早 | 滚动到页脚或点击「加载更早」，按 `offset=<已取条数>` 取下一页并接在列表末尾；加载中显示「正在加载更早数据…」，取完显示「没有更早数据」，首页即空显示「暂无历史上报」 |
+| 实时插入 | 该设备的新上报通过 MQTT 实时通道插到列表顶部；若用户已向下浏览，按插入行的实际高度补偿滚动偏移，正在看的历史数据不会被顶走；停留在顶部时不做补偿，新数据直接可见 |
+| 兼容 | `offset` 为可选增量参数，不传时网关行为与旧版完全一致（最近 `limit` 条、时间正序）；旧网关忽略该参数时详情页只显示首屏一页 |
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -406,7 +415,7 @@ http://192.168.1.8:5173
 | POST | `/api/devices/bulk` | 批量注册（重复跳过） |
 | PATCH/DELETE | `/api/devices/{id}` | 编辑元数据 / 删除（删除仅 admin） |
 | GET | `/api/devices/{id}` | 设备详情 + 最新数据 |
-| GET | `/api/devices/{id}/records` | 历史数据（start / end / limit） |
+| GET | `/api/devices/{id}/records` | 历史数据（start / end / limit，可选 offset；不传 offset 行为不变） |
 | GET | `/api/devices/{id}/records/aggregate` | 按小时/天聚合（avg/min/max） |
 | GET | `/api/records/latest` | 全局最新数据（可选 status / keyword / limit / offset，不传时行为不变） |
 | GET | `/api/alerts` | 告警列表（deviceId / level / status） |
@@ -479,6 +488,31 @@ http://192.168.1.8:5173
 - 扩容路径：`uvicorn --workers` 多进程 → 多实例 + Nginx → 消息队列削峰 → 迁移 Go 网关。
 - 代码按「消费器 / 服务层 / 存储层」分层，迁移时业务逻辑可平移。
 - 时序表建议按 `device_id` 分区或引入 TimescaleDB；当前规模单表 + 复合索引足够。
+
+### 10.1 管理后台代码分割（v1.13.0）
+
+`web` 构建策略（`web/vite.config.ts`）：
+
+- **路由全部懒加载**：仪表盘、设备、历史、告警、审计、账号、OTA、系统状态与登录页
+  均由 `() => import()` 按需加载，入口只保留应用外壳、路由守卫与全局样式；
+- **稳定大依赖单独分包**：`manualChunks` 将 `echarts` / `zrender` 归入 `echarts`，
+  `mqtt` 归入 `mqtt`。图表库只在图表页请求，MQTT 与外壳状态灯共用且独立缓存；
+- **Element Plus 保持按需引入**（`unplugin-vue-components`）：组件跟随各自视图进入异步 chunk，
+  不整包合并，避免把只有部分页面使用的组件塞进入口同步包。
+
+`npm run build`（`vue-tsc --noEmit && vite build`）产物（2026-11-04 实测，无 chunk 体积告警）：
+
+| 产物 | 大小 | 说明 |
+| --- | --- | --- |
+| `index-*.js` | 312.04 kB | 入口主包（原 693.24 kB，降幅约 55%） |
+| `mqtt-*.js` | 345.32 kB | MQTT 客户端，入口 `modulepreload`，与外壳状态灯同期加载 |
+| `echarts-*.js` | 482.73 kB | 图表库，仅图表相关页面需要时加载 |
+| `el-table-column-*.js` | 89.96 kB | Element Plus 按需组件（异步） |
+| `HistoryView-*.js` | 110.64 kB | 最大的业务视图异步 chunk |
+| 其余视图 chunk | 2.9 ~ 34.3 kB | 登录、仪表盘、设备、告警、审计、账号、OTA、系统状态 |
+
+> 入口同步加载的只有 `index` + `mqtt`；`echarts` 与各业务视图均不进入首屏请求。
+> 如后续新增图表页，继续沿用 `@/utils/echarts` 的按需注册，避免把全量 echarts 带入入口包。
 
 ---
 
@@ -584,3 +618,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试（[发布说明](docs/releases/v1.10.0.md)） |
 | `v1.11.0` | 移动看板切换服务端分页与筛选，拆掉首屏 100 台与告警 pageSize=50 上限；网关 `/api/devices` 新增可选 `hasAlert` / `withAlertCount`（按设备聚合未处理告警数），`/api/records/latest` 新增可选 `deviceIds`；汇总卡改用服务端统计，实时与分页协同（[发布说明](docs/releases/v1.11.0.md)） |
 | `v1.12.0` | 移动看板新增分组切换与分组筛选（与搜索、状态、有告警、服务端分页组合生效，切组重置第 1 页）；空分组统一归入「未分组」，网关分组概览同步归并（[发布说明](docs/releases/v1.12.0.md)） |
+| `v1.13.0` | 移动看板设备详情「历史上报」分页（`limit+offset`，首屏一页、加载更早、三态文案、实时插入保持滚动位置）；网关 records 新增可选 `offset`（不传行为不变）；Web 路由全部懒加载 + `manualChunks` 拆分，入口主包 693.24 kB → 312.04 kB 且无体积告警（[发布说明](docs/releases/v1.13.0.md)） |

@@ -198,16 +198,24 @@ async def device_records(
     start: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     end: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     limit: int = Query(default=500, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0, description="从最新一条开始跳过的条数，用于向更早翻页"),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
+    """单设备历史数据。
+
+    offset 为可选增量参数，默认 0：不传时返回结构与语义与历史一致（最近 limit 条、时间正序）。
+    传 offset 时按时间倒序跳过对应条数，用于详情页「加载更早」分页。
+    """
     try:
         start_dt = to_utc_datetime(start) if start else None
         end_dt = to_utc_datetime(end) if end else None
     except ValueError:
         raise HTTPException(status_code=400, detail="时间格式非法，请使用 ISO8601 或毫秒时间戳")
 
-    rows = await device_service.query_records(session, device_id, start_dt, end_dt, limit)
+    rows = await device_service.query_records(
+        session, device_id, start_dt, end_dt, limit, offset
+    )
     return ApiResponse(data=[SensorRecordOut.model_validate(row) for row in rows])
 
 

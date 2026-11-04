@@ -168,7 +168,31 @@ void main() {
     expect(records.first.seq, 12);
     expect(captured.url.path, '/api/devices/dev-0001/records');
     expect(captured.url.queryParameters['limit'], '5');
+    // 回归：默认不传 offset，请求参数与历史保持一致
+    expect(captured.url.queryParameters.containsKey('offset'), isFalse);
     expect(captured.headers['Authorization'], 'Bearer token');
+  });
+
+  test('单设备历史记录翻页时携带 offset', () async {
+    late http.Request captured;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return _jsonResponse(_ok(const <dynamic>[]));
+      }),
+    );
+
+    final records = await client.fetchDeviceRecords(
+      token: 'token',
+      deviceId: 'dev-0001',
+      limit: 10,
+      offset: 10,
+    );
+
+    expect(records, isEmpty);
+    expect(captured.url.queryParameters['limit'], '10');
+    expect(captured.url.queryParameters['offset'], '10');
   });
 
   test('sendCommand 使用 POST 并携带 type/payload，解析回执', () async {

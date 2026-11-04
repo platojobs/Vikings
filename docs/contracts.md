@@ -256,7 +256,7 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `group` / `hasAlert` / `withAlertCount=true` |
 | 分组概览 | `GET /api/devices/groups` | 分组 chips 数据源；空分组与「未分组」合并 |
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
-| 单设备历史上报 | `GET /api/devices/{id}/records` | 看板固定 `limit=10` |
+| 单设备历史上报 | `GET /api/devices/{id}/records` | 详情页分页：`limit=11&offset=<已取条数>`，多取 1 条用于判断是否还有更早数据，展示 10 条/页（v1.13.0） |
 | 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数 |
 | 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
 | 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
@@ -324,6 +324,28 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | 上下线事件 | 立即改变已加载设备在「在线 / 离线」筛选中的可见性；分页游标与 `total` 仍以服务端为准 |
 
 上述行为均有 Widget 测试覆盖（翻页加载、搜索重置分页、聚合告警筛选、末页/空状态）。
+
+#### 3.10.4 设备详情历史上报分页（v1.13.0）
+
+`GET /api/devices/{device_id}/records` 新增可选 `offset`（默认 `0`，`ge=0`），
+不新增端点、不改变响应结构（仍为 `data: [SensorRecordOut]`）：
+
+| 参数 | 语义 |
+| --- | --- |
+| `limit` | 本页最多返回条数，范围 1~2000（默认 500，与历史一致） |
+| `offset` | 从**最新一条**开始跳过的条数；按 `ts desc` 跳过 `offset` 后取 `limit` 条，最终仍翻转为时间正序返回 |
+| 不传 `offset` | 生成 SQL 时不带 OFFSET 子句，行为与旧版完全一致（最近 `limit` 条、时间正序） |
+
+客户端（device_app 详情弹层）：
+
+- 每页展示 10 条，请求 `limit=11&offset=<已从服务端取回条数>`；多取的 1 条只用于判断
+  `hasMore`（返回条数 > 10），不进入列表；
+- 首屏成功后按时间倒序展示（最新在前）；「加载更早」或滚动到底按 `offset` 追加更早一页；
+- 实时新上报插入列表顶部；用户已向下浏览时按插入行实际高度补偿滚动偏移，停留在顶部时直接展示新数据；
+- 三态文案：加载中「加载中…」/「正在加载更早数据…」，到底「没有更早数据」，首页即空「暂无历史上报」。
+
+网关侧回归测试：`gateway/tests/test_device_service.py` 覆盖
+「不传 offset 与显式 offset=0 结果一致」与「offset 逐页向更早取数、越界返回空列表」。
 
 ---
 

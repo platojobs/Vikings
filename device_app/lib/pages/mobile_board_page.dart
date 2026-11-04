@@ -73,6 +73,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   /// 实时通道收到的最新在线状态，优先于 REST 快照。
   final Map<String, String> _liveStatus = <String, String>{};
 
+  /// 实时上报广播：详情弹层打开时订阅，新数据插到列表顶部。
+  final StreamController<SensorReading> _reportStream =
+      StreamController<SensorReading>.broadcast();
+
   BoardRealtimeService? _realtime;
   StreamSubscription<RealtimeEvent>? _eventSub;
   Timer? _pollTimer;
@@ -172,6 +176,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
     _realtime = null;
+    unawaited(_reportStream.close());
     super.dispose();
   }
 
@@ -319,6 +324,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           ];
           _liveStatus[reading.deviceId] = 'online';
         });
+        // 详情弹层按设备过滤后插到顶部；无订阅者时广播流直接丢弃
+        _reportStream.add(reading);
       case StatusEvent(:final deviceId, :final status):
         setState(() => _liveStatus[deviceId] = status);
     }
@@ -1638,6 +1645,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         token: session.token,
         canWrite: _canWrite,
         apiClientFactory: _createApiClient,
+        reportStream: _reportStream.stream,
         onIssueCommand: () => _openCommandDialog(device),
       ),
     );
@@ -1653,6 +1661,7 @@ class _DeviceDetailSheet extends StatefulWidget {
     required this.token,
     required this.canWrite,
     required this.apiClientFactory,
+    required this.reportStream,
     required this.onIssueCommand,
   });
 
@@ -1668,6 +1677,9 @@ class _DeviceDetailSheet extends StatefulWidget {
   /// 与页面共用同一 REST 客户端工厂，测试可注入 fake。
   final BoardApiClientFactory apiClientFactory;
 
+  /// 页面实时上报广播；弹层按设备过滤后插入列表顶部。
+  final Stream<SensorReading> reportStream;
+
   /// 页面层统一处理指令弹窗、提交与 401/403，返回网关回执。
   final Future<CommandItem?> Function() onIssueCommand;
 
@@ -1676,16 +1688,54 @@ class _DeviceDetailSheet extends StatefulWidget {
 }
 
 class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
+  /// 每页条数；请求 limit = _pageSize + 1 作为「是否还有更早数据」的探测。
+  static const int _pageSize = 10;
+
   List<CommandItem> _commands = const <CommandItem>[];
+  /// 历史上报按时间倒序（最新在前），实时新上报插入顶部。
   List<SensorReading> _records = const <SensorReading>[];
   bool _loading = true;
   bool _issuing = false;
+  bool _loadingMore = false;
+  bool _hasMore = false;
   String? _error;
+
+  /// 已从网关取回的条数（不含实时插入），作为下一页 offset；
+  /// 实时插入会加长列表，但不能让服务端游标跟着漂移。
+  int _serverCount = 0;
+
+  final ScrollController _scrollController = ScrollController();
+
+  /// 列表首行的 key：插入前测高，插入后按该行高度补偿滚动位置。
+  final GlobalKey _firstRowKey = GlobalKey();
+
+  StreamSubscription<SensorReading>? _reportSub;
 
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_onScroll);
+    _reportSub = widget.reportStream.listen(_onRealtimeReport);
     _loadDetail();
+  }
+
+  @override
+  void dispose() {
+    _reportSub?.cancel();
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  /// 滚到接近底部时自动取下一页；没有更早数据时为空操作。
+  void _onScroll() {
+    if (!_scrollController.hasClients) {
+      return;
+    }
+    final position = _scrollController.position;
+    if (position.pixels >= position.maxScrollExtent - 80) {
+      _loadOlder();
+    }
   }
 
   /// 打开指令弹窗；成功后刷新回执列表，让新指令出现在顶部。
@@ -1704,6 +1754,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     }
   }
 
+  /// 首屏：指令回执 + 第一页历史上报。
   Future<void> _loadDetail() async {
     final client = widget.apiClientFactory(widget.baseUrl);
     try {
@@ -1715,12 +1766,20 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         client.fetchDeviceRecords(
           token: widget.token,
           deviceId: widget.device.deviceId,
+          limit: _pageSize + 1,
         ),
       ]);
+      final batches = results[1] as List<SensorReading>;
+      // 网关按时间正序返回，最新一条在末尾；探测多取的一条要丢掉
+      final page = batches.length > _pageSize
+          ? batches.sublist(batches.length - _pageSize)
+          : batches;
       if (mounted) {
         setState(() {
           _commands = results[0] as List<CommandItem>;
-          _records = results[1] as List<SensorReading>;
+          _records = _newestFirst(page);
+          _serverCount = page.length;
+          _hasMore = batches.length > _pageSize;
           _error = null;
         });
       }
@@ -1736,6 +1795,97 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     }
   }
 
+  /// 加载更早一页，接在列表末尾；到底后展示「没有更早数据」。
+  Future<void> _loadOlder() async {
+    if (_loading || _loadingMore || !_hasMore) {
+      return;
+    }
+    setState(() => _loadingMore = true);
+    final client = widget.apiClientFactory(widget.baseUrl);
+    try {
+      final batches = await client.fetchDeviceRecords(
+        token: widget.token,
+        deviceId: widget.device.deviceId,
+        limit: _pageSize + 1,
+        offset: _serverCount,
+      );
+      final known = _records.map(_recordKey).toSet();
+      final older = _newestFirst(batches)
+          .where((item) => !known.contains(_recordKey(item)))
+          .take(_pageSize)
+          .toList(growable: false);
+      if (mounted) {
+        setState(() {
+          _records = <SensorReading>[..._records, ...older];
+          _serverCount += older.length;
+          _hasMore = batches.length > _pageSize;
+        });
+      }
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() => _error = error.userMessage);
+      }
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() => _loadingMore = false);
+      }
+    }
+  }
+
+  /// 实时新上报：插到顶部并保持当前查看位置。
+  ///
+  /// 停在顶部时不做补偿（新数据直接可见）；已向下浏览时按插入行高补回偏移，
+  /// 避免正在看的历史数据被顶走。
+  Future<void> _onRealtimeReport(SensorReading reading) async {
+    if (reading.deviceId != widget.device.deviceId) {
+      return;
+    }
+    if (_records.any((item) => _recordKey(item) == _recordKey(reading))) {
+      return;
+    }
+    final offsetBefore = _scrollController.hasClients
+        ? _scrollController.offset
+        : 0.0;
+    final insertedExtent = _firstRowExtent();
+    setState(() => _records = <SensorReading>[reading, ..._records]);
+    if (offsetBefore <= 0) {
+      return;
+    }
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !_scrollController.hasClients) {
+      return;
+    }
+    _scrollController.jumpTo(offsetBefore + insertedExtent);
+  }
+
+  double _firstRowExtent() {
+    final render = _firstRowKey.currentContext?.findRenderObject();
+    if (render is RenderBox && render.hasSize) {
+      return render.size.height;
+    }
+    return 52;
+  }
+
+  String _recordKey(SensorReading record) =>
+      '${record.ts?.toIso8601String() ?? ''}#${record.seq}';
+
+  /// 统一按时间倒序（无时间戳时用 seq 兜底），保证实时插入与分页顺序一致。
+  List<SensorReading> _newestFirst(List<SensorReading> rows) {
+    final sorted = List<SensorReading>.of(rows)..sort((a, b) {
+      final at = a.ts;
+      final bt = b.ts;
+      if (at != null && bt != null) {
+        final byTime = bt.compareTo(at);
+        if (byTime != 0) {
+          return byTime;
+        }
+      }
+      return b.seq.compareTo(a.seq);
+    });
+    return List<SensorReading>.unmodifiable(sorted);
+  }
+
   @override
   Widget build(BuildContext context) {
     final reading = widget.reading;
@@ -1743,6 +1893,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
       child: SizedBox(
         height: MediaQuery.sizeOf(context).height * 0.72,
         child: ListView(
+          controller: _scrollController,
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
           children: [
             Row(
@@ -1830,29 +1981,6 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
               ),
             const SizedBox(height: 14),
             const Text(
-              '最近上报（最多 10 条）',
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 8),
-            if (_loading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else if (_error != null)
-              Text(
-                _error!,
-                style: const TextStyle(color: Colors.red, fontSize: 13),
-              )
-            else if (_records.isEmpty)
-              const Text(
-                '暂无历史上报',
-                style: TextStyle(fontSize: 13, color: Colors.black45),
-              )
-            else
-              ..._records.map(_buildRecordRow),
-            const SizedBox(height: 14),
-            const Text(
               '指令回执',
               style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
             ),
@@ -1864,6 +1992,46 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
               )
             else if (!_loading && _error == null)
               ..._commands.map(_buildCommandRow),
+            const SizedBox(height: 14),
+            const Text(
+              '历史上报',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Column(
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 8),
+                    Text(
+                      '加载中…',
+                      style: TextStyle(fontSize: 12, color: Colors.black45),
+                    ),
+                  ],
+                ),
+              )
+            else if (_error != null)
+              Text(
+                _error!,
+                style: const TextStyle(color: Colors.red, fontSize: 13),
+              )
+            else if (_records.isEmpty)
+              const Text(
+                '暂无历史上报',
+                style: TextStyle(fontSize: 13, color: Colors.black45),
+              )
+            else ...[
+              for (var index = 0; index < _records.length; index += 1)
+                _buildRecordRow(
+                  _records[index],
+                  key: index == 0
+                      ? _firstRowKey
+                      : ValueKey<String>(_recordKey(_records[index])),
+                ),
+              _buildRecordFooter(),
+            ],
             const SizedBox(height: 12),
             Text(
               widget.canWrite
@@ -1877,8 +2045,51 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     );
   }
 
-  Widget _buildRecordRow(SensorReading record) {
+  /// 历史上报的页脚：加载中 / 可加载更早 / 已到底，三种状态都可读。
+  Widget _buildRecordFooter() {
+    if (_loadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 10),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 8),
+            Text(
+              '正在加载更早数据…',
+              style: TextStyle(fontSize: 12, color: Colors.black45),
+            ),
+          ],
+        ),
+      );
+    }
+    if (!_hasMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 10),
+        child: Center(
+          child: Text(
+            '没有更早数据',
+            style: TextStyle(fontSize: 12, color: Colors.black45),
+          ),
+        ),
+      );
+    }
+    return Center(
+      child: TextButton.icon(
+        onPressed: _loadOlder,
+        icon: const Icon(Icons.history, size: 16),
+        label: const Text('加载更早'),
+      ),
+    );
+  }
+
+  Widget _buildRecordRow(SensorReading record, {Key? key}) {
     return Container(
+      key: key,
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(

@@ -1,13 +1,13 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/auth'
 import { currentRole } from '@/utils/permissions'
-import LoginView from '@/views/LoginView.vue'
 
+// 所有路由（含登录页）统一按需加载，入口包只保留应用外壳与守卫
 const routes: RouteRecordRaw[] = [
   {
     path: '/login',
     name: 'login',
-    component: LoginView,
+    component: () => import('@/views/LoginView.vue'),
     meta: { public: true, title: '登录' },
   },
   { path: '/', redirect: '/dashboard' },

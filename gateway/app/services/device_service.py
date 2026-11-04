@@ -332,7 +332,13 @@ async def query_records(
     start: Optional[datetime],
     end: Optional[datetime],
     limit: int,
+    offset: int = 0,
 ) -> List[SensorRecord]:
+    """按时间倒序取最近 [offset, offset+limit) 条，再翻转为正序返回。
+
+    offset 默认为 0（不生成 OFFSET 子句），因此不传该参数时与历史行为完全一致；
+    传入 offset 时从最新一条开始跳过，用于详情页「加载更早」翻页。
+    """
     stmt = select(SensorRecord)
     if device_id:
         stmt = stmt.where(SensorRecord.device_id == device_id)
@@ -340,7 +346,10 @@ async def query_records(
         stmt = stmt.where(SensorRecord.ts >= start)
     if end:
         stmt = stmt.where(SensorRecord.ts <= end)
-    stmt = stmt.order_by(SensorRecord.ts.desc()).limit(limit)
+    stmt = stmt.order_by(SensorRecord.ts.desc())
+    if offset:
+        stmt = stmt.offset(offset)
+    stmt = stmt.limit(limit)
     rows = (await session.execute(stmt)).scalars().all()
     # 图表需要时间正序，统一在服务层翻转，避免前端各自处理
     return list(reversed(rows))

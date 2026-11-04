@@ -413,3 +413,48 @@ def test_group_filter_and_ungrouped_bucket(tmp_path):
         assert all_total == 4
 
     _run(tmp_path, scenario)
+
+
+def test_query_records_default_query_unchanged(tmp_path):
+    """回归：不传 offset 时仍返回最近 limit 条，且与显式 offset=0 完全一致。"""
+    async def scenario(session):
+        await device_service.create_device(
+            session, "dev-r", "历史设备", "VG-S100", "1.0.0", "默认分组"
+        )
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for index in range(5):
+            _add_record(session, "dev-r", base.replace(hour=index), seq=index + 1)
+        await session.flush()
+
+        default = await device_service.query_records(session, "dev-r", None, None, 3)
+        explicit = await device_service.query_records(session, "dev-r", None, None, 3, 0)
+
+        # 取最新 3 条（seq 3/4/5），服务层统一翻转为时间正序
+        assert [row.seq for row in default] == [3, 4, 5]
+        assert [row.seq for row in explicit] == [3, 4, 5]
+
+    _run(tmp_path, scenario)
+
+
+def test_query_records_offset_pages_backwards(tmp_path):
+    """offset 从最新一条开始跳过，逐页向更早取数；越界返回空列表。"""
+    async def scenario(session):
+        await device_service.create_device(
+            session, "dev-r", "历史设备", "VG-S100", "1.0.0", "默认分组"
+        )
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for index in range(5):
+            _add_record(session, "dev-r", base.replace(hour=index), seq=index + 1)
+        await session.flush()
+
+        first = await device_service.query_records(session, "dev-r", None, None, 2)
+        second = await device_service.query_records(session, "dev-r", None, None, 2, 2)
+        last = await device_service.query_records(session, "dev-r", None, None, 2, 4)
+        beyond = await device_service.query_records(session, "dev-r", None, None, 2, 99)
+
+        assert [row.seq for row in first] == [4, 5]
+        assert [row.seq for row in second] == [2, 3]
+        assert [row.seq for row in last] == [1]
+        assert beyond == []
+
+    _run(tmp_path, scenario)

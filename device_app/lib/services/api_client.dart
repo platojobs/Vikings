@@ -106,17 +106,24 @@ class ApiClient {
     return _mapList(data, SensorReading.fromJson);
   }
 
-  /// 单设备最近若干条上报，用于看板详情页的「最近上报」列表。
+  /// 单设备历史上报，用于看板详情页的分页列表。
+  ///
+  /// 网关按时间倒序取数后翻转返回；[offset] 从最新一条开始跳过，
+  /// 默认 0 时请求参数与历史一致（只带 limit），不改变既有行为。
   Future<List<SensorReading>> fetchDeviceRecords({
     required String token,
     required String deviceId,
     int limit = 10,
+    int offset = 0,
   }) async {
     final data = await _send(
       'GET',
       '/api/devices/$deviceId/records',
       token: token,
-      query: <String, String>{'limit': '$limit'},
+      query: <String, String>{
+        'limit': '$limit',
+        if (offset > 0) 'offset': '$offset',
+      },
     );
     return _mapList(data, SensorReading.fromJson);
   }
