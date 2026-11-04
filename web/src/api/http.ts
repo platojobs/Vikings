@@ -15,7 +15,7 @@ const API_BASE = (import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000').repl
 type QueryValue = string | number | boolean | null | undefined
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   params?: Record<string, QueryValue>
   body?: unknown
   signal?: AbortSignal

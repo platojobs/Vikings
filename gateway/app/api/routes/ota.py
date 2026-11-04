@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.schemas import ApiResponse, OtaTaskCreateRequest, OtaTaskOut, PageOut
-from app.security import require_user
+from app.security import ROLE_OPERATOR, require_role, require_user
 from app.services import audit_service, command_service
 
 router = APIRouter(prefix="/api/ota", tags=["ota"])
@@ -16,7 +16,7 @@ async def create_task(
     body: OtaTaskCreateRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    user: dict = Depends(require_user),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
 ):
     mqtt = request.app.state.mqtt
     if not mqtt.is_connected:

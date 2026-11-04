@@ -15,6 +15,9 @@ const ACTION_OPTIONS = [
   { label: '创建 OTA 任务', value: 'ota.create' },
   { label: '确认告警', value: 'alert.ack' },
   { label: '修改阈值', value: 'threshold.update' },
+  { label: '新建账号', value: 'user.create' },
+  { label: '修改账号', value: 'user.update' },
+  { label: '删除账号', value: 'user.delete' },
 ]
 
 const query = reactive({ operator: '', action: '' })

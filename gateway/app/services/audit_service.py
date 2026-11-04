@@ -17,6 +17,9 @@ ACTION_COMMAND_CREATE = "command.create"
 ACTION_OTA_CREATE = "ota.create"
 ACTION_ALERT_ACK = "alert.ack"
 ACTION_THRESHOLD_UPDATE = "threshold.update"
+ACTION_USER_CREATE = "user.create"
+ACTION_USER_UPDATE = "user.update"
+ACTION_USER_DELETE = "user.delete"
 
 
 async def log(

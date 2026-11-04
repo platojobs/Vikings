@@ -136,8 +136,18 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/auth/login` | 登录，入参 `{username, password}`，返回 `{token, user:{username, role}}` |
+| GET | `/api/auth/me` | 返回数据库中的最新账号信息（角色被调整后前端刷新即可生效） |
 
-后续请求头：`Authorization: Bearer <token>`。
+后续请求头：`Authorization: Bearer <token>`。登录凭证校验数据库 `app_user` 表，
+口令以 PBKDF2-SHA256 哈希存储。角色与权限矩阵：
+
+| 角色 | 权限 |
+| --- | --- |
+| `admin` | 全部：设备/告警/OTA/审计查询 + 阈值配置 + 账号管理 |
+| `operator` | 查询 + 下发指令 + 创建 OTA 任务 + 确认告警 |
+| `viewer` | 只读：仅设备/告警/OTA/审计查询 |
+
+越权访问返回 HTTP 403，未登录或令牌失效返回 401。
 
 ### 3.2 设备
 
@@ -194,6 +204,19 @@ fire-and-forget，不阻塞告警主链路。
 | --- | --- | --- |
 | GET | `/api/stats/overview` | 设备总数/在线数/今日上报数/未确认告警数 |
 | GET | `/api/health` | 存活探针（含 Broker 连接状态） |
+
+### 3.9 账号与权限（仅 admin）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/users` | 账号列表（用户名/角色/启停/最近登录） |
+| POST | `/api/users` | 新建账号，入参 `{username, password, role}`；用户名重复返回 409 |
+| PATCH | `/api/users/{username}` | 修改角色 / 启停 / 重置口令（`role`、`active`、`password` 均可选） |
+| DELETE | `/api/users/{username}` | 删除账号；禁止删除当前登录账号 |
+
+保护规则：系统必须保留至少一个可用管理员，降级/停用/删除最后一个 admin 均返回 400。
+账号变更全部写入审计日志（`user.create` / `user.update` / `user.delete`），
+审计 detail 只记录变更项，不落口令明文。
 
 ---
 
@@ -288,11 +311,29 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 | --- | --- | --- |
 | id | bigserial PK | 自增 |
 | operator | varchar(64) | 操作人（登录用户名） |
-| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update |
-| target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config） |
+| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / user.* |
+| target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config / app_user） |
 | target_id | varchar(64) | 目标标识 |
 | detail | jsonb | 动作上下文（如指令类型、阈值变更明细） |
 | created_at | timestamptz | 操作时间，索引 |
+
+动作枚举：`login` / `command.create` / `ota.create` / `alert.ack` / `threshold.update` /
+`user.create` / `user.update` / `user.delete`。
+
+### `app_user` 后台账号表
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| username | varchar(64) PK | 登录用户名 |
+| password_hash | varchar(255) | PBKDF2-SHA256 哈希（`pbkdf2_sha256$迭代$salt$hash`） |
+| role | varchar(16) | admin / operator / viewer |
+| active | boolean | 是否启用；停用后立即无法登录 |
+| last_login_at | timestamptz | 最近登录时间 |
+| created_at / updated_at | timestamptz | 时间戳 |
+
+首次启动且表为空时，网关按环境变量 `ADMIN_USERNAME/ADMIN_PASSWORD` 初始化管理员，
+并额外创建 `operator/operator123` 与 `viewer/viewer123` 两个演示账号；
+已有账号时不再覆盖，避免重启重置运维改过的口令。
 
 ---
 

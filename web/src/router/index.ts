@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/auth'
+import { currentRole } from '@/utils/permissions'
 import LoginView from '@/views/LoginView.vue'
 
 const routes: RouteRecordRaw[] = [
@@ -41,6 +42,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '审计日志' },
   },
   {
+    path: '/users',
+    name: 'users',
+    component: () => import('@/views/UsersView.vue'),
+    meta: { title: '账号管理' },
+  },
+  {
     path: '/ota',
     name: 'ota',
     component: () => import('@/views/OtaView.vue'),
@@ -61,6 +68,10 @@ router.beforeEach((to) => {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
   if (to.path === '/login' && token) {
+    return { path: '/dashboard' }
+  }
+  // 账号管理仅对管理员开放，非管理员直接回到仪表盘
+  if (to.path === '/users' && currentRole() !== 'admin') {
     return { path: '/dashboard' }
   }
   return true

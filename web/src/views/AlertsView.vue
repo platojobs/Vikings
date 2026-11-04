@@ -3,11 +3,12 @@
  * 告警中心：统计卡片 + 筛选列表 + 确认操作 + 阈值在线配置。
  * 订阅 device/system/alert，新告警实时插入列表头部并弹通知。
  */
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElNotification } from 'element-plus'
 import { ackAlert, fetchAlerts, fetchAlertSummary } from '@/api/alerts'
 import { fetchThresholds, updateThresholds } from '@/api/rules'
 import { subscribe } from '@/services/mqtt'
+import { canOperate, isAdmin } from '@/utils/permissions'
 import { formatDateTime } from '@/utils/format'
 import {
   alertLevelLabel,
@@ -25,6 +26,10 @@ import type {
 } from '@/types'
 
 // ==================== 统计卡片 ====================
+
+/** 只读角色不能确认告警；阈值配置仅管理员可见 */
+const canWrite = computed(() => canOperate())
+const isAdminOnly = computed(() => isAdmin())
 
 const summary = ref<AlertSummary>({ open: 0, critical_open: 0, today: 0 })
 
@@ -317,7 +322,9 @@ onUnmounted(() => {
         <el-button type="primary" @click="handleSearch">查询</el-button>
         <el-button @click="handleReset">重置</el-button>
         <div class="filter-spacer" />
-        <el-button type="warning" plain @click="openThresholdDrawer">阈值配置</el-button>
+        <el-button v-if="isAdminOnly" type="warning" plain @click="openThresholdDrawer">
+          阈值配置
+        </el-button>
       </div>
     </el-card>
 
@@ -361,7 +368,7 @@ onUnmounted(() => {
         <el-table-column label="操作" width="100" fixed="right">
           <template #default="{ row }">
             <el-button
-              v-if="row.status === 'open'"
+              v-if="row.status === 'open' && canWrite"
               link
               type="primary"
               :loading="ackingId === row.alert_id"

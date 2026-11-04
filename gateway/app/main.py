@@ -14,13 +14,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import alerts, audit, auth, devices, ota, rules, stats
+from app.api.routes import alerts, audit, auth, devices, ota, rules, stats, users
 from app.config import get_settings
 from app.database import SessionFactory, dispose_engine, init_models
 from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
 from app.scheduler import BackgroundScheduler
-from app.services import rule_service
+from app.services import rule_service, user_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,8 +36,13 @@ async def lifespan(app: FastAPI):
     await init_models()
 
     # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
+    # 同时初始化账号表（仅首次启动，避免覆盖运维改过的口令）
     async with SessionFactory() as session:
         await rule_service.load_overrides(session)
+        created_users = await user_service.ensure_bootstrap_users(session)
+        await session.commit()
+    if created_users:
+        logger.info("初始化后台账号: %s", ", ".join(created_users))
 
     handler = MessageHandler()
     mqtt = MqttGatewayClient(handler)
@@ -80,6 +85,7 @@ app.include_router(ota.router)
 app.include_router(stats.router)
 app.include_router(rules.router)
 app.include_router(audit.router)
+app.include_router(users.router)
 
 
 @app.exception_handler(HTTPException)

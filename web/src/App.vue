@@ -4,8 +4,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
-import { clearAuth, getStoredUser } from '@/utils/auth'
+import { fetchMe } from '@/api/auth'
+import { clearAuth, getStoredUser, getToken, setAuth } from '@/utils/auth'
 import { onStatusChange } from '@/services/mqtt'
+import { setRole } from '@/utils/permissions'
+import { userRoleLabel, userRoleTagType } from '@/utils/labels'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,13 +17,31 @@ const isLogin = computed(() => route.name === 'login')
 const activeMenu = computed(() => route.path)
 const username = computed(() => getStoredUser()?.username ?? 'admin')
 
+/** 角色随 /api/auth/me 刷新，用于菜单显示（仅管理员可见账号管理） */
+const role = ref(getStoredUser()?.role ?? '')
+const isAdmin = computed(() => role.value === 'admin')
+
 const mqttConnected = ref(false)
 let offStatus: (() => void) | null = null
 
-onMounted(() => {
+onMounted(async () => {
   offStatus = onStatusChange((connected) => {
     mqttConnected.value = connected
   })
+
+  if (!getToken()) return
+  try {
+    const me = await fetchMe()
+    role.value = me.role
+    setRole(me.role as 'admin' | 'operator' | 'viewer')
+    setAuth(getToken(), { username: me.username, role: me.role })
+    // 非管理员停在账号管理页时（例如权限被降级）回到仪表盘
+    if (me.role !== 'admin' && route.path === '/users') {
+      await router.replace('/dashboard')
+    }
+  } catch {
+    // 401 已由 HTTP 层清除登录态，其余错误保持静默
+  }
 })
 
 onBeforeUnmount(() => offStatus?.())
@@ -63,6 +84,7 @@ async function handleLogout(): Promise<void> {
           <el-menu-item index="/history">历史查询</el-menu-item>
           <el-menu-item index="/alerts">告警中心</el-menu-item>
           <el-menu-item index="/audit">审计日志</el-menu-item>
+          <el-menu-item v-if="isAdmin" index="/users">账号管理</el-menu-item>
           <el-menu-item index="/ota">OTA 管理</el-menu-item>
         </el-menu>
 
@@ -71,6 +93,9 @@ async function handleLogout(): Promise<void> {
             {{ mqttConnected ? 'MQTT 已连接' : 'MQTT 连接中' }}
           </el-tag>
           <span class="username">{{ username }}</span>
+          <el-tag :type="userRoleTagType(role)" size="small" effect="plain">
+            {{ userRoleLabel(role) }}
+          </el-tag>
           <el-button link class="logout-btn" @click="handleLogout">退出登录</el-button>
         </div>
       </el-header>

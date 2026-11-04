@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.schemas import AlertOut, AlertSummaryOut, ApiResponse, PageOut
-from app.security import require_user
+from app.security import ROLE_OPERATOR, require_role, require_user
 from app.services import alert_service, audit_service
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
@@ -37,7 +37,7 @@ async def list_alerts(
 async def ack_alert(
     alert_id: str,
     session: AsyncSession = Depends(get_session),
-    user: dict = Depends(require_user),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
 ):
     alert = await alert_service.ack_alert(session, alert_id)
     if alert is None:

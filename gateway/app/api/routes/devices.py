@@ -16,7 +16,7 @@ from app.schemas import (
     SensorRecordOut,
     to_utc_datetime,
 )
-from app.security import require_user
+from app.security import ROLE_OPERATOR, require_role, require_user
 from app.services import audit_service, command_service, device_service
 
 router = APIRouter(prefix="/api", tags=["devices"])
@@ -112,7 +112,7 @@ async def create_command(
     body: CommandCreateRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    user: dict = Depends(require_user),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
 ):
     mqtt = request.app.state.mqtt
     cmd, err = await command_service.issue_command(

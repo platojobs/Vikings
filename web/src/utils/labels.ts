@@ -73,6 +73,9 @@ export function auditActionLabel(action: string): string {
     'ota.create': '创建 OTA 任务',
     'alert.ack': '确认告警',
     'threshold.update': '修改阈值',
+    'user.create': '新建账号',
+    'user.update': '修改账号',
+    'user.delete': '删除账号',
   }
   return labels[action] ?? action
 }
@@ -85,7 +88,33 @@ export function auditActionTagType(action: string): TagType {
       return 'warning'
     case 'threshold.update':
       return 'danger'
+    case 'user.create':
+    case 'user.update':
+    case 'user.delete':
+      return 'danger'
     default:
       return 'primary'
+  }
+}
+
+// ==================== 账号角色 ====================
+
+export function userRoleLabel(role: string): string {
+  const labels: Record<string, string> = {
+    admin: '管理员',
+    operator: '运维',
+    viewer: '只读',
+  }
+  return labels[role] ?? role
+}
+
+export function userRoleTagType(role: string): TagType {
+  switch (role) {
+    case 'admin':
+      return 'danger'
+    case 'operator':
+      return 'primary'
+    default:
+      return 'info'
   }
 }

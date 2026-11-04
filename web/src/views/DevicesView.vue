@@ -3,7 +3,7 @@
  * 设备列表：状态筛选 + 关键字搜索 + 分页。
  * 点击任意行打开抽屉，展示详情、历史数据折线图与指令历史。
  */
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   fetchDeviceCommands,
@@ -17,6 +17,7 @@ import { commandStateLabel, commandStateTagType } from '@/utils/labels'
 import DeviceStatusTag from '@/components/DeviceStatusTag.vue'
 import SensorChart from '@/components/SensorChart.vue'
 import { subscribe } from '@/services/mqtt'
+import { canOperate } from '@/utils/permissions'
 import type {
   CommandAckMessage,
   CommandItem,
@@ -105,6 +106,9 @@ async function openDevice(row: Device): Promise<void> {
 }
 
 // ==================== 指令下发面板 ====================
+
+/** 只读账号隐藏下发能力，与后端 require_role(operator) 保持一致 */
+const canWrite = computed(() => canOperate())
 
 const commandType = ref<CommandType>('config')
 const submittingCmd = ref(false)
@@ -373,6 +377,14 @@ onUnmounted(() => {
             <h3>下发指令</h3>
             <span class="section-hint">网关落库后经 MQTT 推送给设备，设备在唤醒窗口内回执</span>
           </div>
+          <el-alert
+            v-if="!canWrite"
+            title="当前账号为只读角色，无法下发指令。如需执行运维操作，请联系管理员调整角色。"
+            type="info"
+            :closable="false"
+            show-icon
+            class="readonly-tip"
+          />
           <el-radio-group v-model="commandType" class="cmd-type-group">
             <el-radio-button label="config">运行参数</el-radio-button>
             <el-radio-button label="calibrate">传感器校准</el-radio-button>
@@ -445,7 +457,7 @@ onUnmounted(() => {
           <el-button
             type="primary"
             :loading="submittingCmd"
-            :disabled="!detail"
+            :disabled="!detail || !canWrite"
             @click="handleSendCommand"
           >
             下发{{ commandLabel(commandType) }}指令
@@ -575,6 +587,10 @@ onUnmounted(() => {
 
 .cmd-type-group {
   margin-bottom: 16px;
+}
+
+.readonly-tip {
+  margin-bottom: 12px;
 }
 
 .cmd-form {

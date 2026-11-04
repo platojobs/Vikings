@@ -5,17 +5,21 @@
  * - 任务列表 → GET /api/ota/tasks，展开行展示每台设备的升级进度
  * - 订阅 device/+/cmd/ack，按 cmdId 定位设备并实时刷新进度条
  */
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { fetchDevices } from '@/api/devices'
 import { createOtaTask, fetchOtaTasks } from '@/api/ota'
 import { subscribe } from '@/services/mqtt'
+import { canOperate } from '@/utils/permissions'
 import { formatDateTime } from '@/utils/format'
 import { commandStateLabel, commandStateTagType, progressStatus } from '@/utils/labels'
 import type { CommandAckMessage, Device, OtaTask } from '@/types'
 
 const devices = ref<Device[]>([])
 const devicesLoading = ref(false)
+
+/** 只读角色禁止创建 OTA 任务，与后端 require_role(operator) 一致 */
+const canWrite = computed(() => canOperate())
 
 const form = reactive({
   deviceIds: [] as string[],
@@ -144,6 +148,15 @@ onBeforeUnmount(() => offAck?.())
         </div>
       </template>
 
+      <el-alert
+        v-if="!canWrite"
+        title="当前账号为只读角色，无法创建 OTA 任务。如需发布升级，请联系管理员调整角色。"
+        type="info"
+        :closable="false"
+        show-icon
+        class="readonly-tip"
+      />
+
       <el-form label-position="top" class="ota-form" @submit.prevent="handleSubmit">
         <el-row :gutter="16">
           <el-col :span="24">
@@ -187,7 +200,7 @@ onBeforeUnmount(() => offAck?.())
           </el-col>
         </el-row>
 
-        <el-button type="primary" :loading="submitting" @click="handleSubmit">
+        <el-button type="primary" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
           创建 OTA 任务
         </el-button>
       </el-form>
@@ -307,6 +320,10 @@ onBeforeUnmount(() => offAck?.())
 }
 
 .ota-form :deep(.el-form-item) {
+  margin-bottom: 16px;
+}
+
+.readonly-tip {
   margin-bottom: 16px;
 }
 

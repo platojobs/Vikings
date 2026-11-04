@@ -5,7 +5,7 @@ MQTT 侧模型承担「消息校验」职责，任何字段缺失/越界都在�
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -282,3 +282,34 @@ class AlertSummaryOut(BaseModel):
     open: int
     critical_open: int
     today: int
+
+
+# ==================== 账号与权限 ====================
+
+UserRole = Literal["admin", "operator", "viewer"]
+
+
+class UserOut(BaseModel):
+    username: str
+    role: str
+    active: bool
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class UserCreateRequest(BaseModel):
+    """新建账号：用户名限定字母数字与 _.-，避免特殊字符带来的注入与展示问题。"""
+
+    username: str = Field(min_length=2, max_length=32, pattern=r"^[a-zA-Z0-9_.-]+$")
+    password: str = Field(min_length=6, max_length=128)
+    role: UserRole = "viewer"
+
+
+class UserUpdateRequest(BaseModel):
+    """更新账号：仅允许改角色、启停与重置口令，用户名与创建时间不可变。"""
+
+    role: Optional[UserRole] = None
+    active: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)

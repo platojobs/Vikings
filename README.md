@@ -139,6 +139,8 @@ brew install mosquitto postgresql@16 python@3.14
 | MQTT（浏览器） | ws://127.0.0.1:9001 |
 
 默认后台账号：`admin / admin123`（见 `gateway/.env`，生产必须改）。
+首次启动还会创建两个演示账号：`operator / operator123`（运维）、`viewer / viewer123`（只读），
+用于直接演示角色权限差异。
 
 ### 4.3 启动设备端
 
@@ -186,14 +188,22 @@ docker compose -f infra/docker-compose.yml up -d
 - AI 诊断：规则判定 + LLM 文案，无 Key / 超时自动降级模板
 - 指令状态机 `issued → received → progress → success/failed`，禁止状态回退
 - OTA 任务汇总（成功/失败计数）与设备固件版本同步
+- 账号体系与 RBAC：admin / operator / viewer 三角色，PBKDF2 口令哈希 + JWT
+- 管理动作全量审计：登录、指令、OTA、告警确认、阈值修改、账号变更
+- 阈值在线配置：`rule_config` 持久化覆盖环境变量，改完即时生效
+- 时序数据按小时/天聚合接口，支撑长周期趋势视图
+- critical 告警 Webhook 外推（钉钉/飞书/企业微信机器人兼容）
 - JWT 鉴权 + 统一 `{code, message, data}` 响应体
 
 ### 管理后台（Vue3）
 
-- 登录页 + 路由守卫
+- 登录页 + 路由守卫 + 角色驱动的菜单与按钮权限
 - 实时仪表盘：指标卡、多设备实时曲线、实时告警流
-- 设备列表：状态筛选、搜索、分页、详情抽屉（历史曲线 + 指令历史）
-- 历史查询：设备 + 时间范围筛选，温度/湿度/电压多轴折线图
+- 设备列表：状态筛选、搜索、分页、详情抽屉（历史曲线 + 指令历史 + 指令下发）
+- 历史查询：明细 / 按小时 / 按天聚合视图，CSV 导出
+- 告警中心：统计卡片、实时告警推送、在线确认、阈值配置抽屉
+- 审计日志：动作/操作人筛选，变更详情可查看
+- 账号管理：新建账号、角色调整、启停、重置口令、删除保护
 - OTA 管理：创建任务、任务列表、逐设备升级进度实时刷新
 
 ---
@@ -215,12 +225,19 @@ docker compose -f infra/docker-compose.yml up -d
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/auth/login` | 登录换取 JWT |
+| GET | `/api/auth/me` | 当前账号最新信息（角色刷新） |
 | GET | `/api/devices` | 设备列表（status / keyword / 分页） |
 | GET | `/api/devices/{id}` | 设备详情 + 最新数据 |
 | GET | `/api/devices/{id}/records` | 历史数据（start / end / limit） |
+| GET | `/api/devices/{id}/records/aggregate` | 按小时/天聚合（avg/min/max） |
 | GET | `/api/records/latest` | 全局最新数据（看板首屏兜底） |
-| GET | `/api/alerts` | 告警列表 |
+| GET | `/api/alerts` | 告警列表（deviceId / level / status） |
 | POST | `/api/alerts/{id}/ack` | 告警确认 |
+| GET | `/api/alerts/summary` | 告警统计 |
+| GET/PUT | `/api/rules/thresholds` | 阈值查询 / 在线更新 |
+| GET | `/api/audit-logs` | 审计日志（operator / action / 分页） |
+| GET/POST | `/api/users` | 账号列表 / 新建（仅 admin） |
+| PATCH/DELETE | `/api/users/{username}` | 修改角色与启停 / 删除（仅 admin） |
 | POST | `/api/devices/{id}/commands` | 下发指令 |
 | GET | `/api/devices/{id}/commands` | 指令历史与回执状态 |
 | POST | `/api/ota/tasks` | 创建 OTA 任务 |
@@ -240,6 +257,9 @@ docker compose -f infra/docker-compose.yml up -d
 | `device_alert` | AI 告警 | `(device_id, metric, created_at)` 索引支撑告警抑制 |
 | `device_command` | 指令与回执状态 | 状态机 + OTA 进度持久化 |
 | `ota_task` | OTA 任务汇总 | 一次任务覆盖多设备，汇总成功/失败数 |
+| `rule_config` | 阈值在线覆盖 | 优先于环境变量，改完即时生效 |
+| `audit_log` | 管理动作审计 | 动作 + 目标 + JSON 上下文，按时间索引 |
+| `app_user` | 后台账号与角色 | PBKDF2 口令哈希，角色驱动接口权限 |
 
 建表脚本：[infra/postgres/init.sql](infra/postgres/init.sql)，网关启动时也会幂等补齐缺失表。
 
@@ -269,7 +289,8 @@ docker compose -f infra/docker-compose.yml up -d
 4. 用模拟器注入 `--voltage 2.90 --temperature 78`：后台实时弹出 critical 告警，展示 AI 文案。
 5. 后台设备详情下发 calibrate：App 日志显示收到指令并回执，指令历史状态变为 success。
 6. 创建 OTA 任务：后台进度条实时推进到 100%，设备固件版本同步更新。
-7. 关闭 App（模拟掉电）：Mosquitto 的 LWT 遗嘱立即把设备置为离线，证明状态判定不依赖心跳超时。
+7. 用 `viewer / viewer123` 重新登录：下发指令、确认告警、阈值配置全部隐藏，接口直接返回 403。
+8. 关闭 App（模拟掉电）：Mosquitto 的 LWT 遗嘱立即把设备置为离线，证明状态判定不依赖心跳超时。
 
 ---
 
@@ -307,3 +328,6 @@ docker compose -f infra/docker-compose.yml up -d
 | `v0.6.0-device` | Flutter 设备端间歇上线状态机与指令回执 |
 | `v1.0.0` | 全链路联调通过 + 完整文档 |
 | `v1.1.0` | 离线巡检定时任务、时序数据保留清理、告警阈值可配置、后端单测、GitHub Actions CI、前端实时状态刷新 |
+| `v1.2.0` | 设备指令下发面板、cmd/ack 实时回执、CSV 导出、ECharts 按需引入（主包 1.41MB→685KB） |
+| `v1.3.0` | 告警中心、阈值在线配置、审计日志、时序聚合接口、critical 告警 Webhook |
+| `v1.4.0` | 账号体系与 RBAC（三角色）、账号管理页、按钮级权限收口、登录页演示账号 |

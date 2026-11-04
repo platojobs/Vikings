@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.schemas import ApiResponse, ThresholdsUpdateRequest
-from app.security import require_user
+from app.security import ROLE_ADMIN, require_role, require_user
 from app.services import audit_service, rule_service
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
@@ -25,7 +25,7 @@ async def get_thresholds(_: dict = Depends(require_user)):
 async def update_thresholds(
     body: ThresholdsUpdateRequest,
     session: AsyncSession = Depends(get_session),
-    user: dict = Depends(require_user),
+    user: dict = Depends(require_role(ROLE_ADMIN)),
 ):
     """在线更新阈值：持久化到 rule_config 并即时刷新规则引擎缓存。"""
     updated = await rule_service.update_thresholds(session, body, user["sub"])

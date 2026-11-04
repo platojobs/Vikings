@@ -12,6 +12,18 @@ const route = useRoute()
 const form = reactive({ username: 'admin', password: 'admin123' })
 const loading = ref(false)
 
+/** 三种角色的演示账号，点击即可填充，便于直接演示权限差异 */
+const demoAccounts = [
+  { username: 'admin', password: 'admin123', label: '管理员' },
+  { username: 'operator', password: 'operator123', label: '运维' },
+  { username: 'viewer', password: 'viewer123', label: '只读' },
+]
+
+function fillDemo(account: (typeof demoAccounts)[number]): void {
+  form.username = account.username
+  form.password = account.password
+}
+
 async function handleSubmit(): Promise<void> {
   if (!form.username.trim() || !form.password.trim()) {
     ElMessage.warning('请输入用户名和密码')
@@ -82,7 +94,20 @@ async function handleSubmit(): Promise<void> {
         </el-button>
       </el-form>
 
-      <p class="login-hint">演示账号：admin / admin123</p>
+      <div class="demo-accounts">
+        <span class="demo-label">演示账号（点击填充）</span>
+        <div class="demo-list">
+          <el-tag
+            v-for="account in demoAccounts"
+            :key="account.username"
+            class="demo-tag"
+            effect="plain"
+            @click="fillDemo(account)"
+          >
+            {{ account.label }} · {{ account.username }}
+          </el-tag>
+        </div>
+      </div>
     </el-card>
   </div>
 </template>
@@ -178,11 +203,27 @@ async function handleSubmit(): Promise<void> {
   margin-top: 6px;
 }
 
-.login-hint {
-  margin: 18px 0 0;
+.demo-accounts {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed #e2e8f0;
   text-align: center;
+}
+
+.demo-label {
   font-size: 12px;
   color: #94a3b8;
+}
+
+.demo-list {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.demo-tag {
+  cursor: pointer;
 }
 
 @media (max-width: 900px) {

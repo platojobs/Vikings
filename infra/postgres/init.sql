@@ -102,7 +102,47 @@ CREATE TABLE IF NOT EXISTS ota_task (
 
 COMMENT ON TABLE ota_task IS 'OTA 任务表：一个任务覆盖多台设备，汇总字段用于列表页快速展示';
 
--- ---------- 6. 种子数据 ----------
+-- ---------- 7. 阈值在线配置表 ----------
+CREATE TABLE IF NOT EXISTS rule_config (
+    key         varchar(64) PRIMARY KEY,
+    value       numeric(10,2) NOT NULL,
+    updated_by  varchar(64) NOT NULL DEFAULT 'system',
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE rule_config IS '告警阈值运行时覆盖：优先于环境变量，在线修改立即生效';
+
+-- ---------- 8. 审计日志表 ----------
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          bigserial PRIMARY KEY,
+    operator    varchar(64) NOT NULL,
+    action      varchar(32) NOT NULL,
+    target_type varchar(32) NOT NULL DEFAULT '',
+    target_id   varchar(128) NOT NULL DEFAULT '',
+    detail      jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE audit_log IS '后台管理动作审计：登录/指令/OTA/告警确认/阈值修改/账号变更';
+
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action_created ON audit_log (action, created_at DESC);
+
+-- ---------- 9. 后台账号表 ----------
+CREATE TABLE IF NOT EXISTS app_user (
+    username      varchar(64) PRIMARY KEY,
+    password_hash varchar(255) NOT NULL,
+    role          varchar(16) NOT NULL DEFAULT 'viewer',
+    active        boolean NOT NULL DEFAULT true,
+    last_login_at timestamptz,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE app_user IS '后台账号与角色：admin/operator/viewer，口令以 PBKDF2 哈希存储';
+COMMENT ON COLUMN app_user.role IS 'admin 全部权限 / operator 运维执行 / viewer 只读';
+
+-- ---------- 10. 种子数据 ----------
 INSERT INTO device (device_id, name, model, firmware_version, status)
 VALUES
     ('dev-0001', '冷库温度节点 01', 'VG-S100', '1.0.0', 'offline'),

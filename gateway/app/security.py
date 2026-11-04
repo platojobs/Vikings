@@ -1,5 +1,15 @@
-"""JWT 鉴权：演示级简易后台登录，生产可替换为 OAuth2 / SSO。"""
+"""JWT 鉴权与口令哈希：演示级简易后台登录，生产可替换为 OAuth2 / SSO。
 
+角色模型（与前端菜单、接口权限一一对应）：
+- admin     全部权限：含阈值配置与用户管理
+- operator  运维执行：下发指令、创建 OTA、确认告警
+- viewer    只读：仅可查询设备/告警/审计
+"""
+
+import base64
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,8 +21,48 @@ from app.config import get_settings
 settings = get_settings()
 ALGORITHM = "HS256"
 
+# 角色常量：避免业务代码直接写字符串
+ROLE_ADMIN = "admin"
+ROLE_OPERATOR = "operator"
+ROLE_VIEWER = "viewer"
+ALL_ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 
-def create_access_token(username: str, role: str = "admin") -> str:
+# PBKDF2 迭代次数：兼顾登录耗时与离线爆破成本
+PBKDF2_ITERATIONS = 120000
+
+
+def hash_password(password: str) -> str:
+    """生成口令哈希，格式 pbkdf2_sha256$迭代次数$salt$hash（base64）。
+
+    使用标准库实现，不引入额外依赖；salt 随机生成，同一口令每次结果不同。
+    """
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return "$".join(
+        [
+            "pbkdf2_sha256",
+            str(PBKDF2_ITERATIONS),
+            base64.b64encode(salt).decode("ascii"),
+            base64.b64encode(digest).decode("ascii"),
+        ]
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """校验口令：使用 compare_digest 防时序侧信道。"""
+    try:
+        algorithm, iterations, salt_b64, hash_b64 = (stored or "").split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def create_access_token(username: str, role: str = ROLE_ADMIN) -> str:
     """签发 JWT，携带用户名与角色。"""
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
     payload = {"sub": username, "role": role, "exp": expire}
@@ -38,3 +88,18 @@ async def require_user(request: Request) -> dict:
 
 
 CurrentUser = Depends(require_user)
+
+
+def require_role(*roles: str):
+    """FastAPI 依赖工厂：限定接口可访问的角色，admin 始终放行。
+
+    用法：`user: dict = Depends(require_role(ROLE_OPERATOR))`
+    """
+
+    async def dependency(user: dict = Depends(require_user)) -> dict:
+        role = user.get("role")
+        if role != ROLE_ADMIN and role not in roles:
+            raise HTTPException(status_code=403, detail="当前账号无此操作权限")
+        return user
+
+    return dependency

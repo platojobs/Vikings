@@ -40,6 +40,31 @@ export interface LoginResult {
   user: UserInfo
 }
 
+// ==================== 账号与权限 ====================
+
+/** 角色：admin 全部权限 / operator 运维执行 / viewer 只读 */
+export type UserRole = 'admin' | 'operator' | 'viewer'
+
+export interface AppUser {
+  username: string
+  role: UserRole
+  active: boolean
+  last_login_at: string | null
+  created_at: string
+}
+
+export interface UserCreateBody {
+  username: string
+  password: string
+  role: UserRole
+}
+
+export interface UserUpdateBody {
+  role?: UserRole
+  active?: boolean
+  password?: string
+}
+
 // ==================== 设备 / 传感器 ====================
 
 export type DeviceStatus = 'online' | 'offline'
