@@ -1,0 +1,6 @@
+# E2E 验收额外依赖（其余依赖复用 gateway/requirements.txt 与 gateway/.venv）
+# 安装：
+#   gateway/.venv/bin/python -m pip install -r scripts/e2e/requirements.txt
+paho-mqtt>=2.0
+websocket-client>=1.7
+httpx>=0.27

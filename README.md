@@ -110,6 +110,7 @@
 │   ├── start_web.sh           启动前端
 │   ├── stop_all.sh            一键停止
 │   ├── smoke_test.sh          端到端冒烟验证
+│   ├── e2e/                   真实 Broker 端到端验收（脚本 + 说明）
 │   └── simulate_device.py     无手机时的设备模拟器（联调用）
 └── README.md
 ```
@@ -473,7 +474,37 @@ http://192.168.1.8:5173
 
 ---
 
-## 12. 测试
+## 12. 端到端验收（真实 Broker）
+
+`scripts/e2e/e2e_acceptance.py` 验证 CI 覆盖不到的真实链路：真实 Mosquitto、
+MQTT over WebSocket（与移动看板同一连接方式）、真实网关、REST 写接口与断线恢复。
+
+```bash
+gateway/.venv/bin/python -m pip install -r scripts/e2e/requirements.txt
+gateway/.venv/bin/python scripts/e2e/e2e_acceptance.py
+echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
+```
+
+覆盖内容：
+
+- 设备上线 / 上报 / 休眠下线，REST 设备列表与 `/api/records/latest` 可读；
+- WebSocket 9001 秒级收到上报、上下线与 critical 告警；
+- REST 下发 config 指令，模拟设备回执 success 并同步到指令历史；
+- REST 确认告警，状态变为 acked（open 消失、acked 可查）；
+- 停 Broker 后 WS 断连、REST 仍可轮询；重启 Broker 后 WS 重连、网关
+  `mqtt.connected=true`，并再次收到真实上报。
+
+隔离与清理：脚本自起 Broker 与网关（端口空闲时），网关使用临时 SQLite，
+不写生产库；结束后停止所有托管进程、删除临时库并等待端口释放。
+若 1883/9001 已被外部 Broker 占用，脚本会复用，但降级步骤会明确 FAIL（不杀外部进程）。
+
+CI 只跑 analyze / test / pytest / web build，不安装 Broker，因此本脚本定位为
+**发布前本地验收资产**，不纳入 CI。前置条件、逐项覆盖、常见失败原因见
+[scripts/e2e/README.md](scripts/e2e/README.md)。
+
+---
+
+## 13. 测试
 
 | 层 | 命令 | 覆盖范围 |
 | --- | --- | --- |
@@ -488,7 +519,7 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 
 ---
 
-## 13. 版本记录
+## 14. 版本记录
 
 | Tag | 内容 |
 | --- | --- |
@@ -509,3 +540,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.8.0` | 移动看板实时化（MQTT over WebSocket 9001，替换 20 秒轮询）与凭据安全存储（Keychain/Keystore + 旧 token 迁移） |
 | `v1.9.0` | 移动看板接入受限写操作：指令下发（校准/配置/重启/单台 OTA）与告警确认，复用网关既有接口并按角色 / 403 禁用 |
 | `v1.9.1` | 移动看板 Widget 测试补强：登录、写操作确认/取消/回执、告警移除、权限禁用、实时降级与 401 路径 |
+| `v1.9.2` | 真实 Broker 端到端验收：WebSocket 实时增量、指令回执、告警 acked、停 Broker 降级与恢复；验收固化为可重复脚本 |
