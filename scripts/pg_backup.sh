@@ -16,6 +16,7 @@
 #   --dir <目录>        备份目录（默认 backups/postgres，可用 BACKUP_DIR 覆盖）
 #   --keep <N>          保留份数（默认 14，可用 BACKUP_KEEP 覆盖）
 #   --db-user/--db-name container/dsn 模式下的库账号与库名
+#   BACKUP_METRICS_FILE 可选；写入 node_exporter 文本指标，供备份失败告警
 #
 # 示例（生产每日 02:00）：
 #   0 2 * * * cd /opt/vikings && ./scripts/pg_backup.sh --keep 30 >> logs/backup.log 2>&1
@@ -32,9 +33,30 @@ DB_USER="${POSTGRES_USER:-iot}"
 DB_NAME="${POSTGRES_DB:-iot}"
 OUT_DIR="${BACKUP_DIR:-$ROOT_DIR/backups/postgres}"
 KEEP="${BACKUP_KEEP:-14}"
+# 可选：写入 node_exporter textfile collector 指标，供 Prometheus 告警备份失败。
+# 例：BACKUP_METRICS_FILE=/var/lib/node_exporter/textfile/iot-backup.prom
+METRICS_FILE="${BACKUP_METRICS_FILE:-}"
 
 log() { printf '[pg-backup] %s\n' "$*"; }
-fail() { printf '[pg-backup][fail] %s\n' "$*" >&2; exit 1; }
+
+write_metrics() {
+  [ -n "$METRICS_FILE" ] || return 0
+  mkdir -p "$(dirname "$METRICS_FILE")" 2>/dev/null || return 0
+  {
+    echo "# HELP iot_backup_last_success_timestamp_seconds 最近一次成功备份的 Unix 时间戳。"
+    echo "# TYPE iot_backup_last_success_timestamp_seconds gauge"
+    echo "iot_backup_last_success_timestamp_seconds ${1:-0}"
+    echo "# HELP iot_backup_last_status 最近一次备份结果（1=成功，0=失败）。"
+    echo "# TYPE iot_backup_last_status gauge"
+    echo "iot_backup_last_status ${2:-0}"
+  } > "${METRICS_FILE}.part" 2>/dev/null && mv "${METRICS_FILE}.part" "$METRICS_FILE" || true
+}
+
+fail() {
+  write_metrics 0 0
+  printf '[pg-backup][fail] %s\n' "$*" >&2
+  exit 1
+}
 
 usage() {
   sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
@@ -98,6 +120,7 @@ trap - EXIT
 
 SIZE="$(du -h "$TARGET" | cut -f1)"
 log "备份完成：${TARGET}（${SIZE}）"
+write_metrics "$(date +%s)" 1
 
 # 仅保留最近 N 份；按 mtime 倒序，命名也含时间戳，二者一致
 count="$(ls -1 "$OUT_DIR"/postgres-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')"

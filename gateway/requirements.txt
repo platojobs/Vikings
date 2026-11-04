@@ -19,6 +19,9 @@ alembic>=1.13
 pydantic>=2.6
 pydantic-settings>=2.2
 
+# 可观测性：Prometheus 指标（/metrics）
+prometheus-client>=0.20
+
 # JWT 鉴权 / LLM 调用
 PyJWT>=2.8
 httpx>=0.27

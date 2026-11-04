@@ -14,6 +14,12 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 import aiomqtt
 
 from app.config import get_settings
+from app.metrics import (
+    MQTT_CONNECTED,
+    MQTT_CONNECT_FAILURES_TOTAL,
+    MQTT_DISCONNECTS_TOTAL,
+    MQTT_MESSAGES_TOTAL,
+)
 from app.topics import (
     TOPIC_SYSTEM_ALERT,
     TOPIC_ACK_WILDCARD,
@@ -46,6 +52,7 @@ class MqttGatewayClient:
         self._stopping = False
         self.last_error: Optional[str] = None
         self.message_count = 0
+        MQTT_CONNECTED.set(0)
 
     @property
     def is_connected(self) -> bool:
@@ -71,6 +78,7 @@ class MqttGatewayClient:
     async def _run_forever(self) -> None:
         backoff = 1
         while not self._stopping:
+            was_connected = False
             try:
                 will = aiomqtt.Will(
                     topic=settings.mqtt_will_topic,
@@ -89,6 +97,8 @@ class MqttGatewayClient:
                 ) as client:
                     self._client = client
                     self._connected.set()
+                    MQTT_CONNECTED.set(1)
+                    was_connected = True
                     self.last_error = None
                     backoff = 1
                     logger.info("已连接 MQTT Broker %s:%s", settings.mqtt_host, settings.mqtt_port)
@@ -109,6 +119,8 @@ class MqttGatewayClient:
 
             except aiomqtt.MqttError as exc:
                 self.last_error = str(exc)
+                if not was_connected:
+                    MQTT_CONNECT_FAILURES_TOTAL.inc()
                 logger.warning("MQTT 连接断开: %s，%s 秒后重连", exc, backoff)
             except asyncio.CancelledError:
                 raise
@@ -116,7 +128,10 @@ class MqttGatewayClient:
                 self.last_error = str(exc)
                 logger.exception("MQTT 消费异常: %s", exc)
             finally:
+                if was_connected:
+                    MQTT_DISCONNECTS_TOTAL.inc()
                 self._connected.clear()
+                MQTT_CONNECTED.set(0)
                 self._client = None
 
             if self._stopping:
@@ -140,6 +155,7 @@ class MqttGatewayClient:
             return
 
         self.message_count += 1
+        MQTT_MESSAGES_TOTAL.labels(kind=kind).inc()
         try:
             await self._handler(kind, device_id, payload)
         except Exception as exc:

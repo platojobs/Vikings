@@ -35,9 +35,11 @@ COPY gateway/alembic ./alembic
 USER 10001:10001
 EXPOSE 8000
 
-# 健康检查同时要求 Broker 已连接：凭证错误或 Broker 不可用时容器不会假装就绪。
+# 就绪检查（v1.20.0）：/api/health/ready 会真实查询数据库并检查 Broker 连接。
+# `/api/health` 仍是轻量存活探针（进程存活即 200）；这里用 ready，避免
+# 「数据库不可用/ Broker 掉线」时容器继续被标记为健康。
 HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
-  CMD ["python", "-c", "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)); sys.exit(0 if d.get('data',{}).get('mqttConnected') else 1)"]
+  CMD ["python", "-c", "import sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4); sys.exit(0 if r.status == 200 else 1)"]
 
 # 反向代理后面运行：信任反代传入的 X-Forwarded-For（登录限流按真实客户端 IP）。
 # 网关端口只在 Docker 内网可见，不对宿主机发布。

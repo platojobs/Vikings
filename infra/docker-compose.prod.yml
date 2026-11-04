@@ -1,4 +1,4 @@
-# 生产编排（v1.18.0）。与 infra/docker-compose.yml（本地开发）用途不同：
+# 生产编排（v1.20.0）。与 infra/docker-compose.yml（本地开发）用途不同：
 #   - 开发编排面向本机快速起依赖；本文件面向一台干净机器的完整对外服务。
 #   - 使用方式见 docs/deployment.md；推荐直接执行 scripts/prod_up.sh。
 #
@@ -142,10 +142,26 @@ services:
       ALERT_RETENTION_DAYS: ${ALERT_RETENTION_DAYS:-180}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       DATA_PURGE_INTERVAL_SECONDS: ${DATA_PURGE_INTERVAL_SECONDS:-3600}
+      # 可观测性（v1.20.0）：生产固定 JSON 日志，便于采集与按 requestId 检索
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       # 目录级挂载：凭证轮换需要同目录原子写临时文件
       - ./prod/secrets:/run/secrets:rw
+    healthcheck:
+      # 与镜像内 HEALTHCHECK 相同口径：就绪 = 数据库可查 + Broker 已连接
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=4); sys.exit(0 if r.status == 200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -1,4 +1,4 @@
-# 运维手册（v1.19.0）
+# 运维手册（v1.20.0）
 
 > 面向已按 [deployment.md](deployment.md) 完成部署的运维人员。
 > 所有命令均在仓库根目录执行，并使用生产编排文件。
@@ -34,7 +34,7 @@ $COMPOSE down
 
 ---
 
-## 2. 日志与排障
+## 2. 日志、健康检查与指标
 
 ```bash
 # 跟踪全部
@@ -54,7 +54,55 @@ docker logs --tail=200 <container>
 ```
 
 排障顺序：`postgres` → `migrate` → `mosquitto` → `gateway` → `web` → `proxy`。
-网关健康检查要求 `mqttConnected=true`，因此 Broker/凭证问题会直接表现为网关 unhealthy。
+
+### 2.1 结构化日志
+
+生产默认 `LOG_FORMAT=json`（见 `infra/prod/.env`），每行一条 JSON；本地可用 `LOG_FORMAT=text`。
+请求日志字段：`time/level/logger/message/requestId/event/method/path/status/durationMs/clientIp/user/error`。
+**不记录**请求体、请求头、查询串与 Cookie；`Authorization`、Bearer token、口令/密钥键值、
+数据库 URL 中的口令均替换为 `[REDACTED]`（异常堆栈同样脱敏）。
+
+```bash
+# 只看 5xx
+docker compose -f infra/docker-compose.prod.yml logs gateway --since 30m | \
+  jq -c 'select(.status >= 500)'
+
+# 按 requestId 定位一次报错
+docker compose -f infra/docker-compose.prod.yml logs gateway --since 1h | \
+  jq -c 'select(.requestId=="<用户提供的 requestId>")'
+```
+
+### 2.2 请求 ID 追踪
+
+网关接受上游 `X-Request-Id`（反代会透传），没有则生成 32 位 ID；响应头始终回写，
+错误响应体带 `requestId`。用户报错时先要这个 ID，再用上面的 `jq` 命令检索，
+最后用反代日志里的 `grid=` 字段对齐 nginx 访问日志。
+
+### 2.3 健康检查分层
+
+| 端点 | 语义 | 是否查库/查 Broker |
+| --- | --- | --- |
+| `/api/health` | 存活：进程活着就 200 | 否 |
+| `/api/health/ready` | 就绪：DB 真实 `SELECT 1` + MQTT 已连接 | 是 |
+
+容器 `HEALTHCHECK` 与编排健康检查引用 `/ready`：数据库或 Broker 不可用时容器不应标记为健康。
+数据库故障时 `/api/health` 仍返回 200，`/ready` 返回 503 并在 `components` 指出具体层。
+
+### 2.4 指标与告警
+
+Prometheus 端点 `GET /metrics`（经反代只允许内网来源，公网 403）。关键指标：
+
+- Broker：`iot_mqtt_connected`、`iot_mqtt_disconnects_total`、`iot_mqtt_connect_failures_total`；
+- 数据库：`iot_db_ready`、`iot_db_query_errors_total`、`iot_db_pool_checked_out`；
+- 网关：`iot_http_requests_total{status}`、`iot_http_request_duration_seconds`；
+- 登录：`iot_login_failures_total`、`iot_login_rate_limited_total`；
+- 备份：`iot_backup_last_status`、`iot_backup_last_success_timestamp_seconds`。
+
+告警阈值建议与可直接加载的规则见
+[observability.md](observability.md#5-告警口径与阈值) 与
+[infra/prometheus/iot-alerts.yml](../infra/prometheus/iot-alerts.yml)。
+完整字段说明、采集配置与故障定位矩阵见 [observability.md](observability.md)。
+
 常见现象见 [deployment.md](deployment.md#9-常见故障排查)。
 
 ---
@@ -261,8 +309,12 @@ $COMPOSE exec -T postgres sh -c \
 生产定时（宿主机 cron，每日 02:00）：
 
 ```cron
-0 2 * * * cd /opt/vikings && ./scripts/pg_backup.sh --keep 30 >> logs/backup.log 2>&1
+0 2 * * * cd /opt/vikings && BACKUP_METRICS_FILE=/var/lib/node_exporter/textfile/iot-backup.prom ./scripts/pg_backup.sh --keep 30 >> logs/backup.log 2>&1
 ```
+
+`BACKUP_METRICS_FILE` 可选：写入 `iot_backup_last_status` 与
+`iot_backup_last_success_timestamp_seconds`，供 Prometheus 的备份失败/过期告警使用
+（见 [observability.md](observability.md#5-告警口径与阈值)）。
 
 存放与异地：
 

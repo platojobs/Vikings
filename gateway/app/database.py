@@ -1,8 +1,11 @@
 """数据库接入层：SQLAlchemy 2.0 异步引擎与会话工厂。"""
 
+import asyncio
 import os
-from typing import AsyncGenerator
+import time
+from typing import AsyncGenerator, Optional
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -12,6 +15,11 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import get_settings
+from app.metrics import (
+    DB_QUERY_ERRORS_TOTAL,
+    DB_READY,
+    DB_READY_CHECK_DURATION_SECONDS,
+)
 
 
 class Base(DeclarativeBase):
@@ -38,6 +46,12 @@ SessionFactory = async_sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+@event.listens_for(engine.sync_engine, "handle_error")
+def _record_db_error(_exception_context) -> None:  # pragma: no cover - 事件回调
+    """所有数据库语句/连接错误计数，供 `/metrics` 与告警规则使用。"""
+    DB_QUERY_ERRORS_TOTAL.inc()
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
@@ -73,3 +87,44 @@ async def prepare_database() -> None:
 
 async def dispose_engine() -> None:
     await engine.dispose()
+
+
+async def probe_database(
+    target: Optional[AsyncEngine] = None, timeout_seconds: float = 3.0
+) -> dict:
+    """真实执行一次 `SELECT 1`，返回可用性与耗时（供 `/api/health/ready`）。
+
+    超时与异常都视为「数据库不可用」；错误文本经过脱敏，避免把连接串写进响应。
+    SQLite 下同样会打开连接并执行查询，因此开发环境也能验证这条链路。
+    """
+    from app.observability import redact_text
+
+    target_engine = target or engine
+    started = time.perf_counter()
+
+    async def _query() -> None:
+        async with target_engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+    try:
+        await asyncio.wait_for(_query(), timeout=timeout_seconds)
+    except Exception as exc:
+        latency = time.perf_counter() - started
+        DB_READY.set(0)
+        DB_READY_CHECK_DURATION_SECONDS.set(latency)
+        return {
+            "ok": False,
+            "backend": "sqlite" if settings.is_sqlite else "postgresql",
+            "latencyMs": round(latency * 1000, 2),
+            "error": redact_text(f"{type(exc).__name__}: {exc}"),
+        }
+
+    latency = time.perf_counter() - started
+    DB_READY.set(1)
+    DB_READY_CHECK_DURATION_SECONDS.set(latency)
+    return {
+        "ok": True,
+        "backend": "sqlite" if settings.is_sqlite else "postgresql",
+        "latencyMs": round(latency * 1000, 2),
+        "error": None,
+    }

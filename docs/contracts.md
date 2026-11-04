@@ -399,7 +399,20 @@ fire-and-forget，不阻塞告警主链路。
 | --- | --- | --- |
 | GET | `/api/stats/overview` | 设备总数/在线数/今日上报数/未确认告警数 |
 | GET | `/api/system/status` | 系统状态快照（仅 admin）：`gateway` 运行时长、`mqtt` 连接与消费量、`storage` 容量、`scheduler` 后台任务参数、`notify` Webhook 是否启用（地址脱敏） |
-| GET | `/api/health` | 存活探针（含 Broker 连接状态，无需鉴权） |
+| GET | `/api/health` | 存活探针：进程存活即 200，不查库/不查 Broker（无需鉴权） |
+| GET | `/api/health/ready` | 就绪探针（v1.20.0）：真实 `SELECT 1` + MQTT 连接状态；未就绪返回 503 与各组件明细（无需鉴权） |
+| GET | `/metrics` | Prometheus 文本指标（v1.20.0）：反代只允许内网来源，网关 8000 端口不对外发布 |
+
+**请求追踪（v1.20.0）**：所有 HTTP 响应都带 `X-Request-Id`；若请求方传入合法的
+`X-Request-Id`（`[A-Za-z0-9._-]`，≤64 字符）则沿用，否则生成 32 位十六进制 ID。
+错误响应体在原有 `{code, message, data}` 基础上新增 `requestId`：
+
+```json
+{"code": 500, "message": "服务内部错误", "data": null, "requestId": "trace-abc-123"}
+```
+
+日志中同一 ID 可用于 `docker compose logs gateway | jq 'select(.requestId=="...")'` 对齐排查。
+`/metrics` 指标与告警口径见 [observability.md](observability.md)。
 
 ### 3.9 账号与权限（仅 admin）
 

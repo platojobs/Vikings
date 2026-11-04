@@ -1,9 +1,10 @@
-# 生产部署指南（v1.19.0）
+# 生产部署指南（v1.20.0）
 
 > 目标：**一台干净的机器拿到仓库，执行 2 步即可起一套可对外服务的完整栈**
 > （PostgreSQL + Mosquitto + Python 网关 + Vue 管理后台 + HTTPS 反代）。
 >
 > 日常启停、日志、凭证轮换、备份与回滚见 [operations.md](operations.md)；
+> 请求 ID、健康分层、指标与告警阈值见 [observability.md](observability.md)；
 > Broker 鉴权矩阵见 [contracts.md](contracts.md#11-broker-鉴权与主体topic-矩阵v1170)。
 
 ---
@@ -181,14 +182,16 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env resta
 | `postgres` | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` | — |
 | `migrate` | 一次性任务：`alembic upgrade head`，退出码 0 视为完成 | postgres healthy |
 | `mosquitto` | 用 `iot-gateway` 身份 `mosquitto_pub` 一条状态报文 | — |
-| `gateway` | `/api/health` 且 `data.mqttConnected == true` | migrate 完成、postgres、mosquitto healthy |
+| `gateway` | `/api/health/ready` 返回 200（真实查库 + MQTT 已连接） | migrate 完成、postgres、mosquitto healthy |
 | `web` | `wget http://127.0.0.1:8080/` | — |
 | `proxy` | `wget http://127.0.0.1/healthz` | gateway、web healthy |
 
 - 常驻服务 `restart: unless-stopped`，异常退出自动重启；`migrate` 为 `restart: "no"` 的一次性任务；
 - 迁移失败时 gateway 不会启动，避免「代码新、库旧」的隐性故障；
 - 日志轮转：单服务 `max-size=10m`、`max-file=3`；
-- 网关健康检查**要求 Broker 已连接**，凭证错误时容器保持 unhealthy 而不是假装就绪。
+- 网关健康检查**要求数据库可查且 Broker 已连接**；任一不可用时容器保持 unhealthy，
+  错误/明细可通过 `/api/health/ready` 的 `components` 与 `docker logs gateway` 查看；
+- 生产默认 `LOG_FORMAT=json`（`LOG_LEVEL` 可调）；`/api/health` 仍是轻量存活探针，不受数据库/Broker 影响。
 
 ---
 
@@ -207,6 +210,8 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env logs 
 docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env exec -T postgres \
   sh -c 'psql -tAc "select version_num from alembic_version" -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 curl -k https://<host>/api/health
+curl -k https://<host>/api/health/ready
+curl -k https://<host>/metrics | head -20   # 需内网来源；公网返回 403
 docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env ps
 ```
 
@@ -247,7 +252,7 @@ docker run --rm -v iot-prod_mosquitto-data:/data -v "$PWD/backups":/backup alpin
 
 | 现象 | 排查 | 处理 |
 | --- | --- | --- |
-| `gateway` 一直 unhealthy | `logs gateway` 看是否 fail-fast 或连接 Broker 失败 | 核对 `.env` 的 JWT/ADMIN/DB/MQTT；确认 `infra/prod/secrets/mosquitto.passwd` 存在且 644 |
+| `gateway` 一直 unhealthy | `logs gateway`；`curl /api/health/ready` 看 components | 数据库不可用或 Broker/凭证问题；核对 `.env` 的 JWT/ADMIN/DB/MQTT；确认 `infra/prod/secrets/mosquitto.passwd` 存在且 644 |
 | `migrate` 退出非 0，gateway 未启动 | `logs migrate` | 若是半升级状态（缺表）先人工核对；一般修正数据库连接后重跑 `$COMPOSE run --rm migrate` |
 | `gateway` 报「数据库迁移版本不一致」 | `SELECT version_num FROM alembic_version` | 先执行 `$COMPOSE run --rm migrate alembic upgrade head` |
 | `mosquitto` unhealthy | `logs mosquitto`；健康检查用的 `iot-gateway` 口令是否与 passwd 一致 | 重新执行 `prod_up.sh`（幂等回填）；或轮换 `service:iot-gateway` 后同步 `.env` |

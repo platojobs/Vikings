@@ -15,18 +15,28 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import alerts, audit, auth, devices, ota, rules, stats, system, users
+from app.api.routes import (
+    alerts,
+    audit,
+    auth,
+    devices,
+    health,
+    ota,
+    rules,
+    stats,
+    system,
+    users,
+)
 from app.config import get_settings
 from app.database import SessionFactory, dispose_engine, prepare_database
+from app.metrics import DB_READY
 from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
+from app.observability import ObservabilityMiddleware, configure_logging
 from app.scheduler import BackgroundScheduler
 from app.services import rule_service, user_service
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-)
+configure_logging()
 logger = logging.getLogger("app")
 settings = get_settings()
 
@@ -42,6 +52,7 @@ async def lifespan(app: FastAPI):
     logger.info("网关启动（APP_ENV=%s），数据库: %s", settings.app_env, settings.safe_database_url)
     app.state.started_at = datetime.now(timezone.utc)
     await prepare_database()
+    DB_READY.set(1)
 
     # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
     # 同时初始化账号表（仅首次启动，避免覆盖运维改过的口令）
@@ -73,7 +84,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="IoT 业务网关",
     description="设备消息消费、时序入库、AI 异常诊断、指令下发与后台查询接口",
-    version="1.0.0",
+    version="1.20.0",
     lifespan=lifespan,
 )
 
@@ -86,6 +97,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 请求 ID、结构化访问日志与 HTTP 指标；放在 CORS 外层，保证响应头一定回写
+app.add_middleware(ObservabilityMiddleware)
+
 app.include_router(auth.router)
 app.include_router(devices.router)
 app.include_router(alerts.router)
@@ -95,24 +109,54 @@ app.include_router(rules.router)
 app.include_router(audit.router)
 app.include_router(users.router)
 app.include_router(system.router)
+app.include_router(health.router)
+app.include_router(health.metrics_router)
+
+
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "")
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """把 FastAPI 默认的 {detail} 统一成契约里的 {code, message, data}。"""
+    """把 FastAPI 默认的 {detail} 统一成契约里的 {code, message, data}。
+
+    额外带 requestId：用户报错时可直接把该 ID 交给运维检索日志。
+    """
+    headers = dict(exc.headers or {})
+    request_id = _request_id(request)
+    if request_id:
+        headers["X-Request-Id"] = request_id
     return JSONResponse(
         status_code=exc.status_code,
-        content={"code": exc.status_code, "message": exc.detail, "data": None},
-        headers=exc.headers,
+        content={
+            "code": exc.status_code,
+            "message": exc.detail,
+            "data": None,
+            "requestId": request_id,
+        },
+        headers=headers,
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.exception("未捕获异常 path=%s", request.url.path)
+    request_id = _request_id(request)
+    logger.exception(
+        "未捕获异常 path=%s request_id=%s",
+        request.url.path,
+        request_id,
+        extra={"requestId": request_id},
+    )
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": "服务内部错误", "data": None},
+        content={
+            "code": 500,
+            "message": "服务内部错误",
+            "data": None,
+            "requestId": request_id,
+        },
+        headers={"X-Request-Id": request_id} if request_id else None,
     )
 
 
@@ -121,5 +165,5 @@ async def root():
     return {
         "code": 0,
         "message": "IoT 业务网关运行中",
-        "data": {"docs": "/docs", "health": "/api/health"},
+        "data": {"docs": "/docs", "health": "/api/health", "ready": "/api/health/ready"},
     }

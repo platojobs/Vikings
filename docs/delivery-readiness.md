@@ -1,10 +1,11 @@
-# 交付就绪审计（v1.15.1，状态更新至 v1.19.0）
+# 交付就绪审计（v1.15.1，状态更新至 v1.20.0）
 
 > 审计日期：2026-11-05
 > 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
 > 审计基线：`v1.15.0`（提交 `f77af2d`）
 > 状态更新：P0-2 于 v1.16.0 完成、P0-3 于 v1.17.0 完成、P0-1 于 v1.18.0 完成；
-> P1-2（数据生命周期 + 备份恢复）与 P1-3（迁移机制）于 v1.19.0 合并完成。
+> P1-2（数据生命周期 + 备份恢复）与 P1-3（迁移机制）于 v1.19.0 合并完成；
+> P1-1（可观测性）于 v1.20.0 完成。
 > P0 阻断项已全部关闭。
 
 ## 总体结论
@@ -145,7 +146,7 @@
 
 ## P1（可交付，但上线后会被运维/客户抱怨）
 
-### P1-1 可观测性只有存活探针，缺请求日志、指标与自身健康告警
+### P1-1 可观测性只有存活探针，缺请求日志、指标与自身健康告警 ✅ 已完成（v1.20.0）
 
 - **现状证据**
   - `gateway/app/main.py:26-29` 仅 `logging.basicConfig` 文本日志，无请求 ID / 访问日志 / 状态码与耗时。
@@ -155,6 +156,19 @@
 - **建议做法**：JSON 结构化日志 + 请求 ID 中间件；新增 `/api/health/ready`（DB `SELECT 1` + Broker 状态）；暴露 Prometheus 指标（请求数/延迟/5xx、MQTT 消息数、告警未处理数）；为 `mqttConnected=false`、5xx 比例、健康探针失败配置告警。
 - **预估工作量**：1~2 人日。
 - **依赖关系**：无强依赖，可与 P0-1 并行；指标暴露依赖部署侧抓取配置。
+- **完成证据（v1.20.0）**
+  - `gateway/app/observability.py`：JSON/文本双格式日志、`X-Request-Id` 中间件、ContextVar 贯穿、敏感信息脱敏；
+    请求日志字段含 method/path/status/durationMs/user/error，且不记录请求头/请求体/查询串。
+  - `GET /api/health` 保持轻量存活；新增 `GET /api/health/ready` 真实 `SELECT 1` + MQTT 状态，
+    未就绪 503 并在 `components` 指出具体层；Dockerfile/生产 compose 健康检查已改引用 `/ready`。
+  - `GET /metrics` 暴露 Prometheus 指标：请求计数/耗时直方图/状态码、登录失败与 429、
+    MQTT 连接与掉线、DB 查询错误与连接池；反代仅允许内网来源。
+  - 告警规则文件 `infra/prometheus/iot-alerts.yml`，覆盖网关不可达、`/ready` 失败、MQTT 掉线、
+    5xx 比例/速率、登录 429、DB 错误、备份失败/过期。
+  - 真实演练：停库后 `/api/health=200`、`/ready=503(components.database.ok=false)`；恢复后 `/ready=200`；
+    停 Broker 后 `iot_mqtt_connected=0`、`/ready=503(components.mqtt.ok=false)`；DB 故障时 5xx 计数
+    与 `iot_db_query_errors_total` 同步上升；带 Authorization 的请求日志仅记录 `user`，token 未落日志。
+  - 测试：`gateway/tests/test_observability.py`（请求 ID、错误响应、ready 三态、指标、日志脱敏、登录计数）。
 
 ### P1-2 数据生命周期只清理 records，告警/审计无限增长，且无备份恢复方案 ✅ 已完成（v1.19.0）
 
@@ -333,5 +347,6 @@
 - `v1.17.0`：P0-3 Broker 鉴权与设备凭证 ✅ 已完成；
 - `v1.18.0`：P0-1 + P1-6（生产部署入口与运维/部署手册）✅ 已完成；
 - `v1.19.0`：P1-2 + P1-3（Alembic 迁移、数据生命周期、备份恢复）✅ 已完成；
-- 下一批：P1-1 可观测性、P1-4 Web 批量确认、P1-5 移动端发布工程、P1-7 剩余测试补强；
+- `v1.20.0`：P1-1（结构化日志、请求 ID、分层健康检查、Prometheus 指标与告警规则）✅ 已完成；
+- 下一批：P1-4 Web 批量确认、P1-5 移动端发布工程、P1-7 剩余测试补强；
 - P2 项穿插或单独小版本。

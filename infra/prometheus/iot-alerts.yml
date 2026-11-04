@@ -1,0 +1,145 @@
+# v1.20.0 可观测性告警规则（可直接加载到 Prometheus）
+#
+# 使用方式（prometheus.yml）：
+#   rule_files:
+#     - /etc/prometheus/rules/iot-alerts.yml
+#
+# 抓取作业约定：
+#   - job="iot-gateway"         直接或经反代抓取 http://gateway:8000/metrics
+#   - job="iot-gateway-ready"   blackbox_exporter 探测 https://<host>/api/health/ready
+#   - job="node"                node_exporter（textfile collector 收集备份指标）
+#
+# 阈值是保守起点：先保证「能发现故障」，再按真实流量调低/调高。
+groups:
+  - name: iot-gateway-availability
+    rules:
+      - alert: IotGatewayDown
+        expr: up{job="iot-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          layer: gateway
+        annotations:
+          summary: "网关指标端点不可达"
+          description: "Prometheus 连续 1 分钟抓不到 {{ $labels.instance }} 的 /metrics，网关进程可能已退出或反代不可用。"
+
+      - alert: IotReadinessFailing
+        expr: probe_success{job="iot-gateway-ready"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          layer: gateway
+        annotations:
+          summary: "网关 /api/health/ready 返回非 200"
+          description: "就绪探针失败超过 1 分钟：数据库或 MQTT 至少一项不可用。打开 /api/health/ready 的 components 明细定位。"
+
+      - alert: IotDbNotReady
+        expr: iot_db_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: database
+        annotations:
+          summary: "数据库就绪探测失败"
+          description: "最近一次 /api/health/ready 的 SELECT 1 失败；配套看 iot_db_query_errors_total 与数据库日志。"
+
+  - name: iot-gateway-mqtt
+    rules:
+      - alert: IotMqttDisconnected
+        expr: iot_mqtt_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+          layer: broker
+        annotations:
+          summary: "网关与 MQTT Broker 断开"
+          description: "连续 2 分钟未连接。先看 Broker 容器状态与 1883/9001 监听，再看网关日志中的 MQTT 连接断开原因。"
+
+      - alert: IotMqttDisconnectSpike
+        expr: increase(iot_mqtt_disconnects_total[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          layer: broker
+        annotations:
+          summary: "MQTT 10 分钟内反复掉线"
+          description: "连接建立后掉线次数 > 3，通常是 Broker 重启、网络抖动或凭证轮换未重载。"
+
+      - alert: IotMqttConnectFailures
+        expr: increase(iot_mqtt_connect_failures_total[10m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          layer: broker
+        annotations:
+          summary: "MQTT 重连持续失败"
+          description: "检查 Broker 是否启动、MQTT_USERNAME/PASSWORD 是否与 passwd 一致。"
+
+  - name: iot-gateway-http
+    rules:
+      - alert: IotHttp5xxRatioHigh
+        expr: |
+          (
+            sum(rate(iot_http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(iot_http_requests_total[5m])), 1e-9)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          layer: gateway
+        annotations:
+          summary: "HTTP 5xx 比例超过 5%"
+          description: "持续 5 分钟。按 requestId 查网关 JSON 日志；同时看 iot_db_query_errors_total 是否同步上升。"
+
+      - alert: IotHttp5xxSpike
+        expr: sum(rate(iot_http_requests_total{status=~"5.."}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          layer: gateway
+        annotations:
+          summary: "HTTP 5xx 每秒超过 1 个"
+          description: "低流量场景下比比例更敏感；先用 /api/health/ready 判断 DB/Broker 是否健康。"
+
+      - alert: IotLoginRateLimitedSpike
+        expr: increase(iot_login_rate_limited_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          layer: gateway
+        annotations:
+          summary: "登录 429 激增"
+          description: "10 分钟内 > 10 次 429，可能是暴力破解或用户集中登录失败。检查来源 IP 与 iot_login_failures_total。"
+
+  - name: iot-data-protection
+    rules:
+      - alert: IotDbQueryErrors
+        expr: rate(iot_db_query_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          layer: database
+        annotations:
+          summary: "数据库语句/连接错误持续出现"
+          description: "SQLAlchemy handle_error 每分钟超过 6 次；结合 /api/health/ready 与 PostgreSQL 日志。"
+
+      - alert: IotBackupFailed
+        expr: iot_backup_last_status == 0
+        for: 5m
+        labels:
+          severity: critical
+          layer: backup
+        annotations:
+          summary: "最近一次数据库备份失败"
+          description: "pg_backup.sh 通过 BACKUP_METRICS_FILE 写入该指标；立即查看 logs/backup.log 并手工重跑。"
+
+      - alert: IotBackupStale
+        expr: time() - iot_backup_last_success_timestamp_seconds > 129600
+        for: 30m
+        labels:
+          severity: critical
+          layer: backup
+        annotations:
+          summary: "超过 36 小时没有成功备份"
+          description: "按每日备份 + 12 小时容差计算；检查 cron、磁盘空间与备份目录权限。"

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_session
+from app.metrics import LOGIN_FAILURES_TOTAL, LOGIN_RATE_LIMITED_TOTAL
 from app.schemas import (
     ApiResponse,
     LoginRequest,
@@ -43,6 +44,7 @@ async def login(
     key = (_client_ip(request), body.username)
     retry_after = login_limiter.retry_after(key)
     if retry_after:
+        LOGIN_RATE_LIMITED_TOTAL.inc()
         raise HTTPException(
             status_code=429,
             detail=f"登录失败次数过多，请 {retry_after} 秒后重试",
@@ -53,6 +55,7 @@ async def login(
     if user is None:
         # 账号不存在 / 已停用 / 口令错误统一提示，避免账号枚举
         login_limiter.record_failure(key)
+        LOGIN_FAILURES_TOTAL.inc()
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     login_limiter.reset(key)

@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -31,8 +32,12 @@ from app.models import (  # noqa: F401  仅用于让静态检查知道模型已�
 
 config = context.config
 
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Alembic 的 fileConfig 会重置根 handler 级别，并默认禁用已有 logger。
+# 网关启动时已经配置了 JSON 日志；此处只在「尚未配置根日志」的 CLI 场景启用
+# alembic.ini 的默认日志。否则迁移日志会从 JSON 变回文本，并让 app.request 等
+# 已存在的 logger 被禁用。
+if config.config_file_name is not None and not logging.getLogger().handlers:
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 settings = get_settings()
