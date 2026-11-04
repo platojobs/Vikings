@@ -574,4 +574,4 @@ Widget 测试通过 `MobileBoardPage` 的构造参数注入 fake `ApiClient` / �
 | `v1.9.1` | 移动看板 Widget 测试补强：登录、写操作确认/取消/回执、告警移除、权限禁用、实时降级与 401 路径 |
 | `v1.9.2` | 真实 Broker 端到端验收：WebSocket 实时增量、指令回执、告警 acked、停 Broker 降级与恢复；验收固化为可重复脚本 |
 | `v1.9.3` | E2E 纳入 GitHub Actions 独立作业（mosquitto + 端口检查 + 超时 + 清理）；E2E 使用临时 Broker 数据目录与 Python/Mosquitto 路径自适应 |
-| `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试 |
+| `v1.10.0` | 移动看板搜索与状态筛选（防抖、有告警筛选、20 条分批懒加载、空状态）、实时事件与筛选协同；网关 `/api/records/latest` 新增可选 status / keyword / limit / offset，`/api/devices` 过滤分页补回归测试（[发布说明](docs/releases/v1.10.0.md)） |
