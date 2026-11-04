@@ -55,7 +55,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.0"
+          # 与 device_app/pubspec.yaml 的 sdk: ^3.13.7 对齐：
+          # 3.24.0 自带 Dart 3.5，会在 flutter pub get 阶段直接失败
+          flutter-version: "3.47.9"
           channel: stable
       - run: flutter pub get
       - run: flutter analyze

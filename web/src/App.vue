@@ -86,6 +86,7 @@ async function handleLogout(): Promise<void> {
           <el-menu-item index="/audit">审计日志</el-menu-item>
           <el-menu-item v-if="isAdmin" index="/users">账号管理</el-menu-item>
           <el-menu-item index="/ota">OTA 管理</el-menu-item>
+          <el-menu-item v-if="isAdmin" index="/system">系统状态</el-menu-item>
         </el-menu>
 
         <div class="header-right">

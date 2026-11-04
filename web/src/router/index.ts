@@ -53,6 +53,12 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/OtaView.vue'),
     meta: { title: 'OTA 管理' },
   },
+  {
+    path: '/system',
+    name: 'system',
+    component: () => import('@/views/SystemView.vue'),
+    meta: { title: '系统状态' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
@@ -70,8 +76,8 @@ router.beforeEach((to) => {
   if (to.path === '/login' && token) {
     return { path: '/dashboard' }
   }
-  // 账号管理仅对管理员开放，非管理员直接回到仪表盘
-  if (to.path === '/users' && currentRole() !== 'admin') {
+  // 账号管理与系统状态仅对管理员开放，非管理员直接回到仪表盘
+  if ((to.path === '/users' || to.path === '/system') && currentRole() !== 'admin') {
     return { path: '/dashboard' }
   }
   return true

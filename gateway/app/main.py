@@ -9,12 +9,13 @@
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import alerts, audit, auth, devices, ota, rules, stats, users
+from app.api.routes import alerts, audit, auth, devices, ota, rules, stats, system, users
 from app.config import get_settings
 from app.database import SessionFactory, dispose_engine, init_models
 from app.mqtt.client import MqttGatewayClient
@@ -33,6 +34,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("网关启动，数据库: %s", settings.database_url)
+    app.state.started_at = datetime.now(timezone.utc)
     await init_models()
 
     # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
@@ -86,6 +88,7 @@ app.include_router(stats.router)
 app.include_router(rules.router)
 app.include_router(audit.router)
 app.include_router(users.router)
+app.include_router(system.router)
 
 
 @app.exception_handler(HTTPException)

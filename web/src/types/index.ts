@@ -339,6 +339,57 @@ export interface StatsOverview {
   alert_open: number
 }
 
+// ==================== 系统状态 ====================
+
+/** GET /api/system/status 的分段结构，全部为 REST snake_case */
+export interface SystemGatewayStatus {
+  version: string
+  started_at: string
+  uptime_seconds: number
+}
+
+export interface SystemMqttStatus {
+  connected: boolean
+  host: string
+  port: number
+  messages_handled: number
+  last_error: string | null
+}
+
+export interface SystemStorageStatus {
+  backend: string
+  device_total: number
+  device_online: number
+  device_offline: number
+  record_total: number
+  record_oldest_at: string | null
+  record_newest_at: string | null
+  alert_total: number
+  alert_open: number
+}
+
+export interface SystemSchedulerStatus {
+  offline_timeout_seconds: number
+  offline_sweep_interval_seconds: number
+  data_retention_days: number
+  data_purge_interval_seconds: number
+  alert_suppress_seconds: number
+}
+
+export interface SystemNotifyStatus {
+  webhook_enabled: boolean
+  webhook_target: string
+}
+
+export interface SystemStatus {
+  gateway: SystemGatewayStatus
+  mqtt: SystemMqttStatus
+  storage: SystemStorageStatus
+  scheduler: SystemSchedulerStatus
+  notify: SystemNotifyStatus
+  generated_at: string
+}
+
 // ==================== MQTT 报文（camelCase） ====================
 
 /** device/{deviceId}/sensor/report */

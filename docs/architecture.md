@@ -43,6 +43,9 @@ Python 异步业务网关 + PostgreSQL + Vue3 管理后台，内置 AI 异常诊
                    │  device_alert    │
                    │  device_command  │
                    │  ota_task        │
+                   │  rule_config     │
+                   │  audit_log       │
+                   │  app_user        │
                    └──────────────────┘
 ```
 

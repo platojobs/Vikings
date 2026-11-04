@@ -210,7 +210,8 @@ fire-and-forget，不阻塞告警主链路。
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/stats/overview` | 设备总数/在线数/今日上报数/未确认告警数 |
-| GET | `/api/health` | 存活探针（含 Broker 连接状态） |
+| GET | `/api/system/status` | 系统状态快照（仅 admin）：`gateway` 运行时长、`mqtt` 连接与消费量、`storage` 容量、`scheduler` 后台任务参数、`notify` Webhook 是否启用（地址脱敏） |
+| GET | `/api/health` | 存活探针（含 Broker 连接状态，无需鉴权） |
 
 ### 3.9 账号与权限（仅 admin）
 

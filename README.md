@@ -87,7 +87,7 @@
 │   │   ├── main.py            FastAPI 入口与生命周期
 │   │   ├── config.py          环境变量配置
 │   │   ├── database.py        异步引擎与会话
-│   │   ├── models.py          5 张表的 ORM 模型
+│   │   ├── models.py          8 张表的 ORM 模型
 │   │   ├── schemas.py         MQTT 报文与 REST 出入参校验
 │   │   ├── topics.py          Topic 构造 / 解析（禁止业务代码手写）
 │   │   ├── rules.py           告警阈值规则引擎
@@ -132,7 +132,7 @@ brew install mosquitto postgresql@16 python@3.14
 
 | 服务 | 地址 |
 | --- | --- |
-| 管理后台 | http://127.0.0.1:5173 |
+| 管理后台 | http://127.0.0.1:5173（默认仅本机，手机访问见 4.6） |
 | 网关 API 文档 | http://127.0.0.1:8000/docs |
 | 健康检查 | http://127.0.0.1:8000/api/health |
 | MQTT（设备） | 127.0.0.1:1883 |
@@ -147,10 +147,18 @@ brew install mosquitto postgresql@16 python@3.14
 ```bash
 cd device_app
 flutter pub get
-flutter run          # 选择模拟器 / 真机；Broker 地址填本机局域网 IP
+flutter run          # 选择模拟器 / 真机
 ```
 
-> Android 模拟器访问宿主机用 `10.0.2.2`，iOS 模拟器可直接用 `127.0.0.1`。
+App 内的「Broker 地址」按运行环境填写，填错会表现为一直连不上：
+
+| 运行环境 | Broker 地址 | 说明 |
+| --- | --- | --- |
+| iOS 模拟器 | `127.0.0.1` | 模拟器与 Mac 共用网络栈 |
+| Android 模拟器 | `10.0.2.2` | AVD 访问宿主机的固定别名 |
+| iOS / Android 真机 | 电脑局域网 IP（如 `192.168.1.8`） | 手机与电脑必须在同一 Wi-Fi，且 1883 端口放行 |
+
+> `127.0.0.1` 在真机上指的是手机自己，不是电脑，这是真机连不上 Broker 的最常见原因。
 
 ### 4.4 无手机时用模拟器打点
 
@@ -165,6 +173,66 @@ gateway/.venv/bin/python scripts/simulate_device.py --device-id dev-0001 --count
 ```bash
 docker compose -f infra/docker-compose.yml up -d
 ```
+
+### 4.6 手机与局域网访问（重要）
+
+先厘清三个端在各端的可见形态，避免「手机上看不到项目」的误解：
+
+| 端 | 形态 | 手机能否看到 |
+| --- | --- | --- |
+| 管理后台 | Vue3 Web 页面 | 能，用手机**浏览器**打开局域网地址 |
+| 设备端 | Flutter App（仅设备模拟器页面） | 能，但只有模拟器界面，没有管理后台功能 |
+| 网关 | 无界面服务 | 不能，也不需要 |
+
+也就是说：**手机上没有原生管理 App，管理界面是 Web**。想在手机上演示后台，按下面步骤用局域网 IP 访问。
+
+1. 查电脑局域网 IP（`en0` 为 Wi-Fi）：
+
+```bash
+ipconfig getifaddr en0          # 例如 192.168.1.8
+```
+
+2. 让网关监听所有网卡（默认脚本只监听 127.0.0.1，手机无法访问）：
+
+```bash
+cd gateway
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+3. 在 `gateway/.env` 放行手机来源的跨域请求（把 IP 换成上一步的结果）：
+
+```bash
+CORS_ORIGINS=http://127.0.0.1:5173,http://192.168.1.8:5173
+```
+
+4. 启动前端时把 API / WebSocket 指向电脑 IP，并监听所有网卡：
+
+```bash
+cd web
+VITE_API_BASE=http://192.168.1.8:8000 \
+VITE_MQTT_WS=ws://192.168.1.8:9001 \
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
+> 这两项**不能写 `127.0.0.1`**：手机上的 `127.0.0.1` 指向手机自身，会表现为登录接口请求失败、看板无实时数据。
+> 临时覆盖只对本次命令生效；需要长期生效可写入 `web/.env.local`。
+
+5. 手机浏览器访问：
+
+```
+http://192.168.1.8:5173
+```
+
+端口放行清单（macOS 防火墙与路由器均需放行，且手机与电脑同一 Wi-Fi）：
+
+| 端口 | 用途 | 谁访问 |
+| --- | --- | --- |
+| 5173 | Vue 管理后台 | 手机 / 电脑浏览器 |
+| 8000 | 网关 REST API | 浏览器（经 5173 页面发起） |
+| 9001 | MQTT over WebSocket | 浏览器实时看板 |
+| 1883 | MQTT over TCP | device_app 模拟设备 |
+
+> 手机端只看管理后台时，只需放行 5173 / 8000 / 9001；运行 device_app 真机联调时再放行 1883。
 
 ---
 
@@ -208,6 +276,7 @@ docker compose -f infra/docker-compose.yml up -d
 - 审计日志：动作/操作人筛选，变更详情可查看
 - 账号管理：新建账号、角色调整、启停、重置口令、删除保护
 - OTA 管理：创建任务、任务列表、逐设备升级进度实时刷新
+- 系统状态：网关运行时长、Broker 连接与消费量、设备在线率、时序记录容量、后台任务参数（仅 admin）
 
 ---
 
@@ -251,6 +320,7 @@ docker compose -f infra/docker-compose.yml up -d
 | GET | `/api/ota/tasks` | 任务列表（含逐设备状态） |
 | GET | `/api/ota/tasks/{id}` | 任务详情 |
 | GET | `/api/stats/overview` | 设备/上报/告警统计 |
+| GET | `/api/system/status` | 系统状态快照（网关/Broker/存储/后台任务，仅 admin） |
 | GET | `/api/health` | 存活探针（含 Broker 连接状态） |
 
 ---

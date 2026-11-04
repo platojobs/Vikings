@@ -353,3 +353,58 @@ class UserUpdateRequest(BaseModel):
     role: Optional[UserRole] = None
     active: Optional[bool] = None
     password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+
+
+# ==================== 系统状态 ====================
+
+
+class GatewayStatusOut(BaseModel):
+    version: str
+    started_at: datetime
+    uptime_seconds: int
+
+
+class MqttStatusOut(BaseModel):
+    connected: bool
+    host: str
+    port: int
+    messages_handled: int
+    last_error: Optional[str] = None
+
+
+class StorageStatusOut(BaseModel):
+    """存储视角的容量快照：只给聚合结果，不下发原始时序数据。"""
+
+    backend: str
+    device_total: int
+    device_online: int
+    device_offline: int
+    record_total: int
+    record_oldest_at: Optional[datetime] = None
+    record_newest_at: Optional[datetime] = None
+    alert_total: int
+    alert_open: int
+
+
+class SchedulerStatusOut(BaseModel):
+    """后台任务与业务参数，仅只读展示，修改仍走环境变量。"""
+
+    offline_timeout_seconds: int
+    offline_sweep_interval_seconds: int
+    data_retention_days: int
+    data_purge_interval_seconds: int
+    alert_suppress_seconds: int
+
+
+class NotifyStatusOut(BaseModel):
+    webhook_enabled: bool
+    webhook_target: str
+
+
+class SystemStatusOut(BaseModel):
+    gateway: GatewayStatusOut
+    mqtt: MqttStatusOut
+    storage: StorageStatusOut
+    scheduler: SchedulerStatusOut
+    notify: NotifyStatusOut
+    generated_at: datetime
