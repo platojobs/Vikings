@@ -119,6 +119,8 @@ async def collect_status(
             offline_sweep_interval_seconds=settings.offline_sweep_interval_seconds,
             data_retention_days=settings.data_retention_days,
             data_purge_interval_seconds=settings.data_purge_interval_seconds,
+            alert_retention_days=settings.alert_retention_days,
+            audit_retention_days=settings.audit_retention_days,
             alert_suppress_seconds=settings.alert_suppress_seconds,
         ),
         notify=NotifyStatusOut(

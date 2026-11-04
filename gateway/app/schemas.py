@@ -448,6 +448,8 @@ class SchedulerStatusOut(BaseModel):
     offline_sweep_interval_seconds: int
     data_retention_days: int
     data_purge_interval_seconds: int
+    alert_retention_days: int = 180
+    audit_retention_days: int = 365
     alert_suppress_seconds: int
 
 

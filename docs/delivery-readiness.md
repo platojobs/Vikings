@@ -1,14 +1,15 @@
-# 交付就绪审计（v1.15.1，状态更新至 v1.18.0）
+# 交付就绪审计（v1.15.1，状态更新至 v1.19.0）
 
 > 审计日期：2026-11-05
 > 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
 > 审计基线：`v1.15.0`（提交 `f77af2d`）
 > 状态更新：P0-2 于 v1.16.0 完成、P0-3 于 v1.17.0 完成、P0-1 于 v1.18.0 完成；
+> P1-2（数据生命周期 + 备份恢复）与 P1-3（迁移机制）于 v1.19.0 合并完成。
 > P0 阻断项已全部关闭。
 
 ## 总体结论
 
-**功能闭环、自动化测试与生产部署入口均已就绪。P0-2（默认凭据与登录防护）于 v1.16.0 完成，P0-3（Broker 鉴权与设备凭证）于 v1.17.0 完成，P0-1（生产部署入口：Dockerfile / 反代 / HTTPS）于 v1.18.0 完成并已真实起栈验收。** 三个 P0 阻断项全部关闭，可以交付；其余 P1 决定上线后的可运维性与口碑。
+**功能闭环、自动化测试与生产部署入口均已就绪。P0-2（默认凭据与登录防护）于 v1.16.0 完成，P0-3（Broker 鉴权与设备凭证）于 v1.17.0 完成，P0-1（生产部署入口：Dockerfile / 反代 / HTTPS）于 v1.18.0 完成并已真实起栈验收；P1-2（数据生命周期与备份恢复）与 P1-3（Alembic 迁移机制）于 v1.19.0 合并完成。** 三个 P0 阻断项全部关闭，可以交付；数据层现在具备可重复、可回滚的变更与备份能力。
 
 已确认做得好、不需要返工的部分：
 
@@ -155,7 +156,7 @@
 - **预估工作量**：1~2 人日。
 - **依赖关系**：无强依赖，可与 P0-1 并行；指标暴露依赖部署侧抓取配置。
 
-### P1-2 数据生命周期只清理 records，告警/审计无限增长，且无备份恢复方案
+### P1-2 数据生命周期只清理 records，告警/审计无限增长，且无备份恢复方案 ✅ 已完成（v1.19.0）
 
 - **现状证据**
   - `gateway/app/background_tasks.py:45-70` 只删除 `SensorRecord`，保留期来自 `gateway/app/config.py:47`（90 天）。
@@ -166,8 +167,26 @@
 - **建议做法**：按表配置保留期（如 acked 告警 180 天、审计 365 天），分批删除；新增 `(status, created_at)` 索引；补充 `pg_dump` 定时备份 + 恢复演练 runbook（含 SQLite 演示路径）。
 - **预估工作量**：1~2 人日。
 - **依赖关系**：与 P1-3 的迁移机制一起做，避免直接改表无版本记录。
+- **完成证据（v1.19.0）**
+  - `gateway/app/background_tasks.py`：`purge_expired_data` 统一执行三类清理（分块提交）：
+    records 按 `ts` 保留 90 天；**只删 acked 告警（默认 180 天），open 永不自动删除**；
+    审计日志默认 365 天。`gateway/app/config.py` 新增 `alert_retention_days`、`audit_retention_days`。
+  - 手动触发：`python -m app.maintenance purge [--dry-run]`（容器内
+    `$COMPOSE exec -T gateway python -m app.maintenance purge`），与定时任务同一实现。
+  - 迁移 `0002_lifecycle_indexes` 新增 `idx_alert_status_created`、`idx_alert_level_created`、
+    `idx_alert_status_device`、`idx_audit_operator_created`，并提供 `downgrade`。
+  - 真实 PostgreSQL EXPLAIN 证据（20 万告警 / 5 万审计）：
+    `status='open'` 列表命中 `idx_alert_status_created`；角标聚合 `status+device_id`
+    由 14.7ms 降至 2.5ms；`operator=op-7` 审计查询 0.606ms 降至 0.037ms。
+  - `scripts/pg_backup.sh`（gzip/时间命名/保留 N 份/失败非零退出）与
+    `scripts/pg_restore.sh`（输入库名确认、`--yes`、恢复后打印 `alembic_version`）。
+  - 隔离容器恢复演练：20 万告警/5 万审计/5 万记录备份 2.4MB → 清空告警、删半审计、
+    改名与新增设备 → 恢复后计数、设备名、`dev-999` 全部回到备份时点，
+    `schema_version=0002_lifecycle_indexes`（详见 `docs/operations.md` 5.3）。
+  - 测试：`tests/test_data_lifecycle.py`（SQLite + 真实 PostgreSQL），
+    `test_system_service` 状态接口暴露保留期配置；CI 新增 PostgreSQL 作业。
 
-### P1-3 无正式数据库迁移机制，`create_all` + 手写补列不可持续
+### P1-3 无正式数据库迁移机制，`create_all` + 手写补列不可持续 ✅ 已完成（v1.19.0）
 
 - **现状证据**
   - `gateway/app/database.py:53-77`：启动时 `Base.metadata.create_all`，仅手写补 `device.group_name` 一列。
@@ -177,6 +196,22 @@
 - **建议做法**：引入 Alembic，以当前结构为 baseline，后续每次变更生成 revision；CI 增加「空库升级到 head」与「旧库升级」测试；保留 `create_all` 仅用于测试。
 - **预估工作量**：1~2 人日。
 - **依赖关系**：P1-2 的表结构变更应排在迁移机制之后。
+- **完成证据（v1.19.0）**
+  - `gateway/alembic/`：`0001_baseline`（v1.18.0 及之前的完整结构，检测到既有 `device`
+    表时跳过建表并标记已应用）+ `0002_lifecycle_indexes`（查询索引，含 `downgrade`）。
+  - `gateway/app/database.py`：启动路径移除 `create_all` 与手写 `ALTER TABLE`；
+    `prepare_database()` 开发/测试自动 upgrade，生产只校验 `alembic_version == head`，
+    不一致拒绝启动。`create_all` 仅保留在测试辅助中。
+  - 生产编排新增 `migrate` 一次性服务（`alembic upgrade head`），gateway
+    `depends_on service_completed_successfully`；迁移失败不启动网关。
+    `infra/postgres/init.sql` 不再挂载到生产，只服务本地开发。
+  - 测试 `tests/test_migrations.py`：空库 upgrade、既有库自动标记（存量设备保留）、
+    显式 `stamp 0001_baseline`、`downgrade -1` 往返、事件循环内启动迁移。
+  - CI：gateway 作业新增空库迁移 + 降级往返 + `alembic check`；
+    新增 `postgres` 作业（postgres:16 service）跑迁移与生命周期测试。
+  - 真实生产卷验收：v1.18 的 `iot-prod_postgres-data`（含 4 台设备）升级后日志显示
+    `[baseline] 检测到既有 schema，跳过建表`，`alembic_version=0002_lifecycle_indexes`，
+    设备数仍为 4，HTTPS 登录与查询正常；`down`/`up` 后数据仍在。
 
 ### P1-4 Web 后台未复用批量确认，告警操作能力落后于移动端
 
@@ -278,14 +313,15 @@
 
 1. ~~P0-2 默认凭据与登录限流~~ ✅ v1.16.0。
 2. ~~P0-3 Broker 凭证/ACL~~ ✅ v1.17.0：双监听关闭匿名、设备凭证与轮换、客户端只读凭证、ACL 隔离与 E2E。
-3. P0-1 容器化 + 反代/HTTPS（2~3 天）：当前唯一剩余阻断项；在 P0-2/P0-3 的 env 与凭证方案稳定后做集成，最后用云主机做一次从零部署验收。
+3. ~~P0-1 容器化 + 反代/HTTPS~~ ✅ v1.18.0：镜像、生产编排、HTTPS 反代与真实起栈验收。
    - 三者可在同一迭代并行设计，但**合并验收必须串行**（先密钥/凭证，再部署）。
 
 **第二批（P1，可并行分组）**
 
 - 可并行：P1-1 可观测性、P1-4 Web 批量确认、P1-5 移动端发布工程（互不冲突）。
-- 需串行：P1-3 迁移机制 → P1-2 数据保留/索引；P1-6 运维文档在 P0/P1-2 落地后编写。
-- P1-7 测试补强贯穿两批：OTA E2E 先做（不依赖部署），PostgreSQL CI 等 P1-3。
+- 需串行：~~P1-3 迁移机制 → P1-2 数据保留/索引~~ ✅ v1.19.0 合并完成（数据层可重复、可回滚）；
+  ~~P1-6 运维文档~~ ✅ v1.18.0 完成。
+- P1-7 测试补强：PostgreSQL CI ~~等 P1-3~~ ✅ 已在 v1.19.0 加入。
 
 **第三批（P2，按客户反馈排序）**
 
@@ -295,6 +331,7 @@
 
 - `v1.16.0`：P0-2 默认凭据与登录防护 ✅ 已完成；
 - `v1.17.0`：P0-3 Broker 鉴权与设备凭证 ✅ 已完成；
-- `v1.18.0`：P0-1 + P1-1 + P1-3 + P1-6（可部署、可观测、迁移与运维手册）；
-- `v1.19.0`：P1-2 + P1-4 + P1-5 + P1-7（数据生命周期、Web 对齐、发布工程与测试补强）；
+- `v1.18.0`：P0-1 + P1-6（生产部署入口与运维/部署手册）✅ 已完成；
+- `v1.19.0`：P1-2 + P1-3（Alembic 迁移、数据生命周期、备份恢复）✅ 已完成；
+- 下一批：P1-1 可观测性、P1-4 Web 批量确认、P1-5 移动端发布工程、P1-7 剩余测试补强；
 - P2 项穿插或单独小版本。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键拉起生产栈（v1.18.0）。
+# 一键拉起生产栈（v1.19.0）。
 #
 # 在干净机器上执行：
 #   ./scripts/prod_up.sh
@@ -9,7 +9,8 @@
 #   2. 首次运行时由 infra/prod/.env.example 生成 infra/prod/.env，并填入随机密钥；
 #   3. 生成 Mosquitto 服务/客户端/（可选）设备凭证到 infra/prod/secrets/；
 #   4. 生成自签 HTTPS 证书（已存在则跳过）；
-#   5. docker compose 构建并启动，等待全部健康检查通过。
+#   5. docker compose 构建并启动；migrate 服务先把数据库升到 alembic head；
+#   6. 确认 migrate 成功，再等待全部常驻服务健康检查通过。
 #
 # 可选环境变量：
 #   SEED_DEVICE_IDS=dev-0001,dev-0002   首次生成时顺便签发设备凭证（默认空）
@@ -200,6 +201,27 @@ else
   log "构建镜像并启动全栈（首次构建耗时较长）"
   "${COMPOSE[@]}" up -d --build
 fi
+
+log "等待数据库迁移完成（migrate 一次性服务）"
+migrate_ok=0
+for _ in $(seq 1 40); do
+  # 一次性服务退出后不在默认 ps 列表里，必须带 -a 才能拿到退出状态
+  migrate_id="$("${COMPOSE[@]}" ps -a -q migrate 2>/dev/null || true)"
+  if [ -n "$migrate_id" ]; then
+    state="$(docker inspect -f '{{.State.Status}}' "$migrate_id" 2>/dev/null || echo unknown)"
+    exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$migrate_id" 2>/dev/null || echo 1)"
+    if [ "$state" = "exited" ]; then
+      if [ "$exit_code" = "0" ]; then
+        migrate_ok=1
+        break
+      fi
+      "${COMPOSE[@]}" logs --tail=40 migrate || true
+      fail "数据库迁移失败（migrate 退出码 ${exit_code}）；gateway 不会启动。修复后重试或手动执行 alembic upgrade head"
+    fi
+  fi
+  sleep 2
+done
+[ "$migrate_ok" = "1" ] || fail "数据库迁移未在 80 秒内完成；查看：${COMPOSE[*]} logs migrate"
 
 log "等待健康检查通过（最多 180 秒）"
 healthy=0

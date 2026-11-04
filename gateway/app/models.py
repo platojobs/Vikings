@@ -92,6 +92,11 @@ class DeviceAlert(Base):
     __table_args__ = (
         Index("idx_alert_created", "created_at"),
         Index("idx_alert_device_metric", "device_id", "metric", "created_at"),
+        # 告警中心默认按 status + 时间倒序；level 可单独筛选（v1.19.0）
+        Index("idx_alert_status_created", "status", "created_at"),
+        Index("idx_alert_level_created", "level", "created_at"),
+        # 移动端/看板按设备聚合未处理告警（status + device_id）
+        Index("idx_alert_status_device", "status", "device_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
@@ -168,6 +173,8 @@ class AuditLog(Base):
     __table_args__ = (
         Index("idx_audit_created", "created_at"),
         Index("idx_audit_action_created", "action", "created_at"),
+        # 审计列表支持按操作人筛选（v1.19.0）
+        Index("idx_audit_operator_created", "operator", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)

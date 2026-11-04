@@ -50,50 +50,25 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-async def init_models() -> None:
-    """开发/演示环境自动建表。
+async def prepare_database() -> None:
+    """启动时的数据库准备。
 
-    生产环境请使用 infra/postgres/init.sql 显式管理结构变更，
-    这里的 create_all 是幂等的，仅补齐缺失的表；已有表的新增列由轻量迁移补齐。
+    结构变更不再由 `create_all` + 手写补列驱动（v1.19.0 起全部走 Alembic）：
+
+    - 生产：只校验 `alembic_version` 是否等于代码 head，不一致直接拒绝启动，
+      避免「代码新、库旧」的隐性故障；迁移由部署流程显式执行。
+    - 开发/测试：自动 `upgrade head`，保留零配置启动体验；已有 SQLite/Postgres
+      库由 baseline 迁移自动识别并标记，不会重建表。
+
+    `Base.metadata.create_all` 仅保留给单元测试构造临时库（tests 内部使用），
+    不再出现在启动路径。
     """
-    from app import models  # noqa: F401  确保模型已注册到 Base.metadata
+    from app import migrations
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_migrate_columns)
-
-
-def _migrate_columns(sync_conn) -> None:
-    """轻量列迁移：create_all 不会修改已有表，灰度升级时补齐新增字段。
-
-    只处理可空或带默认值的加列，避免老库启动即失败。
-    """
-    from sqlalchemy import inspect, text
-
-    columns = {col["name"] for col in inspect(sync_conn).get_columns("device")}
-    if "group_name" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE device ADD COLUMN group_name VARCHAR(64) NOT NULL DEFAULT '默认分组'")
-        )
-    # v1.17.0：设备 MQTT 凭证元数据（不保存明文口令）
-    if "mqtt_username" not in columns:
-        sync_conn.execute(text("ALTER TABLE device ADD COLUMN mqtt_username VARCHAR(64)"))
-    if "mqtt_credential_version" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE device ADD COLUMN mqtt_credential_version INTEGER NOT NULL DEFAULT 0")
-        )
-    if "mqtt_credential_fingerprint" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE device ADD COLUMN mqtt_credential_fingerprint VARCHAR(64)")
-        )
-    if "mqtt_credential_issued_at" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE device ADD COLUMN mqtt_credential_issued_at TIMESTAMP")
-        )
-    if "mqtt_credential_rotated_at" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE device ADD COLUMN mqtt_credential_rotated_at TIMESTAMP")
-        )
+    if settings.is_production:
+        await migrations.verify_current(engine)
+        return
+    await migrations.upgrade_to_head(engine)
 
 
 async def dispose_engine() -> None:

@@ -6,10 +6,11 @@
 
 架构目标：贴合真实中小 IoT 公司的生产架构，而不是"学生玩具项目"。
 
-> **生产部署（v1.18.0）**：一台干净机器执行 `./scripts/prod_up.sh`，
-> 即可构建并拉起 PostgreSQL + Mosquitto + 网关 + Web + HTTPS 反代（含健康检查、数据卷与网络隔离）。
+> **生产部署（v1.19.0）**：一台干净机器执行 `./scripts/prod_up.sh`，
+> 即可构建并拉起 PostgreSQL + Mosquitto + 网关 + Web + HTTPS 反代（含健康检查、数据卷与网络隔离）；
+> 表结构由 Alembic 迁移自动升级，备份/恢复脚本见 `scripts/pg_backup.sh` / `scripts/pg_restore.sh`。
 > 完整步骤、端口、证书替换、升级备份与人工验收命令见 **[docs/deployment.md](docs/deployment.md)**；
-> 日常启停、日志、凭证轮换与回滚见 [docs/operations.md](docs/operations.md)。
+> 日常启停、迁移流程、日志、凭证轮换、保留策略与回滚见 [docs/operations.md](docs/operations.md)。
 
 ---
 
@@ -797,3 +798,5 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.15.1` | 交付就绪只读审计：按安全、部署、可观测性、数据生命周期、功能闭环、发布工程、文档与测试边界产出 P0/P1/P2 分级清单与执行顺序（[交付就绪清单](docs/delivery-readiness.md)） |
 | `v1.16.0` | P0-2 默认凭据与登录防护：`APP_ENV=production` 启动校验默认 JWT/管理员口令/数据库并在不合规时拒绝启动；演示账号仅开发/测试默认种子；登录按 IP+账号限流（429 + `Retry-After`）；新建/重置口令最小长度与弱口令校验；登录响应结构与既有鉴权语义不变（[发布说明](docs/releases/v1.16.0.md)） |
 | `v1.17.0` | P0-3 Broker 鉴权与设备凭证：1883/9001 关闭匿名并按监听加载 `password_file` + ACL；设备用户名=deviceId、只能读写自己的 Topic 子树；Web/移动端登录后换取独立只读凭证（9001 无 write）；新增设备凭证签发/轮换接口与 CLI，轮换后旧凭证失效；E2E 增加匿名拒绝、跨设备越权、客户端只读与轮换验收（[发布说明](docs/releases/v1.17.0.md)） |
+| `v1.18.0` | P0-1 生产部署入口：gateway/web Dockerfile（多阶段、非 root、健康检查）、生产编排与网络隔离、nginx HTTPS 反代与安全头、生产 env 模板与一键脚本；本机真实起栈完成登录/MQTT 凭证/设备查询/模拟上报与持久化验收（[发布说明](docs/releases/v1.18.0.md)） |
+| `v1.19.0` | P1-2 + P1-3 数据层：Alembic baseline 与迁移机制（既有库自动标记、不重建）、告警/审计查询索引、records/告警/审计三套保留策略与手动清理、`pg_dump` 备份/恢复脚本与隔离库恢复演练；CI 增加空库迁移与真实 PostgreSQL 作业（[发布说明](docs/releases/v1.19.0.md)） |

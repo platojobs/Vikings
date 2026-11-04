@@ -35,6 +35,8 @@ def test_collect_status_aggregates_counts(tmp_path, monkeypatch):
         offline_sweep_interval_seconds=60,
         data_retention_days=90,
         data_purge_interval_seconds=3600,
+        alert_retention_days=180,
+        audit_retention_days=365,
         alert_suppress_seconds=300,
         alert_webhook_url="",
     )

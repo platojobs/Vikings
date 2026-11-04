@@ -33,13 +33,16 @@ android/local.properties
 .vscode/
 .DS_Store
 
-# ---- 运行期数据 ----
+# ---- 运行期数据 / 备份（备份含全库数据，禁止入库）----
 logs/
 *.log
 *.db
 *.sqlite3
 data/
 .run/
+backups/
+*.sql.gz
+*.sql.gz.part
 
 # ---- Broker 凭证（只放模板/生成脚本，禁止提交口令文件）----
 infra/mosquitto/passwd

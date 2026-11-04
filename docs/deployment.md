@@ -1,4 +1,4 @@
-# 生产部署指南（v1.18.0）
+# 生产部署指南（v1.19.0）
 
 > 目标：**一台干净的机器拿到仓库，执行 2 步即可起一套可对外服务的完整栈**
 > （PostgreSQL + Mosquitto + Python 网关 + Vue 管理后台 + HTTPS 反代）。
@@ -50,7 +50,8 @@ HTTP_PORT=8080 HTTPS_PORT=8443 SEED_DEVICE_IDS=dev-0001 ./scripts/prod_up.sh
    `SEED_DEVICE_IDS=dev-0001,dev-0002` 可顺便签发设备凭证（默认不签）；
 4. 生成自签 HTTPS 证书到 `infra/prod/nginx/certs/`（已存在则跳过）；
 5. `docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env up -d --build`；
-6. 轮询 5 个服务的健康检查，最多 180 秒，全部通过才返回成功。
+   compose 会先启动一次性 `migrate` 服务执行 `alembic upgrade head`，成功后 gateway 才启动；
+6. 轮询 5 个常驻服务的健康检查，最多 180 秒，全部通过才返回成功。
 
 > 所有密钥、密码、证书都落在 gitignored 路径，仓库只有模板与生成脚本。
 > 需要定制管理员口令时，在首次执行前设置 `ADMIN_PASSWORD='<强口令>'`。
@@ -158,6 +159,10 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env resta
 | `MQTT_PASSWORD_FILE_MODE` | 固定 644 | 网关卡与 Broker 容器以不同 uid 共享文件 |
 | `DEPLOY_UID` / `DEPLOY_GID` | **自动生成，必改** | `id -u` / `id -g`；网关以该非 root 用户运行 |
 | `LLM_*` / `ALERT_WEBHOOK_URL` | 可选 | 不配则 AI 降级模板、告警不外推 |
+| `DATA_RETENTION_DAYS` | 默认 90 | 传感器时序保留天数（按上报时间 `ts`） |
+| `ALERT_RETENTION_DAYS` | 默认 180 | 仅清理已确认（acked）告警；open 永不自动删除 |
+| `AUDIT_RETENTION_DAYS` | 默认 365 | 审计日志保留天数 |
+| `DATA_PURGE_INTERVAL_SECONDS` | 默认 3600 | 清理任务执行周期 |
 | `TZ` | 可选 | 默认 `Asia/Shanghai` |
 
 安全约束：
@@ -174,12 +179,14 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env resta
 | 服务 | 健康检查 | 依赖 |
 | --- | --- | --- |
 | `postgres` | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` | — |
+| `migrate` | 一次性任务：`alembic upgrade head`，退出码 0 视为完成 | postgres healthy |
 | `mosquitto` | 用 `iot-gateway` 身份 `mosquitto_pub` 一条状态报文 | — |
-| `gateway` | `/api/health` 且 `data.mqttConnected == true` | postgres、mosquitto healthy |
+| `gateway` | `/api/health` 且 `data.mqttConnected == true` | migrate 完成、postgres、mosquitto healthy |
 | `web` | `wget http://127.0.0.1:8080/` | — |
 | `proxy` | `wget http://127.0.0.1/healthz` | gateway、web healthy |
 
-- 全部服务 `restart: unless-stopped`，异常退出自动重启；
+- 常驻服务 `restart: unless-stopped`，异常退出自动重启；`migrate` 为 `restart: "no"` 的一次性任务；
+- 迁移失败时 gateway 不会启动，避免「代码新、库旧」的隐性故障；
 - 日志轮转：单服务 `max-size=10m`、`max-file=3`；
 - 网关健康检查**要求 Broker 已连接**，凭证错误时容器保持 unhealthy 而不是假装就绪。
 
@@ -188,15 +195,25 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env resta
 ## 7. 升级与回滚
 
 ```bash
-# 1. 先备份（见 operations.md）
+# 1. 先备份（结构变更前必须）
+./scripts/pg_backup.sh --keep 30
+
 # 2. 拉取新代码并重建
 git fetch --tags && git checkout <新版本 tag>
 ./scripts/prod_up.sh
 
-# 3. 验证
+# 3. 验证迁移与健康
+docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env logs migrate | tail -20
+docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env exec -T postgres \
+  sh -c 'psql -tAc "select version_num from alembic_version" -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 curl -k https://<host>/api/health
 docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env ps
 ```
+
+- 首次部署与升级都由 `migrate` 服务自动执行迁移；既有库由 baseline 自动识别，
+  **不会重建或清空**（详见 [operations.md](operations.md#43-已有库v1180-及更早)）；
+- 空库首次初始化后没有演示设备，设备在首次上报时自动登记，或由管理员通过
+  `POST /api/devices` 创建。
 
 回滚：
 
@@ -205,25 +222,24 @@ git checkout <上一个稳定 tag>
 PROD_SKIP_BUILD=0 ./scripts/prod_up.sh
 ```
 
-数据库结构目前由 `create_all` + 幂等 `init.sql` 维护，**升级前必须备份**；
-正式迁移机制属于 P1-3，不在本版本范围。
+结构也要回退时，先按 [operations.md](operations.md#6-回滚) 恢复升级前的 `pg_dump`，再启动旧版本。
+不要执行 `alembic downgrade base`（会删除全部业务表）。
 
 ---
 
 ## 8. 备份与恢复衔接
 
 ```bash
-# 备份 PostgreSQL（推荐每日 cron）
-docker compose -f infra/docker-compose.prod.yml --env-file infra/prod/.env \
-  exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
-  | gzip > backup-$(date +%F).sql.gz
+# 备份 PostgreSQL（推荐每日 cron；脚本负责压缩、命名、保留 N 份、失败非零退出）
+./scripts/pg_backup.sh --keep 30
 
 # 备份 Broker 持久化（retained/离线队列）
-docker run --rm -v iot-prod_mosquitto-data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/mosquitto-$(date +%F).tar.gz -C /data .
+docker run --rm -v iot-prod_mosquitto-data:/data -v "$PWD/backups":/backup alpine \
+  tar czf "/backup/mosquitto-$(date +%F).tar.gz" -C /data .
 ```
 
-恢复流程、保留策略与演练步骤见 [operations.md](operations.md#4-备份与恢复)。
+恢复流程、保留策略、cron 与异地存放建议、真实恢复演练见
+[operations.md](operations.md#5-备份与恢复)。
 
 ---
 
@@ -232,6 +248,8 @@ docker run --rm -v iot-prod_mosquitto-data:/data -v "$PWD":/backup alpine \
 | 现象 | 排查 | 处理 |
 | --- | --- | --- |
 | `gateway` 一直 unhealthy | `logs gateway` 看是否 fail-fast 或连接 Broker 失败 | 核对 `.env` 的 JWT/ADMIN/DB/MQTT；确认 `infra/prod/secrets/mosquitto.passwd` 存在且 644 |
+| `migrate` 退出非 0，gateway 未启动 | `logs migrate` | 若是半升级状态（缺表）先人工核对；一般修正数据库连接后重跑 `$COMPOSE run --rm migrate` |
+| `gateway` 报「数据库迁移版本不一致」 | `SELECT version_num FROM alembic_version` | 先执行 `$COMPOSE run --rm migrate alembic upgrade head` |
 | `mosquitto` unhealthy | `logs mosquitto`；健康检查用的 `iot-gateway` 口令是否与 passwd 一致 | 重新执行 `prod_up.sh`（幂等回填）；或轮换 `service:iot-gateway` 后同步 `.env` |
 | 反代 502 | `logs proxy gateway` | 等 gateway health 通过；检查 compose 网络是否同时连 `edge` |
 | 浏览器 WebSocket 连不上 | 控制台看 `wss://host/mqtt`；`logs proxy` | 路径必须是 `/mqtt`；确认 443 可达、证书受信任 |
@@ -307,6 +325,7 @@ docker run --rm -e APP_ENV=production iot-gateway:verify
    宿主机 CLI 轮换可直接随后 `docker compose ... restart mosquitto`。
 3. **单实例**：gateway 目前是单进程；多副本需要把登录限流与 MQTT 消费协调改为外部组件
    （P1-1/P2-4）。
-4. **数据库迁移**：仍为 `create_all` + 幂等初始化，升级前必须备份（P1-3）。
+4. **空库无演示数据**：生产首次初始化由迁移建表，不再执行开发用的 `init.sql` 种子；
+   设备在首次上报时自动登记（`ensure_device`）。
 5. **本机 Docker**：若目标环境不允许容器运行时，按第 10 节命令清单在有 Docker 的机器复验；
    不要以「配置看起来正确」替代真实起栈。

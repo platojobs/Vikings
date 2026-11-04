@@ -12,6 +12,9 @@ SQLAlchemy[asyncio]>=2.0
 asyncpg>=0.29          # PostgreSQL 生产驱动
 aiosqlite>=0.19        # SQLite 本地开箱即用驱动（零依赖启动）
 
+# 数据库迁移：结构变更只允许通过 migration 文件表达（v1.19.0）
+alembic>=1.13
+
 # 配置与校验
 pydantic>=2.6
 pydantic-settings>=2.2

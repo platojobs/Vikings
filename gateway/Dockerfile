@@ -28,6 +28,9 @@ RUN groupadd --gid 10001 appuser \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY gateway/app ./app
+# 迁移文件必须随镜像发布：生产 compose 的 migrate 服务直接执行 alembic upgrade head
+COPY gateway/alembic.ini ./alembic.ini
+COPY gateway/alembic ./alembic
 
 USER 10001:10001
 EXPOSE 8000

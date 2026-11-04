@@ -7,7 +7,7 @@
 import asyncio
 import logging
 
-from app.background_tasks import purge_old_records, sweep_offline_devices
+from app.background_tasks import purge_expired_data, sweep_offline_devices
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ class BackgroundScheduler:
     async def start(self) -> None:
         self._tasks = [
             asyncio.create_task(self._loop("离线巡检", sweep_offline_devices, settings.offline_sweep_interval_seconds)),
-            asyncio.create_task(self._loop("数据清理", purge_old_records, settings.data_purge_interval_seconds)),
+            asyncio.create_task(self._loop("数据清理", purge_expired_data, settings.data_purge_interval_seconds)),
         ]
         logger.info(
             "后台调度器启动：离线巡检 %ds / 数据清理 %ds",

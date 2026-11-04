@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     alert_suppress_seconds: int = 300
     device_offline_timeout_seconds: int = 300
     data_retention_days: int = 90
+    # 已确认告警（acked）保留 180 天：覆盖两次季度复盘，足够定位历史事件；
+    # 未确认（open）告警不自动删除，避免清掉未处理的运维欠账。
+    alert_retention_days: int = 180
+    # 审计日志保留 365 天：操作追溯依据，比告警口径更长，且不可重建。
+    audit_retention_days: int = 365
     # 离线巡检与数据清理的执行周期（秒）
     offline_sweep_interval_seconds: int = 60
     data_purge_interval_seconds: int = 3600

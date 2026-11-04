@@ -21,7 +21,8 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      # v1.19.0 起结构由 Alembic 管理（migrate 服务），不再挂载 init.sql：
+      # 该文件只服务于本地开发编排，避免「生产首次初始化」和迁移文件两套 DDL 漂移。
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -71,6 +72,34 @@ services:
         max-size: 10m
         max-file: "3"
 
+  migrate:
+    # 一次性迁移容器（v1.19.0）：在 gateway 启动前把 schema 升到 head。
+    # - 空库：执行 baseline 建表 + 后续 revision；
+    # - 既有库（v1.18 及更早）：baseline 检测到 device 表后只记录版本，不重建，
+    #   存量数据原样保留；随后继续执行增量迁移。
+    # 迁移失败时 gateway 不会启动（depends_on service_completed_successfully）。
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
   gateway:
     build:
       context: ..
@@ -108,11 +137,18 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      # 数据生命周期（v1.19.0）：records 90 天 / 已确认告警 180 天 / 审计 365 天
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-90}
+      ALERT_RETENTION_DAYS: ${ALERT_RETENTION_DAYS:-180}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      DATA_PURGE_INTERVAL_SECONDS: ${DATA_PURGE_INTERVAL_SECONDS:-3600}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       # 目录级挂载：凭证轮换需要同目录原子写临时文件
       - ./prod/secrets:/run/secrets:rw
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       mosquitto:

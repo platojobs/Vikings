@@ -1,7 +1,7 @@
 """IoT 业务网关入口：FastAPI + aiomqtt 异步消息消费。
 
 启动顺序：
-1. 建表（幂等，补齐缺失表）；
+1. 数据库迁移（开发自动 upgrade，生产只校验版本）；
 2. 创建 MQTT 客户端并绑定业务处理器；
 3. 后台启动消费协程（不阻塞 HTTP 服务）；
 4. 优雅关闭时先停消费、再释放数据库连接池。
@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import alerts, audit, auth, devices, ota, rules, stats, system, users
 from app.config import get_settings
-from app.database import SessionFactory, dispose_engine, init_models
+from app.database import SessionFactory, dispose_engine, prepare_database
 from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
 from app.scheduler import BackgroundScheduler
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("网关启动（APP_ENV=%s），数据库: %s", settings.app_env, settings.safe_database_url)
     app.state.started_at = datetime.now(timezone.utc)
-    await init_models()
+    await prepare_database()
 
     # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
     # 同时初始化账号表（仅首次启动，避免覆盖运维改过的口令）

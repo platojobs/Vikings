@@ -24,8 +24,62 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
       - name: 语法校验（编译检查）
         run: python -m compileall app
+      - name: 数据库迁移（空库 + 降级往返）
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/ci-migrate.db
+        run: |
+          mkdir -p data
+          alembic upgrade head
+          alembic downgrade -1
+          alembic upgrade head
+          alembic check
       - name: 单元测试
         run: pytest -q
+
+  postgres:
+    name: PostgreSQL 迁移与数据生命周期
+    runs-on: ubuntu-latest
+    # 真实 PostgreSQL 验证 SQLite 覆盖不到的方言差异（索引/时间类型/DDL 事务）。
+    # 只跑迁移与生命周期测试，不重复跑全量 pytest，避免 CI 明显变慢。
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: gateway
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: iot
+          POSTGRES_PASSWORD: ci_pass_123
+          POSTGRES_DB: iot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U iot -d iot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://iot:ci_pass_123@127.0.0.1:5432/iot
+      TEST_POSTGRES_URL: postgresql+asyncpg://iot:ci_pass_123@127.0.0.1:5432/iot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: 空库迁移 + 往返
+        run: |
+          alembic upgrade head
+          alembic current
+          alembic downgrade -1
+          alembic upgrade head
+          alembic check
+      - name: 数据生命周期与索引（真实 PostgreSQL）
+        run: pytest tests/test_data_lifecycle.py -q
 
   web:
     name: Vue 后台（单元测试 + 类型检查 + 构建）
