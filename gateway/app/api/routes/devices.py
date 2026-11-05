@@ -8,6 +8,8 @@ from app.database import get_session
 from app.schemas import (
     AggregatePoint,
     ApiResponse,
+    CommandBulkRequest,
+    CommandBulkResult,
     CommandCreateRequest,
     CommandOut,
     DeviceBulkCreateRequest,
@@ -419,6 +421,57 @@ async def latest_records(
         session, status, keyword, limit, offset, device_ids
     )
     return ApiResponse(data=[SensorRecordOut.model_validate(row) for row in rows])
+
+
+@router.post("/devices/commands/bulk", response_model=ApiResponse[CommandBulkResult])
+async def bulk_create_commands(
+    body: CommandBulkRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    """批量指令（v1.28.0）：逐台预检与实际下发，部分失败不影响其他设备。
+
+    `ota` 不在本端点受理（schema 已拒绝），必须走 `/api/ota/tasks`：OTA 需要任务级
+    汇总、逐台进度与失败隔离，不能退化成一条普通指令。
+    """
+    mqtt = request.app.state.mqtt
+    result = await command_service.bulk_issue_commands(
+        session=session,
+        publisher=mqtt.publish,
+        device_ids=body.device_ids,
+        cmd_type=body.type,
+        payload=body.payload,
+        operator=user.get("sub", "system"),
+        request_id=body.request_id,
+    )
+    if not result.replayed:
+        await audit_service.log(
+            session,
+            operator=user.get("sub", "system"),
+            action=audit_service.ACTION_COMMAND_BULK,
+            target_type="command_batch",
+            target_id=result.batch_id,
+            detail={
+                "requestId": body.request_id,
+                "type": body.type,
+                "requested": result.requested,
+                "successCount": len(result.success),
+                "failedCount": len(result.failed),
+                "skippedCount": len(result.skipped),
+                "deviceIds": body.device_ids[:20],
+                "skipped": [
+                    {"deviceId": item.device_id, "reason": item.reason}
+                    for item in result.skipped[:10]
+                ],
+                "failed": [
+                    {"deviceId": item.device_id, "reason": item.reason}
+                    for item in result.failed[:10]
+                ],
+            },
+        )
+        await session.commit()
+    return ApiResponse(data=result)
 
 
 @router.post("/devices/{device_id}/commands", response_model=ApiResponse[CommandOut])

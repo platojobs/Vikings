@@ -492,7 +492,8 @@ fire-and-forget，不阻塞告警主链路。
 | --- | --- | --- |
 | POST | `/api/devices/{deviceId}/commands` | 下发指令，入参 `{type, payload}`，网关于 MQTT 发布到 `cmd` Topic |
 | GET | `/api/devices/{deviceId}/commands` | 指令历史（含回执状态/进度） |
-| POST | `/api/ota/tasks` | 创建 OTA 任务，入参 `{deviceIds[], targetVersion, url, description}`；任一设备不存在返回 400 且不创建任务 |
+| POST | `/api/devices/commands/bulk` | 批量指令（v1.28.0），入参 `{device_ids[], type, payload, request_id?}`；type ∈ `calibrate` / `config` / `reboot`，单次最多 200 台 |
+| POST | `/api/ota/tasks` | 创建 OTA 任务，入参 `{deviceIds[], targetVersion, url, description}`（单次最多 200 台）；任一设备不存在返回 400 且不创建任务 |
 | GET | `/api/ota/tasks` | OTA 任务列表（含每台设备升级状态） |
 | GET | `/api/ota/tasks/{taskId}` | OTA 任务详情 |
 
@@ -508,6 +509,56 @@ fire-and-forget，不阻塞告警主链路。
 | 部分成功 | `success + failed == total` | 各自终态 |
 
 终态一经写入即稳定；`success`/`failed` 之和达到 `total` 时任务不再接受状态变化。
+
+#### 3.7.1 批量指令 `POST /api/devices/commands/bulk`（v1.28.0）
+
+**为什么新增端点**：前端循环 N 次单设备接口会产生 N 个并发请求、部分失败难以归类、
+幂等与审计也落在 N 条记录上。批量端点由服务端串行预检与下发，一次审计、逐台结果。
+
+请求：
+
+```json
+{
+  "device_ids": ["dev-0001", "dev-0002"],
+  "type": "config",
+  "payload": {"reportIntervalSec": 30},
+  "request_id": "batch-1700000000000-abc123"
+}
+```
+
+- `device_ids`：1～200 台，重复 ID 在服务端去重；
+- `type`：仅 `calibrate` / `config` / `reboot`。**`ota` 返回 422**——升级必须走
+  `/api/ota/tasks`，需要任务级汇总、逐台进度与失败隔离；
+- `request_id` 可选（8～64 字符）。同一操作人 10 分钟内重放同一 ID 返回首次结果
+  （`replayed=true`，`batch_id` 与 `success` 不变），不会重复下发。当前网关单进程部署，
+  幂等窗口存在进程内；未来多副本需迁移到数据库/Redis。
+
+响应 `data`：
+
+```json
+{
+  "batch_id": "cmdbatch-...",
+  "type": "config",
+  "requested": 2,
+  "replayed": false,
+  "success": [{"device_id": "dev-0001", "cmd_id": "cmd-..."}],
+  "failed": [],
+  "skipped": [{"device_id": "dev-0002", "reason": "设备离线，指令无法投递（MQTT 非持久会话）"}]
+}
+```
+
+| 分类 | 含义 |
+| --- | --- |
+| `success` | 指令已落库并投递到 `device/{id}/cmd` |
+| `failed` | 设备存在且预检通过，但下发失败（如 Broker 断开），原因逐台返回 |
+| `skipped` | 预检跳过：设备不存在、设备离线（若 DB 无有效凭证元数据会补充说明） |
+
+预检只跳过**离线**设备；在线设备必然已成功接入 Broker，即使 DB 中凭证元数据缺失
+（历史/命令行签发）也不会误判。单设备端点保持原行为（不预检、离线也下发）。
+
+权限 `operator` / `admin`（viewer 403）；每次非重放批次写一条
+`command.bulk_create` 审计，含 batch_id、requestId、类型、成功/失败/跳过计数与抽样原因，
+不逐台写 N 条审计。单台发布失败不中断整批。
 
 ### 3.8 统计 / 健康
 

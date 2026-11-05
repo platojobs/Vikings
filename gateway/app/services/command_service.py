@@ -1,6 +1,7 @@
 """指令与 OTA 服务：负责指令落库、MQTT 下发、回执状态机推进与任务汇总。"""
 
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -9,7 +10,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, DeviceCommand, OtaTask
-from app.schemas import CommandAckMessage, OtaDeviceState, OtaTaskOut
+from app.schemas import (
+    CommandAckMessage,
+    CommandBulkFailure,
+    CommandBulkItem,
+    CommandBulkResult,
+    OtaDeviceState,
+    OtaTaskOut,
+)
 from app.topics import command_topic
 
 logger = logging.getLogger(__name__)
@@ -17,9 +25,15 @@ logger = logging.getLogger(__name__)
 # 发布函数签名：publish(topic: str, payload: dict) -> None
 Publisher = Callable[[str, Dict], Awaitable[None]]
 
+# 批量指令的幂等窗口：同一操作人 + requestId 在窗口内只真正下发一次。
+# 网关当前为单进程部署；若未来多副本，需要把这里换成数据库/Redis 共享存储。
+_BULK_IDEMPOTENCY_TTL_SECONDS = 600
+_bulk_results: Dict[str, Tuple[float, CommandBulkResult]] = {}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
 
 
 async def issue_command(
@@ -80,6 +94,99 @@ async def issue_command(
 
     logger.info("指令已下发 cmd=%s device=%s type=%s", cmd.cmd_id, device_id, cmd_type)
     return cmd, None
+
+
+async def bulk_issue_commands(
+    session: AsyncSession,
+    publisher: Publisher,
+    device_ids: Sequence[str],
+    cmd_type: str,
+    payload: Dict,
+    operator: str,
+    request_id: Optional[str] = None,
+) -> CommandBulkResult:
+    """批量下发同一指令：预检 → 逐台下发 → 分类返回成功/失败/跳过。
+
+    预检跳过是**批量场景**的显式语义（单设备端点保持原行为，不做预检）：
+    - 设备不存在；
+    - 未签发有效 MQTT 凭证（missing/revoked），设备根本无法接入；
+    - 设备离线：MQTT 非持久会话，投递到离线设备只会等超时，不如直接告知。
+
+    单台发布失败不会中断整批，失败原因逐台返回。
+    """
+    ordered_ids = list(dict.fromkeys(device_ids))
+    cache_key = f"{operator}:{request_id}" if request_id else ""
+    if cache_key:
+        now = time.monotonic()
+        cached = _bulk_results.get(cache_key)
+        if cached and cached[0] > now:
+            logger.info("批量指令重放 requestId=%s operator=%s", request_id, operator)
+            return cached[1].model_copy(update={"replayed": True})
+        if cached:
+            _bulk_results.pop(cache_key, None)
+        # 顺带清理过期项，避免进程内缓存无限增长
+        for key, (expires, _) in list(_bulk_results.items()):
+            if expires <= now:
+                _bulk_results.pop(key, None)
+
+    device_rows = {
+        row.device_id: row
+        for row in (
+            (await session.execute(select(Device).where(Device.device_id.in_(ordered_ids)))).scalars().all()
+        )
+    }
+
+    success: List[CommandBulkItem] = []
+    failed: List[CommandBulkFailure] = []
+    skipped: List[CommandBulkFailure] = []
+
+    for device_id in ordered_ids:
+        device = device_rows.get(device_id)
+        if device is None:
+            skipped.append(CommandBulkFailure(device_id=device_id, reason="设备不存在"))
+            continue
+        # 只跳过离线设备：在线设备必然已成功接入 Broker，说明凭证可用；
+        # DB 中的凭证元数据可能因历史/命令行签发而不完整，不能据此误杀。
+        if device.status != "online":
+            reason = "设备离线，指令无法投递（MQTT 非持久会话）"
+            if device.mqtt_credential_status != "active":
+                reason = "设备离线，且未签发有效 MQTT 凭证，无法接入 Broker"
+            skipped.append(CommandBulkFailure(device_id=device_id, reason=reason))
+            continue
+
+        cmd, err = await issue_command(
+            session=session,
+            publisher=publisher,
+            device_id=device_id,
+            cmd_type=cmd_type,
+            payload=payload,
+            operator=operator,
+        )
+        if cmd is None or err:
+            failed.append(CommandBulkFailure(device_id=device_id, reason=err or "设备不存在"))
+        else:
+            success.append(CommandBulkItem(device_id=device_id, cmd_id=cmd.cmd_id))
+
+    result = CommandBulkResult(
+        batch_id="cmdbatch-" + uuid.uuid4().hex[:12],
+        type=cmd_type,
+        requested=len(ordered_ids),
+        success=success,
+        failed=failed,
+        skipped=skipped,
+    )
+    if cache_key:
+        _bulk_results[cache_key] = (time.monotonic() + _BULK_IDEMPOTENCY_TTL_SECONDS, result)
+    logger.info(
+        "批量指令 batch=%s type=%s requested=%d success=%d failed=%d skipped=%d",
+        result.batch_id,
+        cmd_type,
+        result.requested,
+        len(success),
+        len(failed),
+        len(skipped),
+    )
+    return result
 
 
 async def apply_ack(

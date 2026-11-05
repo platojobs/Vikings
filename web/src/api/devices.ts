@@ -4,6 +4,8 @@ import { request } from '@/api/http'
 import type {
   AggregateBucket,
   AggregatePoint,
+  BulkCommandType,
+  CommandBulkResult,
   CommandItem,
   CommandType,
   Device,
@@ -131,5 +133,22 @@ export function sendCommand(
   return request<CommandItem>(`/api/devices/${encodeURIComponent(deviceId)}/commands`, {
     method: 'POST',
     body: { type, payload },
+  })
+}
+
+/**
+ * 批量下发同一指令（v1.28.0）：服务端逐台预检与下发，返回成功/失败/跳过明细。
+ * OTA 不在该端点受理，必须走 `/api/ota/tasks`。
+ * `requestId` 用于双击/网络重试去重：同 ID 在 10 分钟内返回首次结果。
+ */
+export function sendBulkCommand(
+  deviceIds: string[],
+  type: BulkCommandType,
+  payload: Record<string, unknown> = {},
+  requestId?: string,
+): Promise<CommandBulkResult> {
+  return request<CommandBulkResult>('/api/devices/commands/bulk', {
+    method: 'POST',
+    body: { device_ids: deviceIds, type, payload, request_id: requestId },
   })
 }

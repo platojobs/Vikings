@@ -363,6 +363,32 @@ export interface CommandItem {
   updated_at: string | null
 }
 
+/** 批量指令可用的类型：OTA 有独立任务流程，不在批量指令端点受理 */
+export type BulkCommandType = 'calibrate' | 'config' | 'reboot'
+
+/** 批量指令逐台成功项（REST snake_case） */
+export interface CommandBulkItem {
+  device_id: string
+  cmd_id: string
+}
+
+/** 批量指令逐台失败/跳过项，reason 可直接展示 */
+export interface CommandBulkFailure {
+  device_id: string
+  reason: string
+}
+
+/** 批量指令结果：成功 / 失败 / 跳过 三类 */
+export interface CommandBulkResult {
+  batch_id: string
+  type: BulkCommandType
+  requested: number
+  replayed: boolean
+  success: CommandBulkItem[]
+  failed: CommandBulkFailure[]
+  skipped: CommandBulkFailure[]
+}
+
 // ==================== OTA ====================
 
 /** 创建 OTA 任务的入参：网关按别名校验，必须用 camelCase */

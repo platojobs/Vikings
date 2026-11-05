@@ -920,9 +920,9 @@ def start_simulator(ctx: Context) -> str:
             "scripts/simulate_device.py",
             "--device-id",
             ctx.device_id,
-            # 6 轮覆盖后续 OTA 窗口（含 2s 休眠），避免测试步骤增加后模拟器提前退出
+            # 8 轮覆盖后续 OTA + 批量步骤（含 2s 休眠），避免测试步骤增加后模拟器提前退出
             "--count",
-            "6",
+            "8",
             "--interval",
             "2",
             "--voltage",
@@ -1706,6 +1706,144 @@ def verify_ota_device_reported_failure(ctx: Context) -> str:
     )
 
 
+def verify_bulk_commands(ctx: Context) -> str:
+    """批量指令（v1.28.0）：真实 Broker 上一次成功 + 离线/无凭证/不存在被跳过。
+
+    主设备正在上报且持有凭证，应成功下发；另两台注册设备分别覆盖「离线」与
+    「未签发凭证」，未注册 ID 覆盖「不存在」。同一 requestId 重放必须不重复下发。
+    """
+    if not ctx.temp_db:
+        raise RuntimeError("缺少临时库路径，无法断言批量审计")
+    offline_id = f"e2e-bulk-offline-{uuid.uuid4().hex[:8]}"
+    nocred_id = f"e2e-bulk-nocred-{uuid.uuid4().hex[:8]}"
+    missing_id = f"e2e-bulk-missing-{uuid.uuid4().hex[:8]}"
+    _register_device(ctx, offline_id, "批量离线设备")
+    _register_device(ctx, nocred_id, "批量无凭证设备")
+    # 给离线设备签发凭证，确保跳过原因是「离线」而不是「未签发凭证」
+    api(ctx, "POST", f"/api/devices/{offline_id}/mqtt-credential")
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        page = api(ctx, "GET", "/api/devices", params={"page": 1, "pageSize": 5, "keyword": ctx.device_id})
+        item = next((d for d in page.get("items") or [] if d["device_id"] == ctx.device_id), None)
+        if item and item.get("status") == "online":
+            break
+        time.sleep(0.3)
+    else:
+        raise RuntimeError("批量指令前置条件失败：主设备不在线")
+
+    request_id = "e2e-bulk-" + uuid.uuid4().hex[:12]
+    body = {
+        "device_ids": [ctx.device_id, offline_id, nocred_id, missing_id],
+        "type": "config",
+        "payload": {"reportIntervalSec": 30, "sleepSec": 15},
+        "request_id": request_id,
+    }
+    result = api(ctx, "POST", "/api/devices/commands/bulk", json=body)
+    if result.get("requested") != 4:
+        raise RuntimeError(f"批量指令 requested 异常：{result}")
+    if [item["device_id"] for item in result.get("success") or []] != [ctx.device_id]:
+        raise RuntimeError(f"批量指令成功集合异常：{result}")
+    skipped = {item["device_id"]: item["reason"] for item in result.get("skipped") or []}
+    if "离线" not in skipped.get(offline_id, ""):
+        raise RuntimeError(f"离线设备跳过原因不具体：{result}")
+    if "凭证" not in skipped.get(nocred_id, ""):
+        raise RuntimeError(f"无凭证设备跳过原因不具体：{result}")
+    if "不存在" not in skipped.get(missing_id, ""):
+        raise RuntimeError(f"不存在设备跳过原因不具体：{result}")
+    if result.get("failed"):
+        raise RuntimeError(f"批量指令不应有 failed：{result}")
+
+    replay = api(ctx, "POST", "/api/devices/commands/bulk", json=body)
+    if not replay.get("replayed") or replay.get("batch_id") != result.get("batch_id"):
+        raise RuntimeError(f"批量指令幂等重放异常：{replay}")
+
+    audits = api(
+        ctx,
+        "GET",
+        "/api/audit-logs",
+        params={"action": "command.bulk_create", "page": 1, "pageSize": 50},
+    )
+    rows = [
+        row for row in audits.get("items") or []
+        if (row.get("detail") or {}).get("requestId") == request_id
+    ]
+    if len(rows) != 1:
+        raise RuntimeError(f"批量审计记录数量异常（应为 1，重放不重复审计）：{len(rows)}")
+    detail = rows[0].get("detail") or {}
+    if detail.get("successCount") != 1 or detail.get("skippedCount") != 3:
+        raise RuntimeError(f"批量审计计数不准确：{detail}")
+
+    api(ctx, "DELETE", f"/api/devices/{offline_id}")
+    api(ctx, "DELETE", f"/api/devices/{nocred_id}")
+    return (
+        f"批量指令 {result['batch_id']}：成功 1（{ctx.device_id}），跳过 3"
+        f"（离线/无凭证/不存在均带具体原因）；重放 requestId 未重复下发，审计 1 条"
+    )
+
+
+def verify_bulk_ota(ctx: Context) -> str:
+    """批量 OTA（v1.28.0）：在线设备成功、离线设备超时失败，互不影响。
+
+    离线设备的指令用真实巡检逻辑判失败（只回拨该条的 updated_at，不缩短生产阈值），
+    主设备走真实模拟器回执，证明 v1.23.0 的终态守卫按设备隔离。
+    """
+    if not ctx.temp_db:
+        raise RuntimeError("缺少临时库路径，无法回拨批量 OTA 超时时钟")
+    offline_id = f"e2e-bulk-ota-{uuid.uuid4().hex[:8]}"
+    _register_device(ctx, offline_id, "批量 OTA 离线设备")
+    created = api(
+        ctx,
+        "POST",
+        "/api/ota/tasks",
+        json={
+            "deviceIds": [ctx.device_id, offline_id],
+            "targetVersion": "1.5.0",
+            "url": "https://updates.example.com/vikings-1.5.0.bin",
+            "description": "E2E 批量 OTA 混合结果",
+        },
+    )
+    task_id = str(created.get("task_id") or "")
+    devices = created.get("devices") or []
+    if not task_id or len(devices) != 2 or int(created.get("total") or 0) != 2:
+        raise RuntimeError(f"批量 OTA 任务创建异常：{created}")
+    offline_cmd = next((item for item in devices if item["device_id"] == offline_id), None)
+    if not offline_cmd:
+        raise RuntimeError(f"批量 OTA 缺少离线设备条目：{created}")
+
+    conn = sqlite3.connect(ctx.temp_db, timeout=5)
+    try:
+        updated = conn.execute(
+            "UPDATE device_command SET updated_at='2000-01-01 00:00:00.000000' WHERE cmd_id=?",
+            (offline_cmd["cmd_id"],),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("回拨批量 OTA 超时时钟失败")
+        conn.commit()
+    finally:
+        conn.close()
+
+    detail = _wait_ota_task(
+        ctx,
+        task_id,
+        lambda task: int(task.get("success") or 0) >= 1 and int(task.get("failed") or 0) >= 1,
+        45,
+        "批量 OTA 混合结果（一成功一失败）",
+    )
+    states = {item["device_id"]: item["state"] for item in detail.get("devices") or []}
+    if states.get(ctx.device_id) != "success":
+        raise RuntimeError(f"批量 OTA 在线设备未成功：{detail}")
+    if states.get(offline_id) != "failed":
+        raise RuntimeError(f"批量 OTA 离线设备未失败：{detail}")
+    if int(detail.get("success")) != 1 or int(detail.get("failed")) != 1:
+        raise RuntimeError(f"批量 OTA 汇总与逐台不一致：{detail}")
+
+    return (
+        f"批量 OTA {task_id}：在线设备 success、离线设备 failed（超时巡检），"
+        f"汇总成功 {detail['success']} / 失败 {detail['failed']} / 共 {detail['total']}"
+    )
+
+
 def verify_ota_timeout_terminal(ctx: Context) -> str:
     """无回执设备：超时巡检把 issued 指令判 failed，任务离开 running。
 
@@ -2374,12 +2512,14 @@ def main() -> int:
         rep.run("command_window", lambda: wait_report_round(ctx, 2))
         rep.run("command_dispatch", lambda: dispatch_command(ctx))
         rep.run("command_ack", lambda: verify_command_ack(ctx))
+        rep.run("bulk_command", lambda: verify_bulk_commands(ctx))
         rep.run("alert_ack", lambda: ack_alert(ctx))
         rep.run("alert_center_bulk_ack", lambda: verify_alert_center_bulk_ack(ctx))
         rep.run("group_change", lambda: verify_group_change(ctx))
         # OTA 必须在模拟器唤醒窗口内下发（与 command 一样依赖 6s 监听窗口）
         rep.run("ota_window", lambda: wait_report_round(ctx, 3))
         rep.run("ota_full_chain", lambda: verify_ota_full_chain(ctx))
+        rep.run("ota_batch_mixed", lambda: verify_bulk_ota(ctx))
         rep.run("ota_audit", lambda: verify_ota_audit(ctx))
         rep.run("stop_simulator", lambda: stop_simulator(ctx))
         # 失败路径：设备主动回执 failed / 设备无回执触发超时终态

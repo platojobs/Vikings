@@ -243,6 +243,52 @@ def test_sweep_ignores_fresh_commands(tmp_path):
     _run(tmp_path, scenario)
 
 
+def test_ota_batch_isolates_per_device_dispatch_failure(tmp_path):
+    """批量 OTA（v1.28.0）：单台下发失败只计该台 failed，其他设备照常推进。"""
+
+    async def scenario(factory):
+        async def publish(topic: str, payload: dict) -> None:
+            if "/dev-b/" in topic:
+                raise RuntimeError("模拟单台下线失败")
+
+        async with factory() as session:
+            await _create_device(session, "dev-a")
+            await _create_device(session, "dev-b")
+            task = await command_service.create_ota_task(
+                session,
+                publish,
+                ["dev-a", "dev-b"],
+                "1.1.0",
+                "https://example.com/fw.bin",
+                "批量 OTA",
+                "tester",
+            )
+        assert task.total == 2
+        assert task.success == 0 and task.failed == 1
+        by_device = {item.device_id: item for item in task.devices}
+        assert by_device["dev-a"].state == "issued"
+        assert by_device["dev-b"].state == "failed"
+
+        async with factory() as session:
+            await command_service.apply_ack(
+                session, _ack(by_device["dev-a"].cmd_id, "success", 100, "升级完成"), device_id="dev-a"
+            )
+            # 终态守卫：failed 设备迟到的 success 不复活
+            await command_service.apply_ack(
+                session, _ack(by_device["dev-b"].cmd_id, "success", 100, "迟到回执"), device_id="dev-b"
+            )
+            await session.commit()
+
+        async with factory() as session:
+            refreshed = await command_service.get_ota_task(session, task.task_id)
+        assert refreshed is not None
+        assert refreshed.success == 1 and refreshed.failed == 1
+        states = {item.device_id: item.state for item in refreshed.devices}
+        assert states == {"dev-a": "success", "dev-b": "failed"}
+
+    _run(tmp_path, scenario)
+
+
 def test_ack_cannot_advance_another_devices_command(tmp_path):
     async def scenario(factory):
         async def publish(topic: str, payload: dict) -> None:

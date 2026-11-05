@@ -329,6 +329,52 @@ class CommandCreateRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CommandBulkRequest(BaseModel):
+    """批量指令（v1.28.0）：一次最多 200 台，逐台返回结果。
+
+    `ota` 不在此端点受理：OTA 需要任务汇总与逐台进度，必须走 `/api/ota/tasks`。
+    `request_id` 可选：调用方重放同一 ID（10 分钟内、同一操作人）返回首次结果，
+    用于双击/网络重试时不重复下发。
+    """
+
+    device_ids: List[str] = Field(min_length=1, max_length=200)
+    type: str = Field(pattern="^(calibrate|config|reboot)$")
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    request_id: Optional[str] = Field(default=None, min_length=8, max_length=64)
+
+
+class CommandBulkItem(BaseModel):
+    """批量指令中下发成功的设备。"""
+
+    device_id: str
+    cmd_id: str
+
+
+class CommandBulkFailure(BaseModel):
+    """批量指令中失败或跳过的设备；`reason` 为可直接展示的具体原因。"""
+
+    device_id: str
+    reason: str
+
+
+class CommandBulkResult(BaseModel):
+    """批量指令结果：成功 / 失败 / 跳过 三类，逐台可见。
+
+    - success：指令已落库并投递到 MQTT；
+    - failed：设备存在且可投递，但下发过程失败（如 Broker 断开）；
+    - skipped：预检阶段被跳过（设备不存在 / 离线 / 无有效凭证）；
+    - replayed：同一 `request_id` 的重复提交，返回首次结果且未重复下发。
+    """
+
+    batch_id: str
+    type: str
+    requested: int
+    replayed: bool = False
+    success: List[CommandBulkItem] = Field(default_factory=list)
+    failed: List[CommandBulkFailure] = Field(default_factory=list)
+    skipped: List[CommandBulkFailure] = Field(default_factory=list)
+
+
 class CommandOut(BaseModel):
     cmd_id: str
     device_id: str
@@ -346,7 +392,7 @@ class CommandOut(BaseModel):
 
 
 class OtaTaskCreateRequest(BaseModel):
-    device_ids: List[str] = Field(alias="deviceIds", min_length=1)
+    device_ids: List[str] = Field(alias="deviceIds", min_length=1, max_length=200)
     target_version: str = Field(alias="targetVersion", min_length=1, max_length=32)
     url: str = Field(min_length=1, max_length=512)
     description: Optional[str] = Field(default=None, max_length=255)

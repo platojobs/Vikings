@@ -6,17 +6,25 @@
  * - 订阅 device/+/cmd/ack，按 cmdId 定位设备并实时刷新进度条
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { useRoute } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { fetchDevices } from '@/api/devices'
 import { createOtaTask, fetchOtaTasks } from '@/api/ota'
 import { subscribe } from '@/services/mqtt'
 import { canOperate } from '@/utils/permissions'
 import { formatDateTime } from '@/utils/format'
 import { commandStateLabel, commandStateTagType, progressStatus } from '@/utils/labels'
+import {
+  BULK_DEVICE_LIMIT,
+  analyzeOtaCandidates,
+  buildOtaConfirmText,
+  formatOtaPreflightMessage,
+} from '@/utils/batch'
 import type { CommandAckMessage, Device, OtaTask } from '@/types'
 
 const devices = ref<Device[]>([])
 const devicesLoading = ref(false)
+const route = useRoute()
 
 /** 只读角色禁止创建 OTA 任务，与后端 require_role(operator) 一致 */
 const canWrite = computed(() => canOperate())
@@ -28,6 +36,13 @@ const form = reactive({
   description: '',
 })
 const submitting = ref(false)
+
+/** 已选设备的升级风险预检：未签发凭证/离线提前暴露，而不是提交后静默失败 */
+const selectedDevices = computed(() =>
+  devices.value.filter((device) => form.deviceIds.includes(device.device_id)),
+)
+const preflight = computed(() => analyzeOtaCandidates(selectedDevices.value))
+const preflightMessage = computed(() => formatOtaPreflightMessage(preflight.value))
 
 const tasks = ref<OtaTask[]>([])
 const tasksLoading = ref(false)
@@ -73,6 +88,20 @@ async function handleSubmit(): Promise<void> {
   }
   if (!form.url.trim()) {
     ElMessage.warning('请填写固件 URL')
+    return
+  }
+  if (form.deviceIds.length > BULK_DEVICE_LIMIT) {
+    ElMessage.warning(`一次最多 ${BULK_DEVICE_LIMIT} 台，请分批创建任务`)
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      buildOtaConfirmText(form.targetVersion.trim(), form.deviceIds.length, preflight.value),
+      '批量 OTA 确认',
+      { type: 'warning', confirmButtonText: '确认创建任务', cancelButtonText: '取消' },
+    )
+  } catch {
     return
   }
 
@@ -133,6 +162,18 @@ function handleSizeChange(): void {
 onMounted(async () => {
   offAck = subscribe('device/+/cmd/ack', handleAck)
   await Promise.all([loadDevices(), loadTasks()])
+  // 从设备列表「批量 OTA」跳转过来时带上已选设备，只保留仍然存在的 ID
+  const requested = String(route.query.deviceIds || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  if (requested.length) {
+    const available = new Set(devices.value.map((device) => device.device_id))
+    form.deviceIds = requested.filter((id) => available.has(id)).slice(0, BULK_DEVICE_LIMIT)
+    if (form.deviceIds.length !== requested.length) {
+      ElMessage.warning('部分预选设备已不存在，已自动忽略')
+    }
+  }
 })
 
 onBeforeUnmount(() => offAck?.())
@@ -179,6 +220,15 @@ onBeforeUnmount(() => offAck?.())
                 />
               </el-select>
             </el-form-item>
+            <el-alert
+              v-if="form.deviceIds.length"
+              class="preflight-tip"
+              :type="preflight.blockedCount ? 'warning' : 'info'"
+              :title="`已选 ${form.deviceIds.length} 台，其中就绪 ${preflight.ready.length} 台`"
+              :description="preflightMessage"
+              :closable="false"
+              show-icon
+            />
           </el-col>
 
           <el-col :xs="24" :md="8">
@@ -259,7 +309,8 @@ onBeforeUnmount(() => offAck?.())
           <template #default="{ row }">
             <div class="task-progress">
               <div class="task-progress-text">
-                成功 {{ row.success }} / 失败 {{ row.failed }} / 共 {{ row.total }} 台
+                成功 {{ row.success }} / 失败 {{ row.failed }} / 待回执
+                {{ row.total - row.success - row.failed }} / 共 {{ row.total }} 台
               </div>
               <el-progress :percentage="taskPercent(row)" :stroke-width="6" />
             </div>
@@ -380,6 +431,11 @@ onBeforeUnmount(() => offAck?.())
 .task-progress-text {
   font-size: 12px;
   color: #64748b;
+}
+
+.preflight-tip {
+  margin-top: -8px;
+  margin-bottom: 16px;
 }
 
 .pagination-bar {

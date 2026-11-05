@@ -3,7 +3,8 @@
  * 设备列表：状态筛选 + 关键字搜索 + 分页。
  * 点击任意行打开抽屉，展示详情、历史数据折线图与指令历史。
  */
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   bulkCreateDevices,
@@ -16,9 +17,11 @@ import {
   fetchDevices,
   issueDeviceCredential,
   revokeDeviceCredential,
+  sendBulkCommand,
   sendCommand,
   updateDevice,
 } from '@/api/devices'
+import { BULK_DEVICE_LIMIT, bulkCommandLabel, summarizeBulkCommand } from '@/utils/batch'
 import { formatDateTime, formatMetric } from '@/utils/format'
 import { commandStateLabel, commandStateTagType } from '@/utils/labels'
 import {
@@ -36,7 +39,9 @@ import SensorChart from '@/components/SensorChart.vue'
 import { subscribe } from '@/services/mqtt'
 import { canOperate, isAdmin } from '@/utils/permissions'
 import type {
+  BulkCommandType,
   CommandAckMessage,
+  CommandBulkResult,
   CommandItem,
   CommandType,
   Device,
@@ -59,6 +64,54 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
 const loading = ref(false)
+const router = useRouter()
+
+// ==================== 多选（跨页保留，上限与网关批量接口一致） ====================
+const selectedMap = ref(new Map<string, Device>())
+const selectedCount = computed(() => selectedMap.value.size)
+const selectedDevices = computed(() => Array.from(selectedMap.value.values()))
+const deviceTable = ref<{
+  toggleRowSelection: (row: Device, selected: boolean) => void
+  clearSelection: () => void
+} | null>(null)
+
+function toggleSelected(row: Device, checked: boolean): void {
+  if (checked) {
+    if (!selectedMap.value.has(row.device_id) && selectedMap.value.size >= BULK_DEVICE_LIMIT) {
+      ElMessage.warning(`批量操作一次最多 ${BULK_DEVICE_LIMIT} 台，请分批处理`)
+      deviceTable.value?.toggleRowSelection(row, false)
+      return
+    }
+    selectedMap.value.set(row.device_id, row)
+  } else {
+    selectedMap.value.delete(row.device_id)
+  }
+  // Map 是响应式对象，替换引用触发 computed 更新
+  selectedMap.value = new Map(selectedMap.value)
+}
+
+function handleSelect(row: Device, checked: boolean): void {
+  toggleSelected(row, checked)
+}
+
+/** 全选/取消全选只作用于当前页，不影响其他页已选设备 */
+function handleSelectAll(rows: Device[]): void {
+  const allSelected = rows.every((row) => selectedMap.value.has(row.device_id))
+  rows.forEach((row) => toggleSelected(row, !allSelected))
+}
+
+function clearSelection(): void {
+  selectedMap.value = new Map()
+  deviceTable.value?.clearSelection()
+}
+
+/** 分页/筛选后回填勾选状态，跨页保留选择 */
+async function restoreSelection(): Promise<void> {
+  await nextTick()
+  for (const row of devices.value) {
+    deviceTable.value?.toggleRowSelection(row, selectedMap.value.has(row.device_id))
+  }
+}
 
 async function loadDevices(): Promise<void> {
   loading.value = true
@@ -72,6 +125,7 @@ async function loadDevices(): Promise<void> {
     })
     devices.value = result.items
     total.value = result.total
+    await restoreSelection()
   } catch {
     // 错误提示已由 HTTP 层统一处理
   } finally {
@@ -320,7 +374,8 @@ const detail = ref<DeviceDetail | null>(null)
 const historyRecords = ref<SensorRecord[]>([])
 const commands = ref<CommandItem[]>([])
 
-async function openDevice(row: Device): Promise<void> {
+async function openDevice(row: Device, column?: { type?: string }): Promise<void> {
+  if (column?.type === 'selection') return // 勾选不打开详情抽屉
   drawerVisible.value = true
   drawerLoading.value = true
   detail.value = null
@@ -528,6 +583,77 @@ function commandLabel(type: CommandType): string {
   }
 }
 
+// ==================== 批量指令（v1.28.0） ====================
+
+const batchCommandVisible = ref(false)
+const batchCommandType = ref<BulkCommandType>('config')
+const batchSubmitting = ref(false)
+const batchResult = ref<CommandBulkResult | null>(null)
+const batchSummary = computed(() =>
+  batchResult.value ? summarizeBulkCommand(batchResult.value) : null,
+)
+
+function openBatchCommand(): void {
+  if (selectedCount.value === 0) {
+    ElMessage.warning('请先勾选需要操作的设备')
+    return
+  }
+  batchResult.value = null
+  batchCommandType.value = 'config'
+  batchCommandVisible.value = true
+}
+
+function newRequestId(): string {
+  return `batch-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function handleBatchCommand(): Promise<void> {
+  if (selectedCount.value === 0) return
+  const label = bulkCommandLabel(batchCommandType.value)
+  try {
+    await ElMessageBox.confirm(
+      `将向 ${selectedCount.value} 台设备下发「${label}」，指令下发后不可撤回。\n` +
+        '离线或未签发有效凭证的设备会被服务端跳过，并在结果中逐台列出原因。',
+      '批量指令确认',
+      { type: 'warning', confirmButtonText: '确认下发', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+
+  batchSubmitting.value = true
+  try {
+    batchResult.value = await sendBulkCommand(
+      selectedDevices.value.map((device) => device.device_id),
+      batchCommandType.value,
+      buildPayload(batchCommandType.value),
+      newRequestId(),
+    )
+    const summary = summarizeBulkCommand(batchResult.value)
+    ElMessage.success(
+      `批量指令完成：成功 ${summary.groups[0].count} 台 / 失败 ${summary.groups[1].count} 台 / 跳过 ${summary.groups[2].count} 台`,
+    )
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    batchSubmitting.value = false
+  }
+}
+
+/** 批量 OTA 不重复造表单：带选中设备跳转 OTA 页，复用既有任务端点 */
+function goBatchOta(): void {
+  if (selectedCount.value === 0) {
+    ElMessage.warning('请先勾选需要升级的设备')
+    return
+  }
+  if (selectedCount.value > BULK_DEVICE_LIMIT) {
+    ElMessage.warning(`一次最多 ${BULK_DEVICE_LIMIT} 台，请分批处理`)
+    return
+  }
+  const ids = selectedDevices.value.map((device) => device.device_id)
+  router.push({ name: 'ota', query: { deviceIds: ids.join(',') } })
+}
+
 // ==================== 历史数据 CSV 导出 ====================
 
 function exportCsv(): void {
@@ -650,21 +776,32 @@ onUnmounted(() => {
         <span class="total-hint">共 {{ total }} 台设备</span>
         <div class="filter-spacer" />
         <template v-if="canWrite">
+          <el-button plain :disabled="selectedCount === 0" @click="openBatchCommand">
+            批量指令{{ selectedCount ? `（${selectedCount}）` : '' }}
+          </el-button>
+          <el-button plain :disabled="selectedCount === 0" @click="goBatchOta">
+            批量 OTA{{ selectedCount ? `（${selectedCount}）` : '' }}
+          </el-button>
           <el-button plain @click="openBulkImport">批量导入</el-button>
           <el-button type="primary" @click="openCreateDevice">新建设备</el-button>
         </template>
+        <el-button v-if="canWrite && selectedCount > 0" link @click="clearSelection">清空选择</el-button>
         <el-button plain @click="exportDevicesCsv">导出 CSV</el-button>
       </div>
     </el-card>
 
     <el-card shadow="never" class="table-card">
       <el-table
+        ref="deviceTable"
         v-loading="loading"
         :data="devices"
         row-key="device_id"
         class="device-table"
         @row-click="openDevice"
+        @select="handleSelect"
+        @select-all="handleSelectAll"
       >
+        <el-table-column v-if="canWrite" type="selection" width="46" reserve-selection />
         <el-table-column prop="device_id" label="设备 ID" min-width="120" />
         <el-table-column prop="name" label="设备名称" min-width="160" />
         <el-table-column prop="model" label="型号" min-width="110" />
@@ -1108,6 +1245,89 @@ onUnmounted(() => {
         <el-button type="primary" @click="acknowledgeOneTimePassword">我已保存，关闭</el-button>
       </template>
     </el-dialog>
+    <!-- 批量指令（v1.28.0）：逐台结果分类展示；OTA 不在本弹窗，走批量 OTA 跳转 -->
+    <el-dialog v-model="batchCommandVisible" title="批量指令" width="760px">
+      <el-alert
+        v-if="!batchResult"
+        :title="`已选择 ${selectedCount} 台设备（一次最多 ${BULK_DEVICE_LIMIT} 台）`"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+
+      <template v-if="!batchResult">
+        <el-form label-width="110px" class="batch-command-form">
+          <el-form-item label="指令类型">
+            <el-radio-group v-model="batchCommandType">
+              <el-radio-button value="config">运行参数配置</el-radio-button>
+              <el-radio-button value="calibrate">传感器校准</el-radio-button>
+              <el-radio-button value="reboot">设备重启</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item v-if="batchCommandType === 'calibrate'" label="温度偏移">
+            <el-input-number v-model="calibrateForm.temperatureOffset" :precision="1" :step="0.1" />
+            <span class="section-hint">湿度偏移</span>
+            <el-input-number v-model="calibrateForm.humidityOffset" :precision="1" :step="0.1" />
+          </el-form-item>
+          <el-form-item v-if="batchCommandType === 'config'" label="上报间隔（秒）">
+            <el-input-number v-model="configForm.reportIntervalSec" :min="5" :max="3600" />
+            <span class="section-hint">休眠窗口（秒）</span>
+            <el-input-number v-model="configForm.sleepSec" :min="0" :max="600" />
+          </el-form-item>
+        </el-form>
+        <el-alert
+          title="OTA 不支持在本弹窗批量下发：升级需要任务级汇总与逐台进度，请使用「批量 OTA」跳转 OTA 任务页。"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+      </template>
+
+      <template v-else>
+        <el-alert
+          :title="batchResult.replayed ? batchSummary?.title : `批次 ${batchResult.batch_id} 已完成`"
+          :type="batchResult.failed.length || batchResult.skipped.length ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+        />
+        <div class="batch-result-groups">
+          <div
+            v-for="group in batchSummary?.groups || []"
+            :key="group.key"
+            class="batch-result-group"
+            :data-test="`batch-group-${group.key}`"
+          >
+            <div class="batch-group-title">
+              <el-tag
+                :type="group.key === 'success' ? 'success' : group.key === 'failed' ? 'danger' : 'info'"
+              >
+                {{ group.label }} {{ group.count }} 台
+              </el-tag>
+            </div>
+            <el-table v-if="group.items.length" :data="group.items" size="small" row-key="device_id">
+              <el-table-column prop="device_id" label="设备 ID" min-width="160" />
+              <el-table-column prop="detail" label="结果 / 原因" min-width="260" show-overflow-tooltip />
+            </el-table>
+            <div v-else class="section-hint">无</div>
+          </div>
+        </div>
+      </template>
+
+      <template #footer>
+        <el-button @click="batchCommandVisible = false">
+          {{ batchResult ? '关闭' : '取消' }}
+        </el-button>
+        <el-button
+          v-if="!batchResult"
+          type="primary"
+          :loading="batchSubmitting"
+          :disabled="selectedCount === 0"
+          @click="handleBatchCommand"
+        >
+          确认下发（{{ selectedCount }} 台）
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -1263,6 +1483,21 @@ onUnmounted(() => {
 
 .full-width {
   width: 100%;
+}
+
+.batch-command-form {
+  margin-top: 12px;
+}
+
+.batch-result-groups {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-group-title {
+  margin-bottom: 6px;
 }
 
 @media (max-width: 768px) {
