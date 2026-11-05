@@ -14,6 +14,7 @@ from app.schemas import (
     AlertSummaryOut,
     ApiResponse,
     PageOut,
+    to_utc_datetime,
 )
 from app.security import ROLE_OPERATOR, require_role, require_user
 from app.services import alert_service, audit_service
@@ -37,12 +38,23 @@ async def list_alerts(
     deviceId: Optional[str] = Query(default=None, max_length=64),
     level: Optional[str] = Query(default=None, pattern=ALERT_LEVEL_PATTERN),
     status: Optional[str] = Query(default=None, pattern="^(open|acked)$"),
+    start: Optional[str] = Query(default=None, description="创建时间下限，ISO8601 或毫秒"),
+    end: Optional[str] = Query(default=None, description="创建时间上限，ISO8601 或毫秒"),
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
     _: dict = Depends(require_user),
 ):
-    rows, total = await alert_service.list_alerts(session, deviceId, level, status, page, pageSize)
+    try:
+        start_dt = to_utc_datetime(start) if start else None
+        end_dt = to_utc_datetime(end) if end else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="时间格式非法，请使用 ISO8601 或毫秒时间戳")
+    if start_dt and end_dt and end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="结束时间不能早于开始时间")
+    rows, total = await alert_service.list_alerts(
+        session, deviceId, level, status, page, pageSize, start=start_dt, end=end_dt
+    )
     return ApiResponse(
         data=PageOut[AlertOut](
             items=[AlertOut.model_validate(row) for row in rows],

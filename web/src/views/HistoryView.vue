@@ -2,13 +2,16 @@
 /**
  * 历史查询：选择设备 + 本地时间范围，支持明细与按小时/按天聚合两种视图。
  * 时间以毫秒时间戳传给网关，避免字符串时区歧义。
+ * v1.30.0：新增「导出 CSV」，由服务端流式生成，前端只负责下载与进度展示。
  */
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { fetchDeviceAggregate, fetchDeviceRecords, fetchDevices } from '@/api/devices'
+import { exportRecords, formatBytes } from '@/api/exports'
 import SensorChart from '@/components/SensorChart.vue'
 import AggregateChart from '@/components/AggregateChart.vue'
 import { formatDateTime } from '@/utils/format'
+import { canOperate } from '@/utils/permissions'
 import type { AggregateBucket, AggregatePoint, Device, SensorRecord } from '@/types'
 
 /** 视图模式：detail=明细，hour/day=聚合粒度 */
@@ -47,6 +50,10 @@ const records = ref<SensorRecord[]>([])
 const points = ref<AggregatePoint[]>([])
 const loading = ref(false)
 const devicesLoading = ref(false)
+/** 导出与查询共用筛选条件；viewer 只读，不提供批量外带数据的入口 */
+const canExport = computed(() => canOperate())
+const exporting = ref(false)
+const exportLoaded = ref(0)
 
 const rangeLabel = computed(() => {
   if (mode.value === 'detail') {
@@ -99,6 +106,44 @@ async function queryRecords(): Promise<void> {
 /** 切换视图模式后重新查询 */
 function handleModeChange(): void {
   if (deviceId.value) queryRecords()
+}
+
+/** 当前筛选是否可用于导出：与查询使用同一套校验，避免导出一份「看起来对」的空文件 */
+function validateExportScope(): [number, number] | null {
+  if (!deviceId.value) {
+    ElMessage.warning('请先选择设备')
+    return null
+  }
+  const [start, end] = range.value
+  if (!start || !end) {
+    ElMessage.warning('请选择时间范围')
+    return null
+  }
+  if (end.getTime() <= start.getTime()) {
+    ElMessage.warning('结束时间需晚于开始时间')
+    return null
+  }
+  return [start.getTime(), end.getTime()]
+}
+
+async function handleExport(): Promise<void> {
+  const scope = validateExportScope()
+  if (!scope) return
+  exporting.value = true
+  exportLoaded.value = 0
+  try {
+    const result = await exportRecords(
+      { deviceId: deviceId.value, start: scope[0], end: scope[1] },
+      (progress) => {
+        exportLoaded.value = progress.loadedBytes
+      },
+    )
+    ElMessage.success(`已导出 ${result.filename}（${formatBytes(result.bytes)}）`)
+  } catch (error) {
+    ElMessage.error((error as Error).message || '导出失败，请稍后重试')
+  } finally {
+    exporting.value = false
+  }
 }
 
 async function loadDevices(): Promise<void> {
@@ -161,6 +206,14 @@ onMounted(loadDevices)
         </el-radio-group>
 
         <el-button type="primary" :loading="loading" @click="queryRecords">查询</el-button>
+        <el-button
+          :loading="exporting"
+          :disabled="!canExport"
+          :title="canExport ? '' : '只读账号不可导出'"
+          @click="handleExport"
+        >
+          {{ exporting ? `导出中 ${formatBytes(exportLoaded)}` : '导出 CSV' }}
+        </el-button>
       </div>
     </el-card>
 

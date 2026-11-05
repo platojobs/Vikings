@@ -107,7 +107,13 @@ async def list_alerts(
     status: Optional[str],
     page: int,
     page_size: int,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> Tuple[List[DeviceAlert], int]:
+    """按创建时间倒序分页；`start` / `end` 为 created_at 闭区间（v1.30.0）。
+
+    导出接口复用同一套过滤条件，保证「列表看到的范围」与「导出的范围」一致。
+    """
     stmt = select(DeviceAlert)
     count_stmt = select(func.count()).select_from(DeviceAlert)
 
@@ -120,6 +126,12 @@ async def list_alerts(
     if status:
         stmt = stmt.where(DeviceAlert.status == status)
         count_stmt = count_stmt.where(DeviceAlert.status == status)
+    if start:
+        stmt = stmt.where(DeviceAlert.created_at >= start)
+        count_stmt = count_stmt.where(DeviceAlert.created_at >= start)
+    if end:
+        stmt = stmt.where(DeviceAlert.created_at <= end)
+        count_stmt = count_stmt.where(DeviceAlert.created_at <= end)
 
     stmt = stmt.order_by(DeviceAlert.created_at.desc())
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)

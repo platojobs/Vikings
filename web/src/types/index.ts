@@ -247,6 +247,9 @@ export interface AlertListQuery {
   deviceId?: string
   level?: AlertLevel
   status?: 'open' | 'acked'
+  /** 创建时间下限/上限（毫秒时间戳），v1.30.0 与导出口径一致 */
+  start?: number
+  end?: number
   page?: number
   pageSize?: number
 }

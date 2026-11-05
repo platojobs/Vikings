@@ -322,7 +322,7 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 | PATCH | `/api/devices/{deviceId}` | 编辑名称 / 型号 / 固件版本 / 分组；设备 ID 与状态不可改 |
 | DELETE | `/api/devices/{deviceId}` | 删除设备（仅 admin）；存在历史时序数据时返回 409 |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
-| GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit` |
+| GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit`、`offset`（v1.13.0） |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
 | GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`、`deviceIds`，均可选 |
 
@@ -420,7 +420,7 @@ v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`start`/`end`（v1.30.0，`created_at` 闭区间）、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
 | POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增，v1.21.0 支持备注），见 3.3.1 |
 | POST | `/api/alerts/{alertId}/ack` | 单条告警确认（v1.21.0 支持备注），见 3.3.2 |
 | GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today}` |
@@ -823,6 +823,64 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 `gateway/tests/test_http_regression.py`（批量确认 HTTP 权限与部分失败、备注与处置元数据、级别收窄 422、PATCH 设备在 MQTT 不可用时仍 200）、
 `device_app/test/alert_center_widget_test.dart`（筛选切换、分页、空态、批量成功、备注输入与处置信息展示、viewer 禁用、403、实时入顶与角标清零）、
 `scripts/e2e/e2e_acceptance.py` 的 `alert_center_bulk_ack`（真实 Broker 产生告警 → REST 筛选可见 → 批量确认后 open 不再返回）。
+
+#### 3.10.7 报表与数据导出（v1.30.0）
+
+服务端直接生成 CSV，前端不做拼接、不翻页拉全量。两个端点共用同一套筛选语义
+（设备历史复用 3.2 / 3.10.4 的 `deviceId` + `start`/`end`，告警复用 3.3 / 3.10.6 的
+`level`/`status`，两者都支持按分组 `group` 过滤）：
+
+| 方法 | 路径 | Query |
+| --- | --- | --- |
+| GET | `/api/exports/records` | `deviceId`、`group`、`start`、`end` |
+| GET | `/api/exports/alerts` | `deviceId`、`group`、`level`(warning/critical)、`status`(open/acked)、`start`、`end` |
+
+- `start` / `end` 为闭区间，接受 ISO8601 或毫秒时间戳；结束早于开始返回 400。
+- 告警级别沿用 v1.21.0 收窄后的 `warning|critical`，传其他值由 FastAPI 返回 422。
+- `group` 精确匹配 `Device.group_name`；设备不存在或未分组时该行不会因分组筛选被返回。
+- 未传时间范围时导出全部可用数据，文件名用 `all` 标记（不会伪造一个看起来像区间的范围）。
+
+**流式与上限**
+
+- 采用 `StreamingResponse` + keyset 分页（记录按 `(ts,id)`、告警按 `(created_at,id)`），
+  每批 2000 行写入一个缓冲区后立即发送并清空，内存不随总行数增长。
+- 单次导出上限 `EXPORT_MAX_ROWS`（默认 200,000）。先 `count` 再开始流式，超限返回
+  **422**：`导出 N 行超过上限 200000 行，请缩小时间范围，或按设备 / 分组分批导出`。
+  选择报错而不是静默截断：周报/对账场景里少几行比导出失败更难发现。
+- 上限只约束单次请求；月报可用「按月 + 按分组」拆分多次导出后合并。
+
+**CSV 格式**
+
+- UTF-8 + BOM（`EF BB BF`），Excel 双击直接识别中文；行结束符 `CRLF`。
+- 中文表头；时间列统一为 `YYYY-MM-DD HH:MM:SS`（UTC），表头注明 `(UTC)`。
+- 逗号 / 双引号 / 换行按 RFC 4180 转义；纯数字前导零（如设备 ID `001`）写成
+  `="001"` 文本公式，避免 Excel 吃掉前导零。
+- 以 `= + - @`、Tab、回车开头的文本加 `'` 前缀，防止被 Excel 当作公式执行。
+- 敏感字段（MQTT 口令、凭证指纹、用户口令哈希等）**不在任何导出列中**。
+
+**响应头**
+
+| 头 | 值 |
+| --- | --- |
+| `Content-Type` | `text/csv; charset=utf-8` |
+| `Content-Disposition` | `attachment; filename="<kind>_<start>_<end>.csv"`；`kind` 为 `records` / `alerts`，日期取 UTC 的 `YYYY-MM-DD`；无时间范围时为 `<kind>_all_<今天>.csv` |
+| `Cache-Control` | `no-store`（导出含业务数据，不允许中间层缓存） |
+
+**权限与审计**
+
+- 仅 `operator` / `admin` 可导出；`viewer` 返回 403。批量导出把大量业务数据带出系统，
+  外泄面远大于单页查询，因此要求可追责账号。
+- 导出完成后写审计：`action=export.records` / `export.alerts`，
+  `target_type=export`、`target_id=文件名`，`detail={filters, rows, duration_ms, filename}`。
+  审计只记录筛选范围、实际行数、耗时与文件名，**不记录任何导出内容**；客户端中途断开
+  （流被取消）也会在生成器 `finally` 中落一条审计。
+- `GET /api/alerts` 同步新增可选 `start` / `end`（`created_at` 闭区间），保证列表看到的
+  范围与导出范围由同一段 SQL 语义产生。
+
+回归覆盖：`gateway/tests/test_exports.py`（筛选复用、CSV 转义/BOM/前导零/UTC、空结果、
+权限矩阵、超限 422、审计内容）；`web/src/api/exports.spec.ts`（参数传递、文件名解析、
+错误提示、401 刷新失败）；真实大数据验证见 `scripts/verify_exports.py`
+（20 万行 Postgres 实测，不进常规 CI）。
 
 ---
 

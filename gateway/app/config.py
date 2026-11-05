@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 8.0
 
     # ---- 业务参数 ----
+    # 导出上限：超过直接 422，要求缩小时间范围/按设备或分组分批。
+    # 不做静默截断：周报对账场景里，少几行比失败更难发现。
+    export_max_rows: int = 200_000
     alert_suppress_seconds: int = 300
     device_offline_timeout_seconds: int = 300
     data_retention_days: int = 90

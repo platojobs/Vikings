@@ -4,10 +4,12 @@
  * 订阅 device/system/alert，新告警实时插入列表头部并弹通知。
  * v1.21.0：批量确认复用 POST /api/alerts/bulk-ack，部分失败逐类展示；
  * viewer 只读，多选与确认按钮禁用并给出说明。
+ * v1.30.0：新增时间范围筛选与「导出 CSV」，列表与导出共用同一套筛选参数。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElNotification } from 'element-plus'
 import { ackAlert, bulkAckAlerts, fetchAlerts, fetchAlertSummary } from '@/api/alerts'
+import { exportAlerts, formatBytes } from '@/api/exports'
 import { fetchThresholds, updateThresholds } from '@/api/rules'
 import { subscribe } from '@/services/mqtt'
 import { canOperate, isAdmin } from '@/utils/permissions'
@@ -51,6 +53,12 @@ const query = reactive<{ level: AlertLevel | ''; status: 'open' | 'acked' | ''; 
   status: '',
   deviceId: '',
 })
+/** 时间范围筛选（v1.30.0）：与导出共用，null 表示不限时间 */
+const range = ref<[Date, Date] | null>(null)
+
+/** 导出状态：按钮 loading 期间禁用重复点击，进度显示已接收体积 */
+const exporting = ref(false)
+const exportLoaded = ref(0)
 
 const alerts = ref<AlertItem[]>([])
 const total = ref(0)
@@ -87,10 +95,13 @@ const ackDialogTitle = computed(() =>
 async function loadAlerts(): Promise<void> {
   loading.value = true
   try {
+    const [start, end] = range.value ?? []
     const result = await fetchAlerts({
       level: query.level || undefined,
       status: query.status || undefined,
       deviceId: query.deviceId.trim() || undefined,
+      start: start ? start.getTime() : undefined,
+      end: end ? end.getTime() : undefined,
       page: page.value,
       pageSize: pageSize.value,
     })
@@ -127,8 +138,43 @@ function handleReset(): void {
   query.level = ''
   query.status = ''
   query.deviceId = ''
+  range.value = null
   page.value = 1
   loadAlerts()
+}
+
+/** 导出当前筛选范围；不做静默放宽，筛选为空就是不限 */
+async function handleExport(): Promise<void> {
+  if (!canWrite.value) {
+    ElMessage.warning('只读账号不可导出，请使用 operator 或 admin 账号')
+    return
+  }
+  const [start, end] = range.value ?? []
+  if (start && end && end.getTime() <= start.getTime()) {
+    ElMessage.warning('结束时间需晚于开始时间')
+    return
+  }
+  exporting.value = true
+  exportLoaded.value = 0
+  try {
+    const result = await exportAlerts(
+      {
+        deviceId: query.deviceId.trim() || undefined,
+        level: query.level || undefined,
+        status: query.status || undefined,
+        start: start ? start.getTime() : undefined,
+        end: end ? end.getTime() : undefined,
+      },
+      (progress) => {
+        exportLoaded.value = progress.loadedBytes
+      },
+    )
+    ElMessage.success(`已导出 ${result.filename}（${formatBytes(result.bytes)}）`)
+  } catch (error) {
+    ElMessage.error((error as Error).message || '导出失败，请稍后重试')
+  } finally {
+    exporting.value = false
+  }
 }
 
 function handleSizeChange(): void {
@@ -392,8 +438,24 @@ onUnmounted(() => {
           clearable
           @keyup.enter="handleSearch"
         />
+        <el-date-picker
+          v-model="range"
+          class="range-picker"
+          type="datetimerange"
+          range-separator="至"
+          start-placeholder="开始时间"
+          end-placeholder="结束时间"
+        />
         <el-button type="primary" @click="handleSearch">查询</el-button>
         <el-button @click="handleReset">重置</el-button>
+        <el-button
+          :loading="exporting"
+          :disabled="!canWrite"
+          :title="canWrite ? '' : '只读账号不可导出'"
+          @click="handleExport"
+        >
+          {{ exporting ? `导出中 ${formatBytes(exportLoaded)}` : '导出 CSV' }}
+        </el-button>
         <div class="filter-spacer" />
         <el-button v-if="isAdminOnly" type="warning" plain @click="openThresholdDrawer">
           阈值配置
@@ -636,6 +698,11 @@ onUnmounted(() => {
 
 .device-input {
   width: 200px;
+}
+
+.range-picker {
+  width: 360px;
+  max-width: 100%;
 }
 
 .filter-spacer {

@@ -15,6 +15,8 @@ export function fetchAlerts(query: AlertListQuery = {}): Promise<PageResult<Aler
       deviceId: query.deviceId,
       level: query.level,
       status: query.status,
+      start: query.start,
+      end: query.end,
       page: query.page,
       pageSize: query.pageSize,
     },
