@@ -51,7 +51,7 @@ def upgrade() -> None:
             sa.Column("device_deny", sa.Text(), nullable=False, server_default=""),
             sa.Column("mute_minutes", sa.Integer(), nullable=False, server_default="10"),
             sa.Column("retry_backoff_seconds", sa.Numeric(6, 2), nullable=False, server_default="1"),
-            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
             sa.Column("updated_by", sa.String(64), nullable=False, server_default="system"),
         )
 
