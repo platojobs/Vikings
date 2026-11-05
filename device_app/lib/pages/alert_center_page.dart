@@ -87,9 +87,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
 
   /// P2-3（v1.25.0）：设备筛选改为输入关键词远程查询，首屏不再拉 200 台。
   static const int _deviceSearchPageSize = 20;
+  static const double _deviceSearchPanelMaxHeight = 280;
 
-  /// 下拉面板最多展示 4 条，避免占满整屏；剩余部分用文字如实说明。
-  static const int _deviceSearchVisibleResults = 4;
   static const Duration _deviceSearchDebounceDuration = Duration(
     milliseconds: 300,
   );
@@ -110,7 +109,10 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   List<DeviceSummary> _deviceResults = const <DeviceSummary>[];
   int _deviceSearchTotal = 0;
   bool _deviceSearching = false;
+  bool _deviceSearchLoadingMore = false;
   String? _deviceSearchError;
+
+  bool get _deviceSearchHasMore => _deviceResults.length < _deviceSearchTotal;
 
   int _page = 1;
   int _total = 0;
@@ -443,6 +445,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         _deviceResults = const <DeviceSummary>[];
         _deviceSearchTotal = 0;
         _deviceSearching = false;
+        _deviceSearchLoadingMore = false;
         _deviceSearchError = null;
       });
       return;
@@ -450,6 +453,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     setState(() {
       _deviceSearchKeyword = keyword;
       _deviceSearching = true;
+      _deviceSearchLoadingMore = false;
       _deviceSearchError = null;
     });
     _deviceSearchDebounce = Timer(
@@ -499,6 +503,62 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     }
   }
 
+  /// 继续加载下一页匹配设备：保留已加载结果，追加新页；不静默截断。
+  Future<void> _loadMoreDeviceResults() async {
+    if (_deviceSearching ||
+        _deviceSearchLoadingMore ||
+        !_deviceSearchHasMore ||
+        _deviceSearchKeyword.isEmpty) {
+      return;
+    }
+    final session = _session;
+    if (session == null) {
+      return;
+    }
+    final seq = _deviceSearchSeq;
+    final nextPage = (_deviceResults.length ~/ _deviceSearchPageSize) + 1;
+    final client = _client();
+    setState(() => _deviceSearchLoadingMore = true);
+    try {
+      final page = await client.fetchDevices(
+        token: session.token,
+        page: nextPage,
+        pageSize: _deviceSearchPageSize,
+        keyword: _deviceSearchKeyword,
+      );
+      if (!mounted || seq != _deviceSearchSeq) {
+        return;
+      }
+      final knownIds = _deviceResults.map((device) => device.deviceId).toSet();
+      final merged = <DeviceSummary>[
+        ..._deviceResults,
+        ...page.items.where((device) => !knownIds.contains(device.deviceId)),
+      ];
+      for (final device in page.items) {
+        _deviceCache[device.deviceId] = device;
+      }
+      setState(() {
+        _deviceResults = List<DeviceSummary>.unmodifiable(merged);
+        _deviceSearchTotal = page.total;
+        _deviceSearchLoadingMore = false;
+      });
+    } on ApiException catch (error) {
+      if (!mounted || seq != _deviceSearchSeq) {
+        return;
+      }
+      if (error.kind == ApiErrorKind.unauthorized) {
+        _handleUnauthorized();
+        return;
+      }
+      setState(() {
+        _deviceSearchLoadingMore = false;
+        _deviceSearchError = error.userMessage;
+      });
+    } finally {
+      client.close();
+    }
+  }
+
   void _selectDevice(DeviceSummary device) {
     _deviceSearchDebounce?.cancel();
     _deviceSearchSeq += 1;
@@ -513,6 +573,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       _deviceResults = const <DeviceSummary>[];
       _deviceSearchTotal = 0;
       _deviceSearching = false;
+      _deviceSearchLoadingMore = false;
       _deviceSearchError = null;
     });
     _applyDevice(device.deviceId);
@@ -528,6 +589,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       _deviceResults = const <DeviceSummary>[];
       _deviceSearchTotal = 0;
       _deviceSearching = false;
+      _deviceSearchLoadingMore = false;
       _deviceSearchError = null;
     });
     _applyDevice('');
@@ -1067,44 +1129,73 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                 ),
               )
             else ...[
-              ..._deviceResults.take(_deviceSearchVisibleResults).map((device) {
-                final selected = device.deviceId == _deviceId;
-                return ListTile(
-                  key: ValueKey('device-result-${device.deviceId}'),
-                  dense: true,
-                  selected: selected,
-                  leading: Icon(
-                    selected ? Icons.check_circle : Icons.circle_outlined,
-                    size: 18,
+              ConstrainedBox(
+                constraints: const BoxConstraints(
+                  maxHeight: _deviceSearchPanelMaxHeight,
+                ),
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      for (final device in _deviceResults)
+                        ListTile(
+                          key: ValueKey('device-result-${device.deviceId}'),
+                          dense: true,
+                          selected: device.deviceId == _deviceId,
+                          leading: Icon(
+                            device.deviceId == _deviceId
+                                ? Icons.check_circle
+                                : Icons.circle_outlined,
+                            size: 18,
+                          ),
+                          title: Text(
+                            device.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text(
+                            device.deviceId,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: Text(
+                            device.online ? '在线' : '离线',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: device.online
+                                  ? Colors.green
+                                  : Colors.black45,
+                            ),
+                          ),
+                          onTap: () => _selectDevice(device),
+                        ),
+                    ],
                   ),
-                  title: Text(
-                    device.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text(
-                    device.deviceId,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  trailing: Text(
-                    device.online ? '在线' : '离线',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: device.online ? Colors.green : Colors.black45,
-                    ),
-                  ),
-                  onTap: () => _selectDevice(device),
-                );
-              }),
+                ),
+              ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 4),
                 child: Text(
                   _deviceSearchHint(),
                   key: const ValueKey('device-search-hint'),
                   style: const TextStyle(fontSize: 11, color: Colors.black54),
                 ),
               ),
+              if (_deviceSearchHasMore)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+                  child: TextButton(
+                    key: const ValueKey('device-search-load-more'),
+                    onPressed: _deviceSearchLoadingMore
+                        ? null
+                        : _loadMoreDeviceResults,
+                    child: Text(
+                      _deviceSearchLoadingMore
+                          ? '正在加载更多…'
+                          : '加载更多（还有 ${_deviceSearchTotal - _deviceResults.length} 台）',
+                    ),
+                  ),
+                ),
             ],
           ],
         ),
@@ -1112,16 +1203,13 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     );
   }
 
-  /// 结果被服务端分页或展示上限截断时不静默：给出总匹配数、当前展示条数与缩小范围提示。
+  /// 结果被服务端分页时不静默：如实给出总匹配数、已加载条数，并提供加载更多入口。
   String _deviceSearchHint() {
-    final shown = math.min(
-      _deviceResults.length,
-      _deviceSearchVisibleResults,
-    );
-    if (_deviceSearchTotal > shown) {
-      return '共 $_deviceSearchTotal 台匹配，仅显示前 $shown 台；继续输入以缩小范围';
+    final shown = _deviceResults.length;
+    if (_deviceSearchHasMore) {
+      return '共 $_deviceSearchTotal 台匹配，已加载 $shown 台；点击「加载更多」继续，也可输入更精确的关键词';
     }
-    return '共 $_deviceSearchTotal 台匹配；继续输入以缩小范围';
+    return '共 $_deviceSearchTotal 台匹配，已全部加载';
   }
 
   Widget _levelChip(String label, String value) {

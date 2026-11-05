@@ -213,6 +213,12 @@ python scripts/mqtt_credentials.py show          # 仅本机调试：查看状�
 也可以登录后台调用 `POST /api/devices/{deviceId}/mqtt-credential` 完成首次签发或轮换；
 响应中的口令只返回一次，平台不保存明文（`device` 表只有版本 / 指纹 / 时间）。
 
+v1.26.0 起运维可直接在 Web / 移动端设备详情查看凭证状态（是否签发、版本、最近轮换、是否吊销、
+指纹前 8 位），并受控轮换/吊销：首次签发 operator 可用，**轮换/吊销仅 admin**。
+界面会要求二次确认并只展示一次口令；若 Broker 未重载，会明确提示「已写入新凭证但 Broker 未重载，
+旧凭证可能仍然有效」并给补救步骤。操作步骤与补救见
+[docs/operations.md](docs/operations.md#313-轮换后提示broker-未重载怎么办)。
+
 **重载 Broker**（修改 `passwd` 后必须执行，否则旧口令仍有效）：
 
 ```bash
@@ -442,7 +448,7 @@ http://192.168.1.8:5173
 | tab 角标 | 角标展示本地未读计数：初始取 `/api/alerts/summary.open`，实时新增 +1，进入告警中心即清零；新告警确认后计数同步减少。告警中心在前台保持实时订阅，保证切到其它 tab 时角标仍能累加（代价是一条 MQTT 连接，与看板互不影响） |
 | 权限 | 与单条确认一致：viewer 只读，批量确认按钮禁用并说明原因；operator / admin 可确认；服务端 403 提示后禁用本轮写操作，401 清除会话回登录页 |
 | 兼容 | `GET /api/alerts` 原参数与默认行为不变；级别枚举收窄为 `warning` / `critical`（`info` / `notice` 返回 422）；单条 `POST /api/alerts/{id}/ack` 语义保持不变 |
-| 规模化（v1.25.0） | 设备搜索在网关 `keyword` 前缀/片段匹配后只取前 20 台，面板展示 4 条并明确提示「共 N 台匹配，仅显示前 M 台；继续输入以缩小范围」，不静默截断；批量确认按 100 条串行分批，结果合并展示 |
+| 规模化（v1.25.0） | 设备搜索在网关 `keyword` 前缀/片段匹配后按服务端分页；v1.26.0 起下拉展示已加载的全部结果（可滚动）并提供「加载更多（还有 N 台）」，不再只显示前 4 台、也不再只能用更窄的关键词；批量确认按 100 条串行分批，结果合并展示 |
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -714,7 +720,7 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（25 项，含鉴权隔离与凭证轮换） | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（37 项，含鉴权隔离、API 凭证轮换与重载结果审计） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
 每次运行由脚本在临时目录生成随机凭证与 `passwd`，**不提交任何真实口令文件**；
@@ -812,3 +818,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.23.0` | P1-7 测试盲区收敛：OTA 全链路进 E2E（创建→下发→分片进度→成功→REST/固件/审计一致）、设备失败与超时两条失败路径；修复终态可回退、下发失败不计任务、跨设备回执、无回执永久 running（新增指令超时巡检与 `COMMAND_TIMEOUT_SECONDS`）；真实故障注入（网关重启、设备重连、DB 短暂不可用）；Postgres 作业扩到告警/设备/认证/HTTP/指令 56 条核心用例；新增真机验收清单（[发布说明](docs/releases/v1.23.0.md)） |
 | `v1.24.0` | P2-4 认证生命周期：access 20 分钟 + refresh 14 天（只存指纹、单次使用与轮换、重放检测），登出/管理员吊销/改密三类吊销；Web 与移动端 401 单飞自动续期、失败回登录页；反代安全头补齐并用真实 Chrome 实测 CSP（含 ECharts blob worker 与 MQTT WSS）；修复生产构建同源 API 相对路径失效（[发布说明](docs/releases/v1.24.0.md)） |
 | `v1.25.0` | P2-3 + P2-5 规模化与 CI 体验：移动端设备筛选改为关键词远程搜索（300ms 防抖、前 20 台 + 截断提示），批量确认超过 100 条自动按 100 串行分批并合并结果、单批失败保留已成功部分；CI 增加分支级 `concurrency` 取消旧运行（标签构建不取消），gateway/Flutter/E2E 失败时上传日志 artifact（保留 7 天）（[发布说明](docs/releases/v1.25.0.md)） |
+| `v1.26.0` | 凭证可运维化 + 搜索体验补齐：Web/移动端设备详情展示凭证状态（绝不展示口令/完整指纹）、admin 受控轮换与吊销、二次确认写清真实影响、一次性口令（复制 + 已保存确认）、Broker 重载失败如实提示并记录审计 `result`；移动端设备搜索改为「加载更多」；E2E 增加真实 Broker 上的 API 轮换（旧凭证被拒、新凭证可用）与设备状态记录（[发布说明](docs/releases/v1.26.0.md)） |

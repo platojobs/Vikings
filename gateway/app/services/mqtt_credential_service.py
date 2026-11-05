@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.mqtt.credentials import (
     fingerprint,
     generate_password,
+    remove_credential,
     upsert_credential,
 )
 from app.models import Device
@@ -96,6 +97,8 @@ def issue_device_credential(device: Device) -> Dict[str, object]:
     if device.mqtt_credential_issued_at is None:
         device.mqtt_credential_issued_at = now
     device.mqtt_credential_rotated_at = now
+    # 重新签发即解除吊销状态；是否真的可用取决于 Broker 是否重载成功
+    device.mqtt_credential_revoked_at = None
 
     return {
         "device_id": username,
@@ -104,6 +107,36 @@ def issue_device_credential(device: Device) -> Dict[str, object]:
         "version": device.mqtt_credential_version,
         "issued_at": device.mqtt_credential_issued_at,
         "rotated_at": now,
+        "password_file": str(password_file),
+    }
+
+
+def revoke_device_credential(device: Device) -> Dict[str, object]:
+    """吊销设备凭证：从 Broker 密码文件删除账号并记录吊销时间。
+
+    只删 `passwd` 条目，不伪造新口令；吊销后设备必须重新签发才能接入。
+    与签发一样，调用方负责提交设备元数据，重载失败时旧凭证可能仍有效。
+    """
+    password_file = _resolve_password_file()
+    username = device.device_id
+    try:
+        removed = remove_credential(password_file, username)
+    except OSError as exc:
+        raise MqttCredentialError(
+            f"无法写入 Broker 密码文件 {password_file}：{exc}；"
+            "请确认网关进程对 Broker 配置目录有写权限"
+        ) from exc
+
+    now = _now()
+    device.mqtt_username = username
+    device.mqtt_credential_revoked_at = now
+
+    return {
+        "device_id": username,
+        "username": username,
+        "version": int(device.mqtt_credential_version or 0),
+        "revoked_at": now,
+        "removed": removed,
         "password_file": str(password_file),
     }
 
@@ -135,11 +168,13 @@ def client_credential(client: str) -> Dict[str, object]:
 
 
 def credential_metadata(device: Device) -> Dict[str, Optional[object]]:
-    """给管理端展示的凭证元数据（不含口令）。"""
+    """给管理端展示的凭证元数据（不含口令与完整指纹）。"""
     return {
         "mqtt_username": device.mqtt_username,
         "mqtt_credential_version": device.mqtt_credential_version,
-        "mqtt_credential_fingerprint": device.mqtt_credential_fingerprint,
+        "mqtt_credential_status": device.mqtt_credential_status,
+        "mqtt_credential_fingerprint_prefix": device.mqtt_credential_fingerprint_prefix,
         "mqtt_credential_issued_at": device.mqtt_credential_issued_at,
         "mqtt_credential_rotated_at": device.mqtt_credential_rotated_at,
+        "mqtt_credential_revoked_at": device.mqtt_credential_revoked_at,
     }

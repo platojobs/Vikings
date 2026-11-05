@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS device (
     mqtt_credential_fingerprint varchar(64),
     mqtt_credential_issued_at timestamptz,
     mqtt_credential_rotated_at timestamptz,
+    mqtt_credential_revoked_at timestamptz,
     created_at       timestamptz  NOT NULL DEFAULT now(),
     updated_at       timestamptz  NOT NULL DEFAULT now()
 );
@@ -32,6 +33,7 @@ COMMENT ON COLUMN device.mqtt_credential_version IS '凭证轮换版本：每次
 COMMENT ON COLUMN device.mqtt_credential_fingerprint IS '口令 SHA-256 指纹，仅用于审计对账';
 COMMENT ON COLUMN device.mqtt_credential_issued_at IS '首次签发时间';
 COMMENT ON COLUMN device.mqtt_credential_rotated_at IS '最近轮换时间';
+COMMENT ON COLUMN device.mqtt_credential_revoked_at IS '凭证吊销时间；NULL 表示未吊销，吊销后须重新签发';
 
 -- 存量库升级（v1.17.0）：表已存在时补齐凭证列
 ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_username varchar(64);
@@ -39,6 +41,7 @@ ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_version integer NOT 
 ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_fingerprint varchar(64);
 ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_issued_at timestamptz;
 ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_rotated_at timestamptz;
+ALTER TABLE device ADD COLUMN IF NOT EXISTS mqtt_credential_revoked_at timestamptz;
 
 -- 灰度升级：老库补列（新建库时该列已存在，IF NOT EXISTS 保证幂等）
 ALTER TABLE device ADD COLUMN IF NOT EXISTS group_name varchar(64) NOT NULL DEFAULT '默认分组';

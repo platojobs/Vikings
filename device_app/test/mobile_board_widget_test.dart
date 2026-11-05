@@ -166,6 +166,12 @@ class _FakeApiClient extends ApiClient {
   int groupFetchCalls = 0;
   int sendCalls = 0;
   int ackCalls = 0;
+  int credentialIssueCalls = 0;
+  int credentialRevokeCalls = 0;
+  bool credentialReloaded = true;
+  String credentialPassword = 'cred-one-time-password';
+  Object? credentialError;
+  String lastCredentialOperation = '';
 
   /// 最近一次设备请求参数，用于断言搜索/筛选已转为服务端参数。
   int lastPage = 0;
@@ -399,6 +405,75 @@ class _FakeApiClient extends ApiClient {
       throw error;
     }
     return _ackedAlert;
+  }
+
+  @override
+  Future<DeviceCredentialResult> issueDeviceCredential({
+    required String token,
+    required String deviceId,
+  }) async {
+    credentialIssueCalls += 1;
+    final error = credentialError;
+    if (error != null) {
+      throw error;
+    }
+    final index = devices.indexWhere((item) => item.deviceId == deviceId);
+    final currentlyActive =
+        index >= 0 && devices[index].mqttCredentialStatus == 'active';
+    final operation = currentlyActive ? 'rotate' : 'issue';
+    lastCredentialOperation = operation;
+    if (index >= 0) {
+      final current = devices[index];
+      devices[index] = current.copyWith(
+        mqttCredentialVersion: current.mqttCredentialVersion + 1,
+        mqttCredentialIssuedAt:
+            current.mqttCredentialIssuedAt ?? DateTime.utc(2026, 11, 5),
+        mqttCredentialRotatedAt: DateTime.utc(2026, 11, 5, 9, 30),
+        mqttCredentialStatus: 'active',
+        mqttCredentialFingerprintPrefix: 'abc12345',
+      );
+    }
+    return DeviceCredentialResult(
+      deviceId: deviceId,
+      username: deviceId,
+      password: credentialPassword,
+      version: index >= 0 ? devices[index].mqttCredentialVersion : 1,
+      operation: operation,
+      reloaded: credentialReloaded,
+      reloadDetail: credentialReloaded
+          ? 'Broker reloaded via SIGHUP'
+          : 'reload command failed: exit code 1',
+      rotatedAt: DateTime.utc(2026, 11, 5, 9, 30),
+    );
+  }
+
+  @override
+  Future<DeviceCredentialRevokeResult> revokeDeviceCredential({
+    required String token,
+    required String deviceId,
+  }) async {
+    credentialRevokeCalls += 1;
+    final error = credentialError;
+    if (error != null) {
+      throw error;
+    }
+    final index = devices.indexWhere((item) => item.deviceId == deviceId);
+    if (index >= 0) {
+      devices[index] = devices[index].copyWith(
+        mqttCredentialStatus: 'revoked',
+        mqttCredentialRevokedAt: DateTime.utc(2026, 11, 5, 9, 40),
+      );
+    }
+    return DeviceCredentialRevokeResult(
+      deviceId: deviceId,
+      username: deviceId,
+      version: index >= 0 ? devices[index].mqttCredentialVersion : 1,
+      revokedAt: DateTime.utc(2026, 11, 5, 9, 40),
+      reloaded: credentialReloaded,
+      reloadDetail: credentialReloaded
+          ? 'Broker reloaded via SIGHUP'
+          : 'reload command failed: exit code 1',
+    );
   }
 
   @override
@@ -1132,9 +1207,8 @@ void main() {
     await tester.pumpAndSettle();
     await _openDeviceSheet(tester);
 
-    // 向下浏览一段，模拟用户正在看较早的历史数据
-    await tester.drag(_sheetList, const Offset(0, -200));
-    await tester.pumpAndSettle();
+    // 向下浏览一段，模拟用户正在看较早的历史数据（凭证区在历史上报之上）
+    await _scrollSheetTo(tester, find.text('24.0℃ / 50% / 80%'));
     final sheetScrollable = find.descendant(
       of: _sheetList,
       matching: find.byType(Scrollable),
@@ -1166,14 +1240,23 @@ void main() {
     await tester.pump();
     await tester.pumpAndSettle();
 
-    // 新上报进入列表（顶部），旧数据锚点仍在原屏幕位置
-    expect(find.text('30.0℃ / 50% / 88%'), findsOneWidget);
+    // 旧数据锚点仍在原屏幕位置，滚动偏移随插入内容增大
     expect(tester.getTopLeft(anchor).dy, closeTo(anchorBefore, 1.0));
     final positionAfter = tester
         .state<ScrollableState>(sheetScrollable)
         .position
         .pixels;
     expect(positionAfter, greaterThan(positionBefore));
+
+    // 回到顶部确认新上报已插入列表首位
+    tester.state<ScrollableState>(sheetScrollable).position.jumpTo(0);
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('30.0℃ / 50% / 88%'),
+      200,
+      scrollable: sheetScrollable,
+    );
+    expect(find.text('30.0℃ / 50% / 88%'), findsOneWidget);
   });
 
   testWidgets('实时分组变更：改组后设备移出当前筛选，total 与服务端口径一致', (tester) async {
@@ -1271,6 +1354,170 @@ void main() {
     expect(find.widgetWithText(ChoiceChip, '巡检组'), findsOneWidget);
     expect(find.widgetWithText(ChoiceChip, '默认分组'), findsOneWidget);
     expect(find.textContaining('dev-0001 · 巡检组'), findsOneWidget);
+  });
+
+  testWidgets('设备详情：未签发凭证时明确提示并提供签发入口', (tester) async {
+    final api = _FakeApiClient();
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-credential-section')),
+    );
+
+    expect(find.text('MQTT 凭证'), findsOneWidget);
+    expect(find.text('未签发'), findsOneWidget);
+    expect(find.text('该设备尚未签发凭证，无法接入 Broker'), findsOneWidget);
+    expect(find.byKey(const Key('credential-status-chip')), findsOneWidget);
+    expect(find.byKey(const Key('credential-issue-button')), findsOneWidget);
+  });
+
+  testWidgets('设备详情：签发需二次确认，口令只展示一次且关闭后不可再查', (tester) async {
+    final api = _FakeApiClient();
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-credential-section')),
+    );
+
+    await tester.tap(find.byKey(const Key('credential-issue-button')));
+    await tester.pumpAndSettle();
+
+    // 二次确认：写清影响后才能继续
+    expect(find.text('签发设备凭证'), findsOneWidget);
+    expect(find.textContaining('确认为设备 dev-0001 签发 MQTT 凭证'), findsOneWidget);
+    expect(api.credentialIssueCalls, 0);
+
+    await tester.tap(find.text('确认签发'));
+    await tester.pumpAndSettle();
+    expect(api.credentialIssueCalls, 1);
+    expect(api.lastCredentialOperation, 'issue');
+
+    // 一次性口令可见，复制入口存在
+    expect(find.byKey(const Key('one-time-credential-password')), findsOneWidget);
+    expect(find.text(api.credentialPassword), findsOneWidget);
+    expect(find.text('复制口令'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('one-time-credential-ack')));
+    await tester.pumpAndSettle();
+
+    // 关闭后口令不可再查，状态刷新为已签发
+    expect(find.byKey(const Key('one-time-credential-password')), findsNothing);
+    expect(find.text(api.credentialPassword), findsNothing);
+    expect(find.text('已签发'), findsOneWidget);
+  });
+
+  testWidgets('设备详情：轮换需二次确认，Broker 重载失败时提示旧凭证可能仍有效', (tester) async {
+    final activeDevice = _device.copyWith(
+      mqttCredentialVersion: 1,
+      mqttCredentialStatus: 'active',
+      mqttCredentialIssuedAt: DateTime.utc(2026, 11, 4, 8),
+      mqttCredentialRotatedAt: DateTime.utc(2026, 11, 4, 8),
+      mqttCredentialFingerprintPrefix: '1234abcd',
+    );
+    final api = _FakeApiClient(devices: [activeDevice])
+      ..credentialReloaded = false
+      ..credentialPassword = 'rotated-one-time-password';
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-credential-section')),
+    );
+
+    expect(find.text('已签发'), findsOneWidget);
+    expect(find.text('1234abcd…'), findsOneWidget);
+    expect(find.byKey(const Key('credential-rotate-button')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('credential-rotate-button')));
+    await tester.pumpAndSettle();
+    expect(find.text('轮换设备凭证'), findsOneWidget);
+    expect(find.textContaining('旧凭证对新连接立即失效'), findsOneWidget);
+    expect(find.textContaining('设备必须更新配置中的口令'), findsOneWidget);
+    expect(find.textContaining('Broker 重载失败'), findsOneWidget);
+    expect(api.credentialIssueCalls, 0);
+
+    await tester.tap(find.text('确认轮换'));
+    await tester.pumpAndSettle();
+    expect(api.credentialIssueCalls, 1);
+    expect(api.lastCredentialOperation, 'rotate');
+
+    // 口令一次性展示 + 未重载的真实状态提示
+    expect(find.text('rotated-one-time-password'), findsOneWidget);
+    expect(find.byKey(const Key('credential-reload-failed')), findsOneWidget);
+    expect(
+      find.textContaining('已写入新凭证，但 Broker 未重载，旧凭证可能仍然有效'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(const Key('one-time-credential-ack')));
+    await tester.pumpAndSettle();
+    expect(find.text('rotated-one-time-password'), findsNothing);
+    expect(find.text('已签发'), findsOneWidget);
+  });
+
+  testWidgets('operator 可签发但不可轮换/吊销，界面给出原因', (tester) async {
+    final activeDevice = _device.copyWith(
+      mqttCredentialVersion: 1,
+      mqttCredentialStatus: 'active',
+      mqttCredentialIssuedAt: DateTime.utc(2026, 11, 4, 8),
+      mqttCredentialRotatedAt: DateTime.utc(2026, 11, 4, 8),
+    );
+    final api = _FakeApiClient(devices: [activeDevice]);
+    const operatorSession = AuthSession(
+      token: 'jwt-operator',
+      username: 'operator',
+      role: 'operator',
+    );
+    await _pumpBoard(tester, api: api, session: operatorSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-credential-section')),
+    );
+
+    expect(find.text('轮换/吊销仅管理员可执行'), findsOneWidget);
+    final rotate = tester.widget<FilledButton>(
+      find.byKey(const Key('credential-rotate-button')),
+    );
+    expect(rotate.onPressed, isNull);
+    final revoke = tester.widget<TextButton>(
+      find.byKey(const Key('credential-revoke-button')),
+    );
+    expect(revoke.onPressed, isNull);
+    expect(api.credentialIssueCalls, 0);
+  });
+
+  testWidgets('admin 吊销凭证：确认后状态变为已吊销', (tester) async {
+    final activeDevice = _device.copyWith(
+      mqttCredentialVersion: 1,
+      mqttCredentialStatus: 'active',
+      mqttCredentialIssuedAt: DateTime.utc(2026, 11, 4, 8),
+      mqttCredentialRotatedAt: DateTime.utc(2026, 11, 4, 8),
+    );
+    final api = _FakeApiClient(devices: [activeDevice]);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-credential-section')),
+    );
+
+    await tester.tap(find.byKey(const Key('credential-revoke-button')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('确认吊销设备 dev-0001'), findsOneWidget);
+    await tester.tap(find.text('确认吊销'));
+    await tester.pumpAndSettle();
+
+    expect(api.credentialRevokeCalls, 1);
+    expect(find.text('已吊销'), findsOneWidget);
+    expect(find.byKey(const Key('credential-revoked-tip')), findsOneWidget);
   });
 }
 

@@ -85,6 +85,8 @@ export interface UserUpdateBody {
 export type DeviceStatus = 'online' | 'offline'
 
 /** 设备表（REST snake_case） */
+export type MqttCredentialStatus = 'missing' | 'active' | 'revoked'
+
 export interface Device {
   device_id: string
   name: string
@@ -94,6 +96,37 @@ export interface Device {
   status: DeviceStatus
   last_report_at: string | null
   last_online_at: string | null
+  /** 凭证元数据：只含状态与短前缀，不含口令或完整指纹 */
+  mqtt_username?: string | null
+  mqtt_credential_version?: number
+  mqtt_credential_issued_at?: string | null
+  mqtt_credential_rotated_at?: string | null
+  mqtt_credential_revoked_at?: string | null
+  mqtt_credential_status?: MqttCredentialStatus
+  mqtt_credential_fingerprint_prefix?: string | null
+}
+
+/** 签发/轮换结果：password 只出现这一次 */
+export interface MqttCredentialResult {
+  device_id: string
+  username: string
+  password: string
+  version: number
+  issued_at: string
+  rotated_at: string
+  operation: 'issue' | 'rotate'
+  reloaded: boolean
+  reload_detail: string
+}
+
+/** 吊销结果：不含口令与完整指纹 */
+export interface MqttCredentialRevokeResult {
+  device_id: string
+  username: string
+  version: number
+  revoked_at: string
+  reloaded: boolean
+  reload_detail: string
 }
 
 /** 传感器时序记录（REST snake_case） */

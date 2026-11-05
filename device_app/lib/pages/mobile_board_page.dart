@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 
 import '../config/api_config.dart';
 import '../models/command_request.dart';
@@ -1766,6 +1767,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         baseUrl: _baseUrl,
         token: session.token,
         canWrite: _canWrite,
+        isAdmin: session.role == 'admin',
         apiClientFactory: _createApiClient,
         reportStream: _reportStream.stream,
         onIssueCommand: () => _openCommandDialog(device),
@@ -1782,6 +1784,7 @@ class _DeviceDetailSheet extends StatefulWidget {
     required this.baseUrl,
     required this.token,
     required this.canWrite,
+    required this.isAdmin,
     required this.apiClientFactory,
     required this.reportStream,
     required this.onIssueCommand,
@@ -1795,6 +1798,9 @@ class _DeviceDetailSheet extends StatefulWidget {
 
   /// 当前会话是否可写（viewer 或服务端 403 后为 false）。
   final bool canWrite;
+
+  /// 轮换/吊销会导致设备掉线，仅 admin 可执行（首次签发 operator 可用）。
+  final bool isAdmin;
 
   /// 与页面共用同一 REST 客户端工厂，测试可注入 fake。
   final BoardApiClientFactory apiClientFactory;
@@ -1818,9 +1824,13 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
   List<SensorReading> _records = const <SensorReading>[];
   bool _loading = true;
   bool _issuing = false;
+  bool _credentialBusy = false;
   bool _loadingMore = false;
   bool _hasMore = false;
   String? _error;
+
+  /// 凭证操作后会重新拉取该设备，保证版本/时间/指纹前缀与服务端一致。
+  late DeviceSummary _device = widget.device;
 
   /// 已从网关取回的条数（不含实时插入），作为下一页 offset；
   /// 实时插入会加长列表，但不能让服务端游标跟着漂移。
@@ -1874,6 +1884,247 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     if (result != null) {
       await _loadDetail();
     }
+  }
+
+  String get _credentialStatusLabel {
+    switch (_device.mqttCredentialStatus) {
+      case 'active':
+        return '已签发';
+      case 'revoked':
+        return '已吊销';
+      default:
+        return '未签发';
+    }
+  }
+
+  String _credentialImpactText(bool rotation) {
+    if (!rotation) {
+      return '确认为设备 ${_device.deviceId} 签发 MQTT 凭证？\n\n'
+          '签发后设备即可使用该用户名/口令接入 Broker；新口令只显示一次。';
+    }
+    return '确认轮换设备 ${_device.deviceId} 的 MQTT 凭证？\n\n'
+        '影响：\n'
+        '1. 旧凭证对新连接立即失效；已建立的连接可能维持到下次断线重连，设备在重连前可能仍显示在线；\n'
+        '2. 设备必须更新配置中的口令后才能重连，未更新前一旦断线将持续离线；\n'
+        '3. 若 Broker 重载失败，新口令已写入但旧凭证可能仍然有效，需按提示人工重载。\n\n'
+        '新口令只显示一次，服务端只保存指纹，关闭后无法再查询。';
+  }
+
+  void _showCredentialMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// 签发或轮换：二次确认 → 调网关 → 一次性口令弹窗 → 刷新设备凭证状态。
+  Future<void> _handleIssueOrRotateCredential() async {
+    if (_credentialBusy || !widget.canWrite) {
+      return;
+    }
+    final rotation = _device.mqttCredentialStatus == 'active';
+    if (rotation && !widget.isAdmin) {
+      _showCredentialMessage('轮换已有凭证会导致设备掉线，仅管理员可执行');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(rotation ? '轮换设备凭证' : '签发设备凭证'),
+        content: SingleChildScrollView(child: Text(_credentialImpactText(rotation))),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(rotation ? '确认轮换' : '确认签发'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    setState(() => _credentialBusy = true);
+    final client = widget.apiClientFactory(widget.baseUrl);
+    DeviceCredentialResult? result;
+    try {
+      result = await client.issueDeviceCredential(
+        token: widget.token,
+        deviceId: _device.deviceId,
+      );
+    } on ApiException catch (error) {
+      _showCredentialMessage(error.message);
+    } finally {
+      if (mounted) {
+        setState(() => _credentialBusy = false);
+      }
+    }
+    if (result == null || !mounted) {
+      return;
+    }
+
+    await _refreshCredential();
+    if (!mounted) {
+      return;
+    }
+    await _showOneTimePassword(result);
+  }
+
+  /// 吊销凭证（仅 admin）：吊销后设备必须重新签发才能接入。
+  Future<void> _handleRevokeCredential() async {
+    if (_credentialBusy || !widget.isAdmin) {
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('吊销设备凭证'),
+        content: Text(
+          '确认吊销设备 ${_device.deviceId} 的 MQTT 凭证？\n\n'
+          '吊销后 Broker 账号被删除，设备立即无法接入，直到重新签发凭证；\n'
+          '若 Broker 重载失败，旧凭证可能仍然有效，需按提示人工重载。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('确认吊销'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    setState(() => _credentialBusy = true);
+    final client = widget.apiClientFactory(widget.baseUrl);
+    try {
+      final result = await client.revokeDeviceCredential(
+        token: widget.token,
+        deviceId: _device.deviceId,
+      );
+      _showCredentialMessage(
+        result.reloaded
+            ? '凭证已吊销，Broker 已重载'
+            : '凭证已吊销，但 Broker 未重载，旧凭证可能仍然有效：${result.reloadDetail}',
+      );
+      await _refreshCredential();
+    } on ApiException catch (error) {
+      _showCredentialMessage(error.message);
+    } finally {
+      if (mounted) {
+        setState(() => _credentialBusy = false);
+      }
+    }
+  }
+
+  /// 重新拉取该设备：不信任本地推断的版本/吊销状态。
+  Future<void> _refreshCredential() async {
+    final client = widget.apiClientFactory(widget.baseUrl);
+    try {
+      final page = await client.fetchDevices(
+        token: widget.token,
+        keyword: _device.deviceId,
+        pageSize: 10,
+      );
+      final match = page.items
+          .where((item) => item.deviceId == _device.deviceId)
+          .cast<DeviceSummary?>()
+          .firstWhere((item) => item != null, orElse: () => null);
+      if (match != null && mounted) {
+        setState(() => _device = match);
+      }
+    } on ApiException catch (error) {
+      _showCredentialMessage('凭证状态刷新失败：${error.message}');
+    }
+  }
+
+  /// 一次性口令弹窗：不可点遮罩/返回关闭，只能点「我已保存」；
+  /// 口令只存在于本次弹窗的局部变量，关闭后无法从界面再次读取。
+  Future<void> _showOneTimePassword(DeviceCredentialResult result) async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('请立即保存新凭证口令'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '口令只显示这一次：服务端只保存 SHA-256 指纹，关闭后无法再次查询，'
+                  '如需新口令只能重新轮换。',
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+                const SizedBox(height: 10),
+                SelectableText(
+                  result.password,
+                  key: const Key('one-time-credential-password'),
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        await Clipboard.setData(
+                          ClipboardData(text: result.password),
+                        );
+                        _showCredentialMessage('口令已复制到剪贴板');
+                      },
+                      icon: const Icon(Icons.copy, size: 16),
+                      label: const Text('复制口令'),
+                    ),
+                  ],
+                ),
+                if (!result.reloaded) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    key: const Key('credential-reload-failed'),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF3CD),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      '已写入新凭证，但 Broker 未重载，旧凭证可能仍然有效。\n'
+                      '补救：在 Broker 主机执行重载（systemctl reload mosquitto '
+                      '或 docker compose restart mqtt），确认成功后再让设备改用新口令。\n'
+                      '重载详情：${result.reloadDetail}',
+                      style: const TextStyle(fontSize: 12, color: Color(0xFF8A6D3B)),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            FilledButton(
+              key: const Key('one-time-credential-ack'),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('我已保存，关闭'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// 首屏：指令回执 + 第一页历史上报。
@@ -2008,6 +2259,143 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     return List<SensorReading>.unmodifiable(sorted);
   }
 
+  Widget _credentialRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 72,
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 12, color: Colors.black45),
+          ),
+        ),
+        Expanded(
+          child: Text(value, style: const TextStyle(fontSize: 12)),
+        ),
+      ],
+    ),
+  );
+
+  /// 凭证状态区：只展示元数据与短前缀，绝不渲染口令或完整指纹。
+  Widget _buildCredentialSection() {
+    final status = _device.mqttCredentialStatus;
+    final issued = status != 'missing';
+    final revoked = status == 'revoked';
+    final active = status == 'active';
+    final statusColor = active
+        ? Colors.green
+        : revoked
+        ? Colors.red
+        : Colors.grey;
+
+    return Container(
+      key: const Key('device-credential-section'),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text(
+                'MQTT 凭证',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(width: 8),
+              Chip(
+                key: const Key('credential-status-chip'),
+                label: Text(
+                  _credentialStatusLabel,
+                  style: const TextStyle(fontSize: 11, color: Colors.white),
+                ),
+                backgroundColor: statusColor,
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          if (!issued)
+            Text(
+              '该设备尚未签发凭证，无法接入 Broker',
+              key: const Key('credential-unissued-tip'),
+              style: const TextStyle(fontSize: 12, color: Colors.red),
+            ),
+          if (revoked)
+            const Text(
+              '该设备凭证已吊销，当前无法接入 Broker；如需恢复请重新签发。',
+              key: Key('credential-revoked-tip'),
+              style: TextStyle(fontSize: 12, color: Colors.red),
+            ),
+          if (issued) ...[
+            _credentialRow('用户名', _device.mqttUsername ?? _device.deviceId),
+            _credentialRow('版本', '${_device.mqttCredentialVersion}'),
+            _credentialRow('首次签发', _formatTime(_device.mqttCredentialIssuedAt)),
+            _credentialRow('最近轮换', _formatTime(_device.mqttCredentialRotatedAt)),
+            if (revoked)
+              _credentialRow('吊销时间', _formatTime(_device.mqttCredentialRevokedAt)),
+            _credentialRow(
+              '指纹前缀',
+              _device.mqttCredentialFingerprintPrefix == null
+                  ? '—'
+                  : '${_device.mqttCredentialFingerprintPrefix}…',
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '仅展示指纹前 8 位，用于人工对账；服务端不保存口令明文，也不会返回完整指纹。',
+              style: TextStyle(fontSize: 11, color: Colors.black45),
+            ),
+          ],
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              if (!issued)
+                FilledButton(
+                  key: const Key('credential-issue-button'),
+                  onPressed: widget.canWrite && !_credentialBusy
+                      ? _handleIssueOrRotateCredential
+                      : null,
+                  child: Text(revoked ? '重新签发凭证' : '签发凭证'),
+                ),
+              if (active) ...[
+                FilledButton.tonal(
+                  key: const Key('credential-rotate-button'),
+                  onPressed: widget.isAdmin && !_credentialBusy
+                      ? _handleIssueOrRotateCredential
+                      : null,
+                  child: const Text('轮换凭证'),
+                ),
+                TextButton(
+                  key: const Key('credential-revoke-button'),
+                  onPressed: widget.isAdmin && !_credentialBusy
+                      ? _handleRevokeCredential
+                      : null,
+                  child: const Text(
+                    '吊销凭证',
+                    style: TextStyle(color: Colors.red),
+                  ),
+                ),
+                if (!widget.isAdmin)
+                  const Text(
+                    '轮换/吊销仅管理员可执行',
+                    style: TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final reading = widget.reading;
@@ -2063,6 +2451,8 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                   ),
               ],
             ),
+            const SizedBox(height: 12),
+            _buildCredentialSection(),
             const SizedBox(height: 12),
             if (reading == null)
               const Text('暂无上报数据', style: TextStyle(color: Colors.black45))

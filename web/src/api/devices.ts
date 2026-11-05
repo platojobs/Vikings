@@ -14,6 +14,8 @@ import type {
   DeviceListQuery,
   DeviceRecordsQuery,
   DeviceUpdateBody,
+  MqttCredentialResult,
+  MqttCredentialRevokeResult,
   PageResult,
   SensorRecord,
 } from '@/types'
@@ -99,6 +101,25 @@ export function fetchDeviceCommands(
   return request<CommandItem[]>(`/api/devices/${encodeURIComponent(deviceId)}/commands`, {
     params: { limit },
   })
+}
+
+/**
+ * 签发/轮换设备 MQTT 凭证。
+ * 口令只在响应中出现一次；首次签发 operator 可用，覆盖已有有效凭证仅 admin。
+ */
+export function issueDeviceCredential(deviceId: string): Promise<MqttCredentialResult> {
+  return request<MqttCredentialResult>(
+    `/api/devices/${encodeURIComponent(deviceId)}/mqtt-credential`,
+    { method: 'POST' },
+  )
+}
+
+/** 吊销设备 MQTT 凭证（仅 admin），吊销后须重新签发才能接入 Broker。 */
+export function revokeDeviceCredential(deviceId: string): Promise<MqttCredentialRevokeResult> {
+  return request<MqttCredentialRevokeResult>(
+    `/api/devices/${encodeURIComponent(deviceId)}/mqtt-credential`,
+    { method: 'DELETE' },
+  )
 }
 
 /** 下发单条指令（calibrate / reboot / config），OTA 走专用任务接口。 */

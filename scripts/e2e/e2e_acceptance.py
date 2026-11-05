@@ -839,6 +839,76 @@ def verify_mqtt_auth_isolation(ctx: Context) -> str:
     )
 
 
+def verify_credential_rotation_api(ctx: Context) -> str:
+    """真实 Broker 上通过管理端点轮换凭证：旧凭证被拒、新凭证可用，并记录设备状态。"""
+    device_id = f"e2e-cred-{uuid.uuid4().hex[:8]}"
+    initial_password = _create_device_with_credentials(ctx, device_id, "凭证轮换验收设备")
+    first_probe = _open_device_probe(ctx, device_id, initial_password)
+    try:
+        before = _wait_device_status(ctx, device_id, "online", 8)
+
+        rotation = api(ctx, "POST", f"/api/devices/{device_id}/mqtt-credential")
+        if not rotation.get("reloaded"):
+            raise RuntimeError(
+                f"轮换后 Broker 未重载：{rotation.get('reload_detail')}"
+            )
+        if rotation.get("operation") != "rotate":
+            raise RuntimeError(f"凭证操作类型不正确：{rotation.get('operation')}")
+        new_password = str(rotation.get("password") or "")
+        if not new_password or new_password == initial_password:
+            raise RuntimeError("轮换响应未返回新口令")
+
+        # 不弱化既有断言：旧凭证必须被真实 Broker 拒绝，新凭证必须能连上
+        old_rc = _connect_rc(device_id, initial_password, "tcp")
+        new_rc = _connect_rc(device_id, new_password, "tcp")
+        if old_rc == 0:
+            raise RuntimeError(f"轮换后旧凭证仍可连接，CONNACK rc={old_rc}")
+        if new_rc != 0:
+            raise RuntimeError(f"轮换后新凭证连接失败，CONNACK rc={new_rc}")
+        # 已建立的旧会话不会因密码文件重载被强制断开（这是 Broker 的真实语义），
+        # 因此这里记录「轮换前 online → 旧会话关闭 → 新凭证重新上线」。
+        first_probe.close()
+        second_probe = _open_device_probe(ctx, device_id, new_password)
+        after = _wait_device_status(ctx, device_id, "online", 8)
+
+        detail = api(ctx, "GET", f"/api/devices/{device_id}")
+        if "password" in detail:
+            raise RuntimeError("设备详情泄露了凭证口令")
+        prefix = detail.get("mqtt_credential_fingerprint_prefix")
+        if not prefix or len(prefix) != 8:
+            raise RuntimeError(f"设备详情未返回 8 位指纹前缀：{prefix}")
+        if detail.get("mqtt_credential_status") != "active":
+            raise RuntimeError(f"轮换后凭证状态不正确：{detail.get('mqtt_credential_status')}")
+
+        audit = api(
+            ctx,
+            "GET",
+            "/api/audit-logs",
+            params={"action": "device.credential_issue", "page": 1, "pageSize": 50},
+        )
+        rows = [
+            row for row in (audit.get("items") or [])
+            if row.get("target_id") == device_id
+            and (row.get("detail") or {}).get("operation") == "rotate"
+        ]
+        if not rows:
+            raise RuntimeError(f"审计日志缺少 {device_id} 的轮换记录")
+        rotation_detail = rows[0].get("detail") or {}
+        if rotation_detail.get("result") != "reload_ok" or not rotation_detail.get("reloaded"):
+            raise RuntimeError(f"轮换审计未记录重载结果：{rows[0]}")
+        if new_password in json.dumps(rows, ensure_ascii=False):
+            raise RuntimeError("审计日志泄露了凭证口令")
+        second_probe.close()
+        api(ctx, "DELETE", f"/api/devices/{device_id}")
+        return (
+            f"轮换前设备 {before.get('status')}；旧凭证 rc={old_rc} 被拒、"
+            f"新凭证 rc={new_rc} 可用；轮换后设备 {after.get('status')}；"
+            f"详情仅暴露指纹前缀 {prefix}…，审计 result={rotation_detail.get('result')}"
+        )
+    finally:
+        first_probe.close()
+
+
 def start_simulator(ctx: Context) -> str:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / "simulator.log"
@@ -2237,6 +2307,7 @@ def main() -> int:
         )
         rep.run("ws_connected", lambda: connect_ws(ctx))
         rep.run("mqtt_auth_isolation", lambda: verify_mqtt_auth_isolation(ctx))
+        rep.run("credential_rotation_api", lambda: verify_credential_rotation_api(ctx))
         rep.run("simulator", lambda: start_simulator(ctx))
         rep.run("realtime_report", lambda: verify_realtime_report(ctx))
         # 先查 REST 快照：此时设备仍在线，可同时验证设备与最新值

@@ -14,11 +14,23 @@ import {
   fetchDeviceGroups,
   fetchDeviceRecords,
   fetchDevices,
+  issueDeviceCredential,
+  revokeDeviceCredential,
   sendCommand,
   updateDevice,
 } from '@/api/devices'
 import { formatDateTime, formatMetric } from '@/utils/format'
 import { commandStateLabel, commandStateTagType } from '@/utils/labels'
+import {
+  CREDENTIAL_FINGERPRINT_NOTE,
+  ONE_TIME_PASSWORD_NOTICE,
+  UNISSUED_CREDENTIAL_NOTICE,
+  buildIssueImpactText,
+  buildRotationImpactText,
+  credentialStatusLabel,
+  credentialStatusTagType,
+  useOneTimeCredential,
+} from '@/utils/credential'
 import DeviceStatusTag from '@/components/DeviceStatusTag.vue'
 import SensorChart from '@/components/SensorChart.vue'
 import { subscribe } from '@/services/mqtt'
@@ -331,6 +343,124 @@ async function openDevice(row: Device): Promise<void> {
   }
 }
 
+// ==================== MQTT 凭证 ====================
+
+const credentialSubmitting = ref(false)
+const oneTimeCredential = useOneTimeCredential()
+const oneTimeOperation = ref<'issue' | 'rotate'>('issue')
+const credentialReloadFailed = ref(false)
+const credentialReloadDetail = ref('')
+
+const credentialStatus = computed(() => {
+  if (!detail.value) return 'missing' as const
+  return (
+    detail.value.mqtt_credential_status ??
+    (detail.value.mqtt_credential_issued_at ? 'active' : 'missing')
+  )
+})
+
+const credentialStatusText = computed(() => credentialStatusLabel(credentialStatus.value))
+const credentialStatusTag = computed(() => credentialStatusTagType(credentialStatus.value))
+
+async function refreshDetail(): Promise<void> {
+  if (!detail.value) return
+  detail.value = await fetchDeviceDetail(detail.value.device_id)
+}
+
+async function handleIssueOrRotateCredential(): Promise<void> {
+  if (!detail.value) return
+  const deviceId = detail.value.device_id
+  const isRotation = credentialStatus.value === 'active'
+
+  try {
+    await ElMessageBox.confirm(
+      isRotation ? buildRotationImpactText(deviceId) : buildIssueImpactText(deviceId),
+      isRotation ? '轮换设备凭证' : '签发设备凭证',
+      {
+        type: 'warning',
+        confirmButtonText: isRotation ? '确认轮换' : '确认签发',
+        cancelButtonText: '取消',
+        distinguishCancelAndClose: true,
+        customClass: 'credential-confirm',
+      },
+    )
+  } catch {
+    return
+  }
+
+  credentialSubmitting.value = true
+  try {
+    const result = await issueDeviceCredential(deviceId)
+    oneTimeCredential.show(result.password)
+    oneTimeOperation.value = result.operation
+    credentialReloadFailed.value = !result.reloaded
+    credentialReloadDetail.value = result.reload_detail
+    ElMessage.success(isRotation ? '新凭证已写入' : '凭证已签发')
+    await refreshDetail()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    credentialSubmitting.value = false
+  }
+}
+
+async function handleRevokeCredential(): Promise<void> {
+  if (!detail.value) return
+  const deviceId = detail.value.device_id
+  try {
+    await ElMessageBox.confirm(
+      [
+        `确认吊销设备 ${deviceId} 的 MQTT 凭证？`,
+        '',
+        '吊销后 Broker 账号被删除，设备立即无法接入，直到重新签发凭证；',
+        '若 Broker 重载失败，旧凭证可能仍然有效，需按提示人工重载。',
+      ].join('\n'),
+      '吊销设备凭证',
+      {
+        type: 'warning',
+        confirmButtonText: '确认吊销',
+        cancelButtonText: '取消',
+        distinguishCancelAndClose: true,
+      },
+    )
+  } catch {
+    return
+  }
+
+  credentialSubmitting.value = true
+  try {
+    const result = await revokeDeviceCredential(deviceId)
+    if (result.reloaded) {
+      ElMessage.success('凭证已吊销，Broker 已重载')
+    } else {
+      ElMessage.warning(
+        `凭证已标记吊销，但 Broker 未重载，旧凭证可能仍然有效：${result.reload_detail}`,
+      )
+    }
+    await refreshDetail()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    credentialSubmitting.value = false
+  }
+}
+
+async function copyOneTimePassword(): Promise<void> {
+  try {
+    if (!oneTimeCredential.password.value) return
+    await navigator.clipboard.writeText(oneTimeCredential.password.value)
+    ElMessage.success('口令已复制到剪贴板')
+  } catch {
+    ElMessage.warning('浏览器拒绝了剪贴板访问，请手动选中口令复制')
+  }
+}
+
+/** 明确确认已保存后才允许关闭：关闭即清空内存中的口令 */
+function acknowledgeOneTimePassword(): void {
+  oneTimeCredential.acknowledge()
+  ElMessage.success('已关闭一次性口令窗口；如需再次查看只能重新轮换')
+}
+
 // ==================== 指令下发面板 ====================
 
 const commandType = ref<CommandType>('config')
@@ -631,6 +761,94 @@ onUnmounted(() => {
           </el-descriptions-item>
         </el-descriptions>
 
+        <section v-if="detail" class="drawer-section credential-section" data-test="device-credential">
+          <div class="section-header">
+            <h3>MQTT 凭证</h3>
+            <span class="section-hint">设备接入 Broker 的用户名与口令状态</span>
+          </div>
+
+          <el-alert
+            v-if="credentialStatus === 'missing'"
+            :title="UNISSUED_CREDENTIAL_NOTICE"
+            description="请点击下方「签发凭证」生成用户名/口令；签发后口令只显示一次。"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="credential-alert"
+          />
+          <el-alert
+            v-else-if="credentialStatus === 'revoked'"
+            title="该设备凭证已吊销，当前无法接入 Broker"
+            description="如需恢复接入，请重新签发凭证并更新设备配置。"
+            type="error"
+            :closable="false"
+            show-icon
+            class="credential-alert"
+          />
+
+          <el-descriptions :column="2" border class="credential-desc">
+            <el-descriptions-item label="凭证状态">
+              <el-tag :type="credentialStatusTag" size="small">{{ credentialStatusText }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="MQTT 用户名">
+              {{ detail.mqtt_username || detail.device_id }}
+            </el-descriptions-item>
+            <el-descriptions-item label="凭证版本">
+              {{ detail.mqtt_credential_version || 0 }}
+            </el-descriptions-item>
+            <el-descriptions-item label="指纹前缀">
+              <code v-if="detail.mqtt_credential_fingerprint_prefix">
+                {{ detail.mqtt_credential_fingerprint_prefix }}…
+              </code>
+              <span v-else>—</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="首次签发">
+              {{ formatDateTime(detail.mqtt_credential_issued_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="最近轮换">
+              {{ formatDateTime(detail.mqtt_credential_rotated_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="吊销时间">
+              {{ formatDateTime(detail.mqtt_credential_revoked_at) }}
+            </el-descriptions-item>
+          </el-descriptions>
+          <p class="section-hint credential-fingerprint-note">{{ CREDENTIAL_FINGERPRINT_NOTE }}</p>
+
+          <div class="credential-actions">
+            <el-button
+              v-if="credentialStatus !== 'active'"
+              type="primary"
+              :loading="credentialSubmitting"
+              :disabled="!canWrite"
+              @click="handleIssueOrRotateCredential"
+            >
+              {{ credentialStatus === 'revoked' ? '重新签发凭证' : '签发凭证' }}
+            </el-button>
+            <template v-else>
+              <el-button
+                type="warning"
+                :loading="credentialSubmitting"
+                :disabled="!isAdminOnly"
+                @click="handleIssueOrRotateCredential"
+              >
+                轮换凭证
+              </el-button>
+              <el-button
+                type="danger"
+                plain
+                :loading="credentialSubmitting"
+                :disabled="!isAdminOnly"
+                @click="handleRevokeCredential"
+              >
+                吊销凭证
+              </el-button>
+              <span v-if="!isAdminOnly" class="section-hint">
+                轮换/吊销会导致设备掉线，仅管理员可执行；operator 仅可首次签发
+              </span>
+            </template>
+          </div>
+        </section>
+
         <section class="drawer-section">
           <div class="section-header">
             <h3>下发指令</h3>
@@ -846,6 +1064,50 @@ onUnmounted(() => {
         <el-button type="primary" :loading="bulkSaving" @click="handleBulkImport">开始导入</el-button>
       </template>
     </el-dialog>
+
+    <!--
+      一次性口令：禁用遮罩点击、ESC 与右上角关闭，只能通过「我已保存」关闭；
+      关闭即清空内存，服务端只存指纹，无法再次查询。
+    -->
+    <el-dialog
+      :model-value="oneTimeCredential.visible.value"
+      title="请立即保存新凭证口令"
+      width="560px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :show-close="false"
+    >
+      <el-alert
+        :title="ONE_TIME_PASSWORD_NOTICE"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+      <div class="one-time-password" data-test="one-time-password">
+        <span class="password-label">
+          MQTT 口令（{{ oneTimeOperation === 'rotate' ? '轮换后' : '签发' }}）
+        </span>
+        <code class="password-value">{{ oneTimeCredential.password.value }}</code>
+      </div>
+      <div class="credential-actions">
+        <el-button type="primary" plain @click="copyOneTimePassword">复制口令</el-button>
+        <span class="section-hint">请先粘贴到设备配置或密钥管理系统，再点击「我已保存」</span>
+      </div>
+
+      <el-alert
+        v-if="credentialReloadFailed"
+        title="已写入新凭证，但 Broker 未重载，旧凭证可能仍然有效"
+        :description="`${credentialReloadDetail}。补救：登录 Broker 主机执行重载（systemctl reload mosquitto，或 docker compose restart mqtt），确认成功后设备会改用新口令重连。`"
+        type="error"
+        :closable="false"
+        show-icon
+        class="credential-alert"
+      />
+
+      <template #footer>
+        <el-button type="primary" @click="acknowledgeOneTimePassword">我已保存，关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -947,6 +1209,48 @@ onUnmounted(() => {
 
 .readonly-tip {
   margin-bottom: 12px;
+}
+
+.credential-alert {
+  margin-bottom: 12px;
+}
+
+.credential-desc {
+  margin-bottom: 8px;
+}
+
+.credential-fingerprint-note {
+  margin: 0 0 12px;
+}
+
+.credential-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.one-time-password {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid #fcd34d;
+  border-radius: 6px;
+  background: #fffbeb;
+}
+
+.password-label {
+  font-size: 12px;
+  color: #92400e;
+}
+
+.password-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  word-break: break-all;
+  user-select: all;
 }
 
 .cmd-form {

@@ -109,6 +109,13 @@ class DeviceSummary {
     this.lastReportAt,
     this.lastOnlineAt,
     this.openAlertCount = 0,
+    this.mqttUsername,
+    this.mqttCredentialVersion = 0,
+    this.mqttCredentialIssuedAt,
+    this.mqttCredentialRotatedAt,
+    this.mqttCredentialRevokedAt,
+    this.mqttCredentialStatus = 'missing',
+    this.mqttCredentialFingerprintPrefix,
   });
 
   final String deviceId;
@@ -125,20 +132,51 @@ class DeviceSummary {
   /// 该设备未处理告警数（服务端聚合，`withAlertCount=true` 时返回）。
   final int openAlertCount;
 
-  bool get online => status == 'online';
+  /// MQTT 凭证元数据：服务端只返回状态与指纹短前缀，绝不返回口令/完整指纹。
+  final String? mqttUsername;
+  final int mqttCredentialVersion;
+  final DateTime? mqttCredentialIssuedAt;
+  final DateTime? mqttCredentialRotatedAt;
+  final DateTime? mqttCredentialRevokedAt;
 
-  DeviceSummary copyWith({int? openAlertCount, String? groupName}) =>
-      DeviceSummary(
-        deviceId: deviceId,
-        name: name,
-        model: model,
-        firmwareVersion: firmwareVersion,
-        groupName: groupName ?? this.groupName,
-        status: status,
-        lastReportAt: lastReportAt,
-        lastOnlineAt: lastOnlineAt,
-        openAlertCount: openAlertCount ?? this.openAlertCount,
-      );
+  /// missing / active / revoked
+  final String mqttCredentialStatus;
+  final String? mqttCredentialFingerprintPrefix;
+
+  bool get online => status == 'online';
+  bool get credentialIssued => mqttCredentialStatus != 'missing';
+  bool get credentialRevoked => mqttCredentialStatus == 'revoked';
+
+  DeviceSummary copyWith({
+    int? openAlertCount,
+    String? groupName,
+    int? mqttCredentialVersion,
+    DateTime? mqttCredentialIssuedAt,
+    DateTime? mqttCredentialRotatedAt,
+    DateTime? mqttCredentialRevokedAt,
+    String? mqttCredentialStatus,
+    String? mqttCredentialFingerprintPrefix,
+  }) => DeviceSummary(
+    deviceId: deviceId,
+    name: name,
+    model: model,
+    firmwareVersion: firmwareVersion,
+    groupName: groupName ?? this.groupName,
+    status: status,
+    lastReportAt: lastReportAt,
+    lastOnlineAt: lastOnlineAt,
+    openAlertCount: openAlertCount ?? this.openAlertCount,
+    mqttUsername: mqttUsername,
+    mqttCredentialVersion: mqttCredentialVersion ?? this.mqttCredentialVersion,
+    mqttCredentialIssuedAt: mqttCredentialIssuedAt ?? this.mqttCredentialIssuedAt,
+    mqttCredentialRotatedAt:
+        mqttCredentialRotatedAt ?? this.mqttCredentialRotatedAt,
+    mqttCredentialRevokedAt:
+        mqttCredentialRevokedAt ?? this.mqttCredentialRevokedAt,
+    mqttCredentialStatus: mqttCredentialStatus ?? this.mqttCredentialStatus,
+    mqttCredentialFingerprintPrefix:
+        mqttCredentialFingerprintPrefix ?? this.mqttCredentialFingerprintPrefix,
+  );
 
   factory DeviceSummary.fromJson(Map<String, dynamic> json) => DeviceSummary(
     deviceId: _asString(json['device_id']),
@@ -150,7 +188,83 @@ class DeviceSummary {
     lastReportAt: _asTime(json['last_report_at']),
     lastOnlineAt: _asTime(json['last_online_at']),
     openAlertCount: _asInt(json['open_alert_count']),
+    mqttUsername: json['mqtt_username']?.toString(),
+    mqttCredentialVersion: _asInt(json['mqtt_credential_version']),
+    mqttCredentialIssuedAt: _asTime(json['mqtt_credential_issued_at']),
+    mqttCredentialRotatedAt: _asTime(json['mqtt_credential_rotated_at']),
+    mqttCredentialRevokedAt: _asTime(json['mqtt_credential_revoked_at']),
+    mqttCredentialStatus: _asString(json['mqtt_credential_status'], 'missing'),
+    mqttCredentialFingerprintPrefix:
+        json['mqtt_credential_fingerprint_prefix']?.toString(),
   );
+}
+
+/// `POST /api/devices/{id}/mqtt-credential`：口令只在本次响应出现一次。
+class DeviceCredentialResult {
+  const DeviceCredentialResult({
+    required this.deviceId,
+    required this.username,
+    required this.password,
+    required this.version,
+    required this.operation,
+    required this.reloaded,
+    required this.reloadDetail,
+    required this.rotatedAt,
+  });
+
+  final String deviceId;
+  final String username;
+  final String password;
+
+  /// issue（首次签发）/ rotate（覆盖已有有效凭证）
+  final String operation;
+  final int version;
+  final bool reloaded;
+  final String reloadDetail;
+  final DateTime? rotatedAt;
+
+  bool get isRotation => operation == 'rotate';
+
+  factory DeviceCredentialResult.fromJson(Map<String, dynamic> json) =>
+      DeviceCredentialResult(
+        deviceId: _asString(json['device_id']),
+        username: _asString(json['username']),
+        password: _asString(json['password']),
+        version: _asInt(json['version']),
+        operation: _asString(json['operation'], 'issue'),
+        reloaded: json['reloaded'] == true,
+        reloadDetail: _asString(json['reload_detail']),
+        rotatedAt: _asTime(json['rotated_at']),
+      );
+}
+
+/// `DELETE /api/devices/{id}/mqtt-credential`：吊销结果不含口令与完整指纹。
+class DeviceCredentialRevokeResult {
+  const DeviceCredentialRevokeResult({
+    required this.deviceId,
+    required this.username,
+    required this.version,
+    required this.revokedAt,
+    required this.reloaded,
+    required this.reloadDetail,
+  });
+
+  final String deviceId;
+  final String username;
+  final int version;
+  final DateTime? revokedAt;
+  final bool reloaded;
+  final String reloadDetail;
+
+  factory DeviceCredentialRevokeResult.fromJson(Map<String, dynamic> json) =>
+      DeviceCredentialRevokeResult(
+        deviceId: _asString(json['device_id']),
+        username: _asString(json['username']),
+        version: _asInt(json['version']),
+        revokedAt: _asTime(json['revoked_at']),
+        reloaded: json['reloaded'] == true,
+        reloadDetail: _asString(json['reload_detail']),
+      );
 }
 
 /// `GET /api/devices` 的分页结果：`data.items` + `total/page/page_size`。

@@ -145,11 +145,16 @@ class DeviceOut(BaseModel):
     last_online_at: Optional[datetime] = None
     # 仅 when withAlertCount=true 时填充；默认 None 保持既有返回结构不变
     open_alert_count: Optional[int] = None
-    # 凭证元数据（不包含口令）：供运维查看签发/轮换状态
+    # 凭证元数据（不包含口令与完整指纹）：供运维查看签发/轮换状态
     mqtt_username: Optional[str] = None
     mqtt_credential_version: int = 0
     mqtt_credential_issued_at: Optional[datetime] = None
     mqtt_credential_rotated_at: Optional[datetime] = None
+    mqtt_credential_revoked_at: Optional[datetime] = None
+    # missing / active / revoked；由 Device 属性计算，不落库
+    mqtt_credential_status: str = "missing"
+    # 指纹短前缀（8 位），只用于人工对账，不回传完整指纹
+    mqtt_credential_fingerprint_prefix: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -163,6 +168,19 @@ class MqttCredentialOut(BaseModel):
     version: int
     issued_at: datetime
     rotated_at: datetime
+    # issue（首次签发）/ rotate（覆盖已有有效凭证）
+    operation: str
+    reloaded: bool
+    reload_detail: str
+
+
+class MqttCredentialRevokeOut(BaseModel):
+    """设备凭证吊销结果：不含口令，也不含完整指纹。"""
+
+    device_id: str
+    username: str
+    version: int
+    revoked_at: datetime
     reloaded: bool
     reload_detail: str
 

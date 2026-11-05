@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0004_refresh_tokens"
+HEAD = "0005_device_credential_revoked_at"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
@@ -65,6 +65,11 @@ def _table_names(db_path: Path) -> set[str]:
 def _alert_columns(db_path: Path) -> set[str]:
     with sqlite3.connect(db_path) as con:
         return {row[1] for row in con.execute("PRAGMA table_info(device_alert)")}
+
+
+def _device_columns(db_path: Path) -> set[str]:
+    with sqlite3.connect(db_path) as con:
+        return {row[1] for row in con.execute("PRAGMA table_info(device)")}
 
 
 def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
@@ -164,14 +169,18 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
 
     down = _run_alembic(db_path, "downgrade", "-1")
     assert down.returncode == 0, down.stderr
-    assert _alembic_version(db_path) == "0003_alert_ack_metadata"
-    assert "refresh_token" not in _table_names(db_path), "downgrade 必须移除刷新令牌表"
+    assert _alembic_version(db_path) == "0004_refresh_tokens"
+    assert "mqtt_credential_revoked_at" not in _device_columns(db_path), (
+        "downgrade -1 必须移除凭证吊销列"
+    )
+    assert "refresh_token" in _table_names(db_path), "downgrade -1 不得影响刷新令牌表"
     assert ACK_COLUMNS <= _alert_columns(db_path), "downgrade -1 不得影响告警处置列"
 
     up = _run_alembic(db_path, "upgrade", "head")
     assert up.returncode == 0, up.stderr
     assert ACK_COLUMNS <= _alert_columns(db_path)
     assert "refresh_token" in _table_names(db_path)
+    assert "mqtt_credential_revoked_at" in _device_columns(db_path)
     assert _alembic_version(db_path) == HEAD
 
 

@@ -132,6 +132,38 @@ class ApiClient {
     return DevicePage.fromJson(data);
   }
 
+  /// 签发/轮换设备凭证：口令只在本次响应出现一次，调用方必须立即展示并清空。
+  Future<DeviceCredentialResult> issueDeviceCredential({
+    required String token,
+    required String deviceId,
+  }) async {
+    final data = await _send(
+      'POST',
+      '/api/devices/$deviceId/mqtt-credential',
+      token: token,
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '凭证响应缺少 data');
+    }
+    return DeviceCredentialResult.fromJson(data);
+  }
+
+  /// 吊销设备凭证（仅 admin）：吊销后设备须重新签发才能接入 Broker。
+  Future<DeviceCredentialRevokeResult> revokeDeviceCredential({
+    required String token,
+    required String deviceId,
+  }) async {
+    final data = await _send(
+      'DELETE',
+      '/api/devices/$deviceId/mqtt-credential',
+      token: token,
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '吊销响应缺少 data');
+    }
+    return DeviceCredentialRevokeResult.fromJson(data);
+  }
+
   /// 分组概览（每组总数 / 在线 / 离线），用于看板分组筛选。
   Future<List<DeviceGroup>> fetchGroups({required String token}) async {
     final data = await _send('GET', '/api/devices/groups', token: token);
@@ -347,6 +379,8 @@ class ApiClient {
           response = await _client
               .post(uri, headers: headers, body: jsonEncode(body ?? const {}))
               .timeout(timeout);
+        } else if (method == 'DELETE') {
+          response = await _client.delete(uri, headers: headers).timeout(timeout);
         } else {
           response = await _client.get(uri, headers: headers).timeout(timeout);
         }

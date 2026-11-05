@@ -18,6 +18,7 @@ from app.schemas import (
     DeviceOut,
     DeviceUpdateRequest,
     MqttCredentialOut,
+    MqttCredentialRevokeOut,
     PageOut,
     SensorRecordOut,
     to_utc_datetime,
@@ -127,31 +128,50 @@ async def issue_device_mqtt_credential(
 
     - username 恒等于 device_id，设备只能操作 `device/{deviceId}/...` 自己的子树；
     - 口令只在本响应返回一次，Broker 密码文件保存 PBKDF2 哈希，Device 表只存指纹；
-    - 轮换会覆盖旧口令，Broker 重载后旧凭证立即失效（`reloaded` 表示是否已重载）。
+    - 首次签发 operator 即可；覆盖已有有效凭证（轮换）会造成设备掉线，仅 admin 可执行；
+    - 响应 `reloaded=false` 表示已写入新口令但 Broker 未重载，旧凭证可能仍有效。
     """
     device = await device_service.get_device(session, device_id)
     if device is None:
         raise HTTPException(status_code=404, detail=f"设备 {device_id} 不存在")
 
+    has_active_credential = (
+        device.mqtt_credential_issued_at is not None
+        and device.mqtt_credential_revoked_at is None
+    )
+    if has_active_credential and user.get("role") != ROLE_ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail="轮换已有凭证会导致设备立即掉线，仅管理员可执行；首次签发 operator 可用",
+        )
+    operation = "rotate" if has_active_credential else "issue"
+
     try:
         issued = mqtt_credential_service.issue_device_credential(device)
-        await audit_service.log(
-            session,
-            operator=user["sub"],
-            action=audit_service.ACTION_DEVICE_CREDENTIAL,
-            target_type="device",
-            target_id=device_id,
-            detail={
-                "username": issued["username"],
-                "version": issued["version"],
-            },
-        )
+        # 先提交设备元数据，再重载 Broker：否则重载后 Broker 读到的仍是旧口令
         await session.commit()
     except mqtt_credential_service.MqttCredentialError as exc:
         await session.rollback()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     reloaded, reload_detail = mqtt_credential_service.reload_broker()
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_CREDENTIAL,
+        target_type="device",
+        target_id=device_id,
+        detail={
+            "username": issued["username"],
+            "version": issued["version"],
+            "operation": operation,
+            # 审计必须记录结果：reload_ok / reload_failed，而不是只记动作
+            "reloaded": reloaded,
+            "reload_detail": reload_detail,
+            "result": "reload_ok" if reloaded else "reload_failed",
+        },
+    )
+    await session.commit()
     return ApiResponse(
         data=MqttCredentialOut(
             device_id=device_id,
@@ -160,6 +180,66 @@ async def issue_device_mqtt_credential(
             version=int(issued["version"]),
             issued_at=issued["issued_at"],
             rotated_at=issued["rotated_at"],
+            operation=operation,
+            reloaded=reloaded,
+            reload_detail=reload_detail,
+        )
+    )
+
+
+@router.delete(
+    "/devices/{device_id}/mqtt-credential",
+    response_model=ApiResponse[MqttCredentialRevokeOut],
+)
+async def revoke_device_mqtt_credential(
+    device_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_ADMIN)),
+):
+    """吊销设备 MQTT 凭证（仅管理员）：删除 Broker 账号并记录吊销时间。
+
+    - 已吊销或从未签发时返回 409，不重复写审计；
+    - `reloaded=false` 表示 Broker 未重载，旧凭证可能仍能连接；
+    - 吊销后设备必须重新签发凭证才能接入 Broker。
+    """
+    device = await device_service.get_device(session, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail=f"设备 {device_id} 不存在")
+    if device.mqtt_credential_issued_at is None:
+        raise HTTPException(status_code=409, detail="该设备尚未签发凭证，无需吊销")
+    if device.mqtt_credential_revoked_at is not None:
+        raise HTTPException(status_code=409, detail="该设备凭证已处于吊销状态")
+
+    try:
+        revoked = mqtt_credential_service.revoke_device_credential(device)
+        await session.commit()
+    except mqtt_credential_service.MqttCredentialError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    reloaded, reload_detail = mqtt_credential_service.reload_broker()
+    await audit_service.log(
+        session,
+        operator=user["sub"],
+        action=audit_service.ACTION_DEVICE_CREDENTIAL_REVOKE,
+        target_type="device",
+        target_id=device_id,
+        detail={
+            "username": revoked["username"],
+            "version": revoked["version"],
+            "removed": revoked["removed"],
+            "reloaded": reloaded,
+            "reload_detail": reload_detail,
+            "result": "reload_ok" if reloaded else "reload_failed",
+        },
+    )
+    await session.commit()
+    return ApiResponse(
+        data=MqttCredentialRevokeOut(
+            device_id=device_id,
+            username=str(revoked["username"]),
+            version=int(revoked["version"]),
+            revoked_at=revoked["revoked_at"],
             reloaded=reloaded,
             reload_detail=reload_detail,
         )

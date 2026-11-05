@@ -58,10 +58,28 @@ class Device(Base):
     mqtt_credential_rotated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 吊销时间：NULL 表示凭证仍有效；吊销后需重新签发才会恢复接入能力
+    mqtt_credential_revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def mqtt_credential_status(self) -> str:
+        """管理端展示口径：missing（未签发）/ active（有效）/ revoked（已吊销）。"""
+        if self.mqtt_credential_issued_at is None:
+            return "missing"
+        return "revoked" if self.mqtt_credential_revoked_at is not None else "active"
+
+    @property
+    def mqtt_credential_fingerprint_prefix(self) -> Optional[str]:
+        """只暴露指纹短前缀（8 位十六进制），供人工对账，绝不返回完整指纹。"""
+        if not self.mqtt_credential_fingerprint:
+            return None
+        return self.mqtt_credential_fingerprint[:8]
 
 
 class SensorRecord(Base):

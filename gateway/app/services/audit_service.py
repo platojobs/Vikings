@@ -28,6 +28,7 @@ ACTION_DEVICE_UPDATE = "device.update"
 ACTION_DEVICE_DELETE = "device.delete"
 ACTION_DEVICE_BULK = "device.bulk_create"
 ACTION_DEVICE_CREDENTIAL = "device.credential_issue"
+ACTION_DEVICE_CREDENTIAL_REVOKE = "device.credential_revoke"
 
 
 async def log(

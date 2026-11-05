@@ -317,7 +317,8 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 | GET | `/api/devices/groups` | 分组概览：每组 `total` / `online` / `offline` |
 | POST | `/api/devices` | 手工注册设备，入参 `device_id`（3~64 位字母数字 _-）、`name`、`model`、`firmware_version`、`group_name`；重复 ID 返回 409 |
 | POST | `/api/devices/bulk` | 批量注册，单次最多 200 台，返回 `{created, skipped}`，重复 ID 跳过 |
-| POST | `/api/devices/{deviceId}/mqtt-credential` | 签发/轮换设备 MQTT 凭证（operator+admin，v1.17.0） |
+| POST | `/api/devices/{deviceId}/mqtt-credential` | 签发/轮换设备 MQTT 凭证：首次签发 operator+admin，轮换已有有效凭证仅 admin（v1.26.0 收紧） |
+| DELETE | `/api/devices/{deviceId}/mqtt-credential` | 吊销设备凭证（仅 admin，v1.26.0）；已吊销/未签发返回 409 |
 | PATCH | `/api/devices/{deviceId}` | 编辑名称 / 型号 / 固件版本 / 分组；设备 ID 与状态不可改 |
 | DELETE | `/api/devices/{deviceId}` | 删除设备（仅 admin）；存在历史时序数据时返回 409 |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
@@ -340,17 +341,23 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 
 设备条目（`DeviceOut`）字段：`device_id`、`name`、`model`、`firmware_version`、`group_name`、
 `status`、`last_report_at`、`last_online_at`、`open_alert_count`（可选，仅 `withAlertCount=true` 时填充）。
+v1.26.0 起额外返回凭证元数据：`mqtt_username`、`mqtt_credential_version`、
+`mqtt_credential_issued_at`、`mqtt_credential_rotated_at`、`mqtt_credential_revoked_at`、
+`mqtt_credential_status`（`missing` / `active` / `revoked`）、
+`mqtt_credential_fingerprint_prefix`（**仅指纹前 8 位**）。列表与详情一致，均不返回口令或完整指纹。
 
 v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹配 `group_name` 为空串或字面「未分组」的设备；
 `GET /api/devices/groups` 也把空分组名与「未分组」合并为同一个 `未分组` 桶（`total` / `online` / `offline` 累加）。
 不传 `group` 时行为不变；普通组名筛选语义不变。
 
-写操作权限：注册 / 批量注册 / 编辑 / 签发设备凭证为 operator+admin，删除为 admin。
+写操作权限：注册 / 批量注册 / 编辑 / **首次签发**设备凭证为 operator+admin；
+**轮换已有有效凭证**与**吊销凭证**仅 admin（会造成设备断线，v1.26.0 起收紧）；删除为 admin。
 
 **设备 MQTT 凭证（v1.17.0）**：`POST /api/devices/{deviceId}/mqtt-credential`
 
-- 用户名恒等于 `device_id`，凭证与 `deviceId` 强绑定；每次调用都会生成新口令并覆盖旧值，
-  因此同一接口既是**首次签发**也是**轮换**。设备注册后、首次连接 Broker 前必须调用一次。
+- 用户名恒等于 `device_id`，凭证与 `deviceId` 强绑定。设备从未签发或已吊销时调用为
+  **首次签发**（`operation=issue`，operator 可用）；已有有效凭证时调用为**轮换**
+  （`operation=rotate`，仅 admin）。设备注册后、首次连接 Broker 前必须调用一次。
 - 响应中的 `password` **只在本次响应出现一次**，平台不提供再次查看；请立即写入设备的安全存储。
   ```json
   {
@@ -363,19 +370,47 @@ v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹�
       "version": 2,
       "issued_at": "2026-11-05T10:00:00+00:00",
       "rotated_at": "2026-11-05T10:00:00+00:00",
+      "operation": "rotate",
       "reloaded": true,
       "reload_detail": "已向 Mosquitto（pid=12345）发送 SIGHUP"
     }
   }
   ```
 - 存储位置：Broker 的 `password_file` 只保存 PBKDF2-SHA512 hash；`device` 表只保存
-  `mqtt_username`、`mqtt_credential_version`、SHA-256 `fingerprint`、签发/轮换时间，
-  **不保存明文口令**。`DeviceOut` 返回上述元数据，不返回 fingerprint 与口令。
-- `reloaded=false` 表示口令已写入但 Broker 未重载（此时旧口令仍有效），`reload_detail`
-  给出原因；可手工执行 SIGHUP 后重试连接。
-- 写密码文件失败返回 503；设备不存在返回 404；未登录 401、viewer 403。
-- 轮换后旧凭证在 Broker 重载后立即失效；吊销使用
-  `scripts/mqtt_credentials.py revoke --subject device:<deviceId> --reload`。
+  `mqtt_username`、`mqtt_credential_version`、SHA-256 `fingerprint`、签发/轮换/吊销时间，
+  **不保存明文口令**。`DeviceOut` 只返回 8 位指纹前缀，不返回完整 fingerprint 与口令。
+- `reloaded=false` 表示口令/吊销已写入但 Broker 未重载；**旧凭证可能仍然有效**，
+  `reload_detail` 给出原因。接口仍返回 200 与本次口令（否则调用方拿不到已写入的新凭证），
+  但调用方必须按失败处理并在界面明示；补救见 `docs/operations.md`。
+- 注意：Broker 重载密码文件不会强制断开已建立的 MQTT 会话。旧凭证对新连接立即失效，
+  但已连接设备可能维持到下次断线重连，因此轮换后设备可能短暂仍显示在线。
+- 写密码文件失败返回 503；设备不存在返回 404；未登录 401、viewer 403；
+  operator 尝试轮换返回 403。
+- 审计：`device.credential_issue` 记录 `operation`、`version`、`reloaded`、`reload_detail`、
+  `result`（`reload_ok` / `reload_failed`），不只记录动作。
+
+**设备 MQTT 凭证吊销（v1.26.0）**：`DELETE /api/devices/{deviceId}/mqtt-credential`（仅 admin）
+
+- 从 Broker `password_file` 删除该设备账号，并写入 `mqtt_credential_revoked_at`；
+  已吊销或未签发返回 409，设备不存在返回 404。
+- 响应不含口令与完整指纹：
+  ```json
+  {
+    "code": 0,
+    "message": "ok",
+    "data": {
+      "device_id": "dev-0001",
+      "username": "dev-0001",
+      "version": 2,
+      "revoked_at": "2026-11-05T10:05:00+00:00",
+      "reloaded": true,
+      "reload_detail": "已向 Mosquitto（pid=12345）发送 SIGHUP"
+    }
+  }
+  ```
+- `reloaded=false` 同样表示 Broker 未重载、旧凭证可能仍有效；审计动作
+  `device.credential_revoke` 记录 `result` 与 `reload_detail`。
+- 吊销后设备必须重新签发（`POST`，此时为 `operation=issue`）才能接入。
 
 v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入口（后台没有批量改分组），
 分组变化时网关额外发布 2.6 的 `device/system/group` 事件；接口入参、响应与错误语义不变，

@@ -635,7 +635,8 @@ void main() {
     expect(api.lastDeviceKeyword, 'dev-0200');
     expect(api.lastDevicePageSize, 20);
     expect(find.byKey(const ValueKey('device-result-dev-0200')), findsOneWidget);
-    expect(find.textContaining('继续输入以缩小范围'), findsOneWidget);
+    expect(find.text('共 1 台匹配，已全部加载'), findsOneWidget);
+    expect(find.byKey(const ValueKey('device-search-load-more')), findsNothing);
 
     await tester.tap(find.byKey(const ValueKey('device-result-dev-0200')));
     await tester.pumpAndSettle();
@@ -643,7 +644,7 @@ void main() {
     expect(find.byKey(const ValueKey('device-filter-active')), findsOneWidget);
   });
 
-  testWidgets('设备搜索宽关键词：结果被截断时明确展示总数与仅显示条数', (tester) async {
+  testWidgets('设备搜索宽关键词：可继续加载更多，直到第 200 台之后', (tester) async {
     final devices = List<DeviceSummary>.generate(250, (index) {
       final seq = (index + 1).toString().padLeft(4, '0');
       return DeviceSummary(
@@ -666,11 +667,37 @@ void main() {
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();
 
+    // 第一页 20 台：如实展示总数与已加载数，并提供继续加载入口
     expect(
-      find.textContaining('共 250 台匹配，仅显示前 4 台；继续输入以缩小范围'),
+      find.text('共 250 台匹配，已加载 20 台；点击「加载更多」继续，也可输入更精确的关键词'),
       findsOneWidget,
     );
     expect(find.byKey(const ValueKey('device-result-dev-0250')), findsNothing);
+    expect(
+      find.text('加载更多（还有 230 台）'),
+      findsOneWidget,
+    );
+
+    // 连续加载更多，能跨过服务端单页上限并到达第 200 台之后
+    for (var i = 0; i < 12; i++) {
+      final loadMore = find.byKey(const ValueKey('device-search-load-more'));
+      if (loadMore.evaluate().isEmpty ||
+          find.byKey(const ValueKey('device-result-dev-0201')).evaluate().isNotEmpty) {
+        break;
+      }
+      await tester.ensureVisible(loadMore);
+      await tester.pumpAndSettle();
+      await tester.tap(loadMore);
+      await tester.pumpAndSettle();
+    }
+
+    expect(find.byKey(const ValueKey('device-result-dev-0201')), findsOneWidget);
+    expect(api.lastDeviceKeyword, 'dev-');
+    expect(api.lastDevicePage, greaterThan(1));
+    expect(
+      find.textContaining('已加载 220 台'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('批量确认 150 条：按 100 串行拆成 2 批并累加结果', (tester) async {
