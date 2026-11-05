@@ -23,7 +23,7 @@ pydantic-settings>=2.2
 prometheus-client>=0.20
 
 # JWT 鉴权 / LLM 调用
-PyJWT>=2.8
+PyJWT>=2.15.1
 httpx>=0.27
 # SMTP 投递（v1.29.0）：异步、支持 STARTTLS
 aiosmtplib>=3.0
