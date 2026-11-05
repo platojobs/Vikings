@@ -350,7 +350,56 @@ class DeviceGroup {
   );
 }
 
-/// `GET /api/stats/overview`：看板汇总卡使用的服务端全量统计。
+/// 概览页 24 小时趋势的小时桶（服务端已按真实数据填充，空桶为 0）。
+class OverviewTrendPoint {
+  const OverviewTrendPoint({
+    required this.hourStart,
+    required this.reports,
+    required this.alerts,
+  });
+
+  final DateTime hourStart;
+  final int reports;
+  final int alerts;
+
+  factory OverviewTrendPoint.fromJson(Map<String, dynamic> json) =>
+      OverviewTrendPoint(
+        hourStart:
+            DateTime.tryParse(_asString(json['hour_start'], ''))?.toLocal() ??
+            DateTime.fromMillisecondsSinceEpoch(0),
+        reports: _asInt(json['reports']),
+        alerts: _asInt(json['alerts']),
+      );
+}
+
+/// 概览页异常设备：有未处理告警或离线。
+class AbnormalDevice {
+  const AbnormalDevice({
+    required this.deviceId,
+    required this.name,
+    required this.status,
+    required this.openAlertCount,
+    required this.reason,
+  });
+
+  final String deviceId;
+  final String name;
+  final String status;
+  final int openAlertCount;
+
+  /// alert / offline / alert+offline，由服务端给出，客户端只做文案映射。
+  final String reason;
+
+  factory AbnormalDevice.fromJson(Map<String, dynamic> json) => AbnormalDevice(
+    deviceId: _asString(json['device_id'], ''),
+    name: _asString(json['name'], ''),
+    status: _asString(json['status'], 'offline'),
+    openAlertCount: _asInt(json['open_alert_count']),
+    reason: _asString(json['reason'], 'offline'),
+  );
+}
+
+/// `GET /api/stats/overview`：看板汇总卡与概览页使用的服务端全量统计。
 class StatsOverview {
   const StatsOverview({
     required this.deviceTotal,
@@ -358,6 +407,13 @@ class StatsOverview {
     required this.deviceOffline,
     required this.reportToday,
     required this.alertOpen,
+    this.credentialMissing = 0,
+    this.warningOpen = 0,
+    this.criticalOpen = 0,
+    this.trend = const <OverviewTrendPoint>[],
+    this.trendComplete = false,
+    this.firstRecordAt,
+    this.abnormalDevices = const <AbnormalDevice>[],
   });
 
   final int deviceTotal;
@@ -365,6 +421,13 @@ class StatsOverview {
   final int deviceOffline;
   final int reportToday;
   final int alertOpen;
+  final int credentialMissing;
+  final int warningOpen;
+  final int criticalOpen;
+  final List<OverviewTrendPoint> trend;
+  final bool trendComplete;
+  final DateTime? firstRecordAt;
+  final List<AbnormalDevice> abnormalDevices;
 
   static const StatsOverview empty = StatsOverview(
     deviceTotal: 0,
@@ -380,6 +443,13 @@ class StatsOverview {
     deviceOffline: deviceOffline,
     reportToday: reportToday,
     alertOpen: alertOpen ?? this.alertOpen,
+    credentialMissing: credentialMissing,
+    warningOpen: warningOpen,
+    criticalOpen: criticalOpen,
+    trend: trend,
+    trendComplete: trendComplete,
+    firstRecordAt: firstRecordAt,
+    abnormalDevices: abnormalDevices,
   );
 
   factory StatsOverview.fromJson(Map<String, dynamic> json) => StatsOverview(
@@ -388,6 +458,25 @@ class StatsOverview {
     deviceOffline: _asInt(json['device_offline']),
     reportToday: _asInt(json['report_today']),
     alertOpen: _asInt(json['alert_open']),
+    credentialMissing: _asInt(json['device_credential_missing']),
+    warningOpen: _asInt(json['alert_warning_open']),
+    criticalOpen: _asInt(json['alert_critical_open']),
+    trend: json['trend'] is List
+        ? (json['trend'] as List)
+              .whereType<Map<String, dynamic>>()
+              .map(OverviewTrendPoint.fromJson)
+              .toList(growable: false)
+        : const <OverviewTrendPoint>[],
+    trendComplete: json['trend_complete'] == true,
+    firstRecordAt: json['first_record_at'] == null
+        ? null
+        : DateTime.tryParse(_asString(json['first_record_at'], ''))?.toLocal(),
+    abnormalDevices: json['abnormal_devices'] is List
+        ? (json['abnormal_devices'] as List)
+              .whereType<Map<String, dynamic>>()
+              .map(AbnormalDevice.fromJson)
+              .toList(growable: false)
+        : const <AbnormalDevice>[],
   );
 }
 

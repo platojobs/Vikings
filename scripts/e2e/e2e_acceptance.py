@@ -1025,6 +1025,61 @@ def verify_rest_device(ctx: Context) -> str:
     )
 
 
+def verify_overview_stats(ctx: Context) -> str:
+    """移动端概览页数据与 REST 口径一致：设备、告警、24 小时趋势与异常设备。"""
+    overview = api(ctx, "GET", "/api/stats/overview")
+    devices = api(ctx, "GET", "/api/devices", params={"page": 1, "pageSize": 1})
+    summary = api(ctx, "GET", "/api/alerts/summary")
+
+    if int(overview["device_total"]) != int(devices["total"]):
+        raise RuntimeError(
+            f"概览设备总数 {overview['device_total']} 与 /api/devices total {devices['total']} 不一致"
+        )
+    if overview["device_online"] + overview["device_offline"] != overview["device_total"]:
+        raise RuntimeError(f"概览在线/离线之和不等于总数：{overview}")
+    if int(overview["alert_open"]) != int(summary["open"]):
+        raise RuntimeError(
+            f"概览未处理告警 {overview['alert_open']} 与 summary.open {summary['open']} 不一致"
+        )
+    if int(overview["alert_critical_open"]) != int(summary["critical_open"]):
+        raise RuntimeError(
+            f"概览 critical {overview['alert_critical_open']} 与 summary.critical_open {summary['critical_open']} 不一致"
+        )
+    if (
+        int(overview["alert_warning_open"]) + int(overview["alert_critical_open"])
+        != int(overview["alert_open"])
+    ):
+        raise RuntimeError(f"概览告警级别分布不等于未处理总数：{overview}")
+
+    trend = overview.get("trend") or []
+    if len(trend) != 24:
+        raise RuntimeError(f"概览趋势应为 24 个小时桶，实际 {len(trend)}")
+    reports = sum(int(point["reports"]) for point in trend)
+    alerts = sum(int(point["alerts"]) for point in trend)
+    if reports <= 0:
+        raise RuntimeError("概览趋势没有任何真实上报数据")
+    if overview.get("first_record_at") is None:
+        raise RuntimeError("概览未返回 first_record_at")
+
+    all_devices = api(
+        ctx, "GET", "/api/devices", params={"page": 1, "pageSize": 200}
+    )
+    known_ids = {item["device_id"] for item in all_devices.get("items") or []}
+    abnormal = overview.get("abnormal_devices") or []
+    for item in abnormal:
+        if item["device_id"] not in known_ids:
+            raise RuntimeError(f"概览异常设备不存在：{item}")
+
+    return (
+        f"概览与 REST 一致：设备 {overview['device_total']}"
+        f"（在线 {overview['device_online']}/离线 {overview['device_offline']}，"
+        f"未签发 {overview['device_credential_missing']}）、"
+        f"未处理告警 {overview['alert_open']}"
+        f"（warning {overview['alert_warning_open']}/critical {overview['alert_critical_open']}）、"
+        f"趋势 24 桶共 {reports} 条上报/{alerts} 条新增告警、异常设备 {len(abnormal)} 台"
+    )
+
+
 def verify_realtime_alert(ctx: Context) -> str:
     assert ctx.collector is not None
     item = ctx.collector.wait_message(
@@ -2314,6 +2369,7 @@ def main() -> int:
         rep.run("rest_device", lambda: verify_rest_device(ctx))
         rep.run("realtime_status", lambda: verify_realtime_status(ctx))
         rep.run("realtime_alert", lambda: verify_realtime_alert(ctx))
+        rep.run("overview_stats", lambda: verify_overview_stats(ctx))
         # 指令必须在设备唤醒窗口内下发，先等下一轮上报
         rep.run("command_window", lambda: wait_report_round(ctx, 2))
         rep.run("command_dispatch", lambda: dispatch_command(ctx))

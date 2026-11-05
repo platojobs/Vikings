@@ -513,11 +513,30 @@ fire-and-forget，不阻塞告警主链路。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/stats/overview` | 设备总数/在线数/今日上报数/未确认告警数 |
+| GET | `/api/stats/overview` | 设备总数/在线数/未处理告警数；v1.27.0 追加凭证缺口、告警级别分布、24 小时趋势与异常设备（见 3.8.1） |
 | GET | `/api/system/status` | 系统状态快照（仅 admin）：`gateway` 运行时长、`mqtt` 连接与消费量、`storage` 容量、`scheduler` 后台任务参数、`notify` Webhook 是否启用（地址脱敏） |
 | GET | `/api/health` | 存活探针：进程存活即 200，不查库/不查 Broker（无需鉴权） |
 | GET | `/api/health/ready` | 就绪探针（v1.20.0，v1.23.0 加强）：真实读取 `device` 表 + MQTT 连接状态；未就绪返回 503 与各组件明细（无需鉴权） |
 | GET | `/metrics` | Prometheus 文本指标（v1.20.0）：反代只允许内网来源，网关 8000 端口不对外发布 |
+
+#### 3.8.1 概览聚合字段（v1.27.0）
+
+`GET /api/stats/overview` **没有新增端点**，只在既有响应上追加字段，Web 指标卡与移动端概览页
+共用这一套口径（机读字段均为 snake_case）：
+
+| 字段 | 类型 | 说明 / 口径 |
+| --- | --- | --- |
+| `device_total` / `device_online` / `device_offline` | int | 与 `/api/devices` 的 `total` 同一数据源；在线 + 离线 = 总数 |
+| `report_today` | int | 今日上报数（沿用既有定义，按 UTC 日切） |
+| `alert_open` | int | 未处理告警数（`status=open`，与 `/api/alerts/summary` 的 `open` 一致） |
+| `device_credential_missing` | int | 未签发有效 MQTT 凭证的设备数（`missing` / `revoked` 均计入） |
+| `alert_warning_open` / `alert_critical_open` | int | 未处理告警按级别拆分；两者之和 = `alert_open`（v1.21.0 收窄口径后只含 warning/critical） |
+| `trend` | `[{hour_start, reports, alerts}]` | 近 24 个整点小时桶，升序；`reports` 为窗口内上报条数，`alerts` 为窗口内**新增**告警条数（含已确认，按 `created_at`） |
+| `trend_complete` | bool | 首条上报时间是否早于窗口起点；`false` 时客户端必须显示「数据不足 24 小时」，不得补假点 |
+| `first_record_at` | datetime? | 全库最早一条上报时间；无数据为 `null` |
+| `abnormal_devices` | `[{device_id, name, status, open_alert_count, reason}]` | 最多 10 台；`reason` ∈ `alert` / `offline` / `alert+offline`；排序：未处理告警数降序 → 离线优先 → `device_id` |
+
+空桶返回 0（真实零值，不是缺失点）；`trend` 恒为 24 个元素。只读接口，viewer / operator / admin 均可访问。
 
 **请求追踪（v1.20.0）**：所有 HTTP 响应都带 `X-Request-Id`；若请求方传入合法的
 `X-Request-Id`（`[A-Za-z0-9._-]`，≤64 字符）则沿用，否则生成 32 位十六进制 ID。

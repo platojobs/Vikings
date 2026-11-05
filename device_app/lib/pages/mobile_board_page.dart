@@ -26,7 +26,7 @@ import 'login_page.dart';
 /// - 写操作严格复用网关既有端点，不复制 RBAC：角色以登录会话为准，
 ///   服务端 403 时立即禁用写按钮并提示，不崩溃；
 /// - 网关与 Web 零改动，订阅 Topic 与后台看板一致；
-/// - 保留本地设备模拟器为默认入口，两套 MQTT 连接互不影响；
+/// - 保留本地设备模拟器（v1.27.0 起位于「工具」tab），两套 MQTT 连接互不影响；
 /// - 未登录、后端不可达、token 失效、实时断线均给出可读提示，不白屏、不崩溃。
 class MobileBoardPage extends StatefulWidget {
   const MobileBoardPage({
@@ -35,11 +35,18 @@ class MobileBoardPage extends StatefulWidget {
     this.storage,
     this.apiClientFactory,
     this.realtimeServiceFactory,
+    this.focusDeviceId = '',
+    this.focusSeq = 0,
   });
 
   /// 页面是否处于前台可见。切到设备模拟或 App 进入后台时置为 false，
   /// 用于断开实时连接、停止轮询省电。
   final bool active;
+
+  /// 从概览「异常设备」跳转时聚焦的设备 ID；[focusSeq] 每次跳转递增，
+  /// 保证重复点击同一设备也能重新应用筛选。
+  final String focusDeviceId;
+  final int focusSeq;
 
   /// 可选的存储与网络依赖，仅用于测试注入；为空时沿用生产默认实现。
   final AppStorage? storage;
@@ -174,6 +181,25 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.active != widget.active) {
       _syncRealtimeLifecycle();
+    }
+    if (oldWidget.focusSeq != widget.focusSeq &&
+        widget.focusDeviceId.isNotEmpty) {
+      _applyFocusDevice(widget.focusDeviceId);
+    }
+  }
+
+  /// 概览页跳转过来时把搜索框切到该设备，直接命中唯一结果。
+  void _applyFocusDevice(String deviceId) {
+    _searchDebounce?.cancel();
+    _keyword = deviceId;
+    _searchController.text = deviceId;
+    _statusFilter = _BoardStatusFilter.all;
+    _groupFilter = '';
+    if (_scrollController.hasClients) {
+      _scrollController.jumpTo(0);
+    }
+    if (_session != null) {
+      unawaited(_loadData());
     }
   }
 

@@ -36,6 +36,8 @@ class AlertCenterPage extends StatefulWidget {
     this.apiClientFactory,
     this.realtimeServiceFactory,
     this.onUnreadChanged,
+    this.onRealtimeEvent,
+    this.onRealtimeState,
   });
 
   /// 页面是否处于前台 tab；仅用于「进入即清零」与切回时补齐，
@@ -48,6 +50,12 @@ class AlertCenterPage extends StatefulWidget {
 
   /// 未读告警数变化时回调 HomeShell 更新 tab 角标。
   final void Function(int unread)? onUnreadChanged;
+
+  /// 实时事件转发：概览页复用这条前台订阅，不再单独建 MQTT 连接。
+  final void Function(RealtimeEvent event)? onRealtimeEvent;
+
+  /// 连接状态与轮询兜底状态转发，保证概览页与告警中心状态一致。
+  final void Function(RealtimeState state, bool polling)? onRealtimeState;
 
   @override
   State<AlertCenterPage> createState() => _AlertCenterPageState();
@@ -728,6 +736,16 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       service.state.removeListener(_onRealtimeStateChanged);
       unawaited(service.dispose());
     }
+    _notifyRealtimeState(RealtimeState.stopped);
+  }
+
+  /// 把同一条前台订阅的状态同步给概览页，避免两个页面各自猜测连接状态。
+  void _notifyRealtimeState([RealtimeState? override]) {
+    final state = override ?? _realtime?.state.value;
+    if (state == null) {
+      return;
+    }
+    widget.onRealtimeState?.call(state, _pollTimer != null);
   }
 
   void _onRealtimeStateChanged() {
@@ -742,6 +760,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         _session != null) {
       _startPolling();
     }
+    _notifyRealtimeState();
   }
 
   /// 实时不可用时轮询第 1 页 + 汇总；即使页面不可见也继续，
@@ -755,14 +774,18 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         unawaited(_reload(silent: true));
       }
     });
+    _notifyRealtimeState();
   }
 
   void _stopPolling() {
     _pollTimer?.cancel();
     _pollTimer = null;
+    _notifyRealtimeState();
   }
 
   void _onRealtimeEvent(RealtimeEvent event) {
+    // 概览页复用这条订阅：先转发再处理，非告警事件（上报/状态）也要到达概览页
+    widget.onRealtimeEvent?.call(event);
     if (!mounted) {
       return;
     }

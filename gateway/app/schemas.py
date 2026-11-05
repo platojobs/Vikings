@@ -372,12 +372,42 @@ class OtaTaskOut(BaseModel):
     devices: List[OtaDeviceState] = Field(default_factory=list)
 
 
+class TrendPointOut(BaseModel):
+    """概览页 24 小时趋势的一个小时桶（真实数据，空桶计 0）。"""
+
+    hour_start: datetime
+    reports: int = 0
+    alerts: int = 0
+
+
+class AbnormalDeviceOut(BaseModel):
+    """概览页异常设备：未处理告警或离线。"""
+
+    device_id: str
+    name: str
+    status: str
+    open_alert_count: int
+    # alert / offline / alert+offline，客户端按此展示原因
+    reason: str
+
+
 class StatsOverviewOut(BaseModel):
+    """GET /api/stats/overview：Web 指标卡与移动端概览共用一套口径。"""
+
     device_total: int
     device_online: int
     device_offline: int
     report_today: int
     alert_open: int
+    # v1.27.0 概览页字段（在既有响应上追加，不新增第二套端点）
+    device_credential_missing: int = 0
+    alert_warning_open: int = 0
+    alert_critical_open: int = 0
+    trend: List[TrendPointOut] = Field(default_factory=list)
+    # 窗口内是否覆盖满 24 小时；为 False 时客户端必须显示「数据不足」
+    trend_complete: bool = False
+    first_record_at: Optional[datetime] = None
+    abnormal_devices: List[AbnormalDeviceOut] = Field(default_factory=list)
 
 
 class PageOut(BaseModel, Generic[T]):

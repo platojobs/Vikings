@@ -827,7 +827,9 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('设备模拟'), findsOneWidget);
+    // v1.27.0：默认 tab 为「概览」，工具 tab 保留设备模拟器入口
+    expect(find.text('工具'), findsOneWidget);
+    expect(find.text('概览'), findsWidgets);
     realtime.emit(AlertEvent(_alert('alt-badge', 'critical', 'open')));
     await tester.pumpAndSettle();
     final badge = tester.widget<Badge>(
