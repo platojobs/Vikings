@@ -88,6 +88,29 @@ curl -k https://localhost/healthz             # 反代自身存活
 浏览器与移动端的实时链路统一走 `wss://<host>/mqtt`，由反代转给 Broker 的 9001；
 公网不需要开放 9001。
 
+### 3.1 SMTP / Webhook 出网与安全（v1.29.0）
+
+告警通知由网关主动外连，**不需要对公网开放任何入站端口**：
+
+| 目标 | 默认端口 | 说明 |
+| --- | --- | --- |
+| Webhook 接收端 | 443（HTTPS） | 只允许 HTTPS；地址存在 `notification_config`，界面不回显 |
+| SMTP 服务器 | 587（STARTTLS）/ 465（SSL） | 建议 STARTTLS + 账号口令；内网邮件中继可只放行内网地址 |
+
+部署要点：
+
+- 防火墙/安全组按目标域名或 IP 做**出站白名单**，不要整网放行；DNS 需能解析
+  接收端域名，容器内时间必须同步（否则 TLS 校验可能失败）。
+- 网关容器需要出网；若只允许内网邮件中继，则 Webhook 可指向内网接收端。
+- 使用 HTTPS Webhook，并在接收端校验 `X-Vikings-Signature`（HMAC-SHA256，原始 body）。
+  **不要把签名密钥或 token 放在 URL query**，URL 本身按敏感配置对待。
+- SMTP 使用专用发信账号/应用口令，并限制收件人范围；开启 STARTTLS，禁止明文口令认证。
+- 通知配置与投递记录存 PostgreSQL：数据库备份中包含 URL/密钥/口令，
+  备份文件必须按密钥管理（见 operations.md 第 5 节）。
+- 网关日志不会打印密钥、口令与完整 URL；如启用外部日志采集，仍建议对
+  `notification_config` 相关字段做访问控制，禁止把 `.env`、数据库备份或审计导出贴到工单。
+- 没有出网条件时关闭通知总开关即可：告警入库、App/Web 实时推送不受影响。
+
 ---
 
 ## 4. HTTPS 证书
@@ -211,7 +234,8 @@ object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
 | `MQTT_PASSWORD_FILE` | 固定容器路径 | `/run/secrets/mosquitto.passwd` |
 | `MQTT_PASSWORD_FILE_MODE` | 固定 644 | 网关卡与 Broker 容器以不同 uid 共享文件 |
 | `DEPLOY_UID` / `DEPLOY_GID` | **自动生成，必改** | `id -u` / `id -g`；网关以该非 root 用户运行 |
-| `LLM_*` / `ALERT_WEBHOOK_URL` | 可选 | 不配则 AI 降级模板、告警不外推 |
+| `LLM_*` | 可选 | 不配则 AI 降级模板 |
+| `ALERT_WEBHOOK_URL` | 旧版 | v1.29.0 起告警通知改由「系统设置 → 告警通知通道」存库配置；该变量仅保留旧状态展示，不参与投递 |
 | `DATA_RETENTION_DAYS` | 默认 90 | 传感器时序保留天数（按上报时间 `ts`） |
 | `ALERT_RETENTION_DAYS` | 默认 180 | 仅清理已确认（acked）告警；open 永不自动删除 |
 | `AUDIT_RETENTION_DAYS` | 默认 365 | 审计日志保留天数 |

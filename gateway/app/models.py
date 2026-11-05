@@ -236,6 +236,77 @@ class RefreshToken(Base):
     replaced_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 
+class NotificationConfig(Base):
+    """告警通知配置（v1.29.0）：单行 id=1，运行时热读取，不依赖重启。
+
+    Webhook URL/签名密钥、SMTP 口令属于敏感配置：只落库，接口返回时脱敏，
+    审计与日志只记录字段名，不记录值。
+    """
+
+    __tablename__ = "notification_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    webhook_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    webhook_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    webhook_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    webhook_timeout_seconds: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=10)
+    webhook_max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
+    smtp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    smtp_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    smtp_port: Mapped[int] = mapped_column(Integer, nullable=False, default=587)
+    smtp_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    smtp_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    smtp_from: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # 逗号分隔的收件人列表
+    smtp_to: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    smtp_starttls: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    smtp_timeout_seconds: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=10)
+    smtp_max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
+    # 规则：级别（逗号分隔 warning/critical）、分组白名单、设备白/黑名单（逗号分隔）
+    levels: Mapped[str] = mapped_column(String(32), nullable=False, default="critical")
+    groups: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    device_allow: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    device_deny: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 同设备同指标在 N 分钟内只通知一次；0 表示不去重
+    mute_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    retry_backoff_seconds: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=1)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+
+
+class NotificationDelivery(Base):
+    """通知投递记录：成功/最终失败/被静默抑制，供界面查看与排障。"""
+
+    __tablename__ = "notification_delivery"
+    __table_args__ = (
+        Index("idx_notify_delivery_created", "created_at"),
+        Index("idx_notify_device_metric_created", "device_id", "metric", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    alert_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    # webhook / smtp / mute
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    # sent / failed / suppressed
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class AppUser(Base):
     """后台账号表：角色驱动菜单与接口权限，口令只存 PBKDF2 哈希。"""
 

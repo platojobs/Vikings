@@ -65,9 +65,8 @@ class MessageHandler:
         for alert in alert_payloads:
             if self._mqtt is not None:
                 await self._mqtt.publish_alert(alert)
-            # critical 告警异步外推 Webhook（fire-and-forget，不阻塞消费）
-            if alert.get("level") == "critical":
-                asyncio.create_task(notify_service.send_alert_webhook(alert))
+            # 通知是旁路：异步派发，失败/重试都不阻塞 MQTT 消费与告警入库（v1.29.0）
+            asyncio.create_task(notify_service.dispatch_alert(alert))
 
     # ---------------- 上下线状态 ----------------
     async def _handle_status(self, device_id: str, payload: Dict[str, Any]) -> None:

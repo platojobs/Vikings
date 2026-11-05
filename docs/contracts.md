@@ -479,12 +479,82 @@ v1.21.0 之前已确认的历史行**不做臆测回填**：无法得知真实�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `ota.create` / `alert.ack` / `threshold.update` |
+| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） |
 
-### 3.6 告警通知（Webhook）
+### 3.6 告警通知通道（v1.29.0）
 
-网关配置 `ALERT_WEBHOOK_URL` 后，critical 级告警生成时向该地址 POST 通知（钉钉 text 兼容格式 + 结构化 alert 字段），
-fire-and-forget，不阻塞告警主链路。
+**链路位置**：MQTT 上报 → `alert_service` 判定 → `device_alert` 入库 → 发布
+`device/system/alert`（App/Web 实时）→ **旁路异步通知**（Webhook / SMTP）。
+通知是旁路：投递失败、重试、超时都不回滚告警，也不阻塞 MQTT 消费。
+
+**配置热读取**：通道与规则存在 `notification_config`（固定 `id=1`），
+每次告警派发时直接读库；Web 保存后**下一条告警立即生效，无需重启网关**。
+未配置或 `enabled=false` 时完全不发通知（既有 E2E 默认即此状态）。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/system/notifications/config` | admin | 读取配置；URL / 签名密钥 / SMTP 口令只返回 `*_configured` 布尔 |
+| PATCH | `/api/system/notifications/config` | admin | 部分更新；未传字段保持原值，敏感字段传空串表示清空；写审计 `notify.config_update` |
+| POST | `/api/system/notifications/test` | operator / admin | 真实发送测试通知，入参 `{channel: webhook \| smtp \| all}`，忽略规则与静默 |
+| GET | `/api/system/notifications/deliveries` | admin | 最近投递记录，Query：`status=sent\|failed\|suppressed`、`page`、`page_size`（≤100） |
+
+**配置字段（PATCH 入参）**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | bool | 总开关 |
+| `webhook_enabled` / `webhook_url` / `webhook_secret` | bool / str / str | Webhook 开关、地址、HMAC 密钥（可选） |
+| `webhook_timeout_seconds` / `webhook_max_attempts` | int | 单次超时（1–60s）与最大尝试次数（1–10） |
+| `smtp_enabled` / `smtp_host` / `smtp_port` | bool / str / int | SMTP 开关、服务器、端口 |
+| `smtp_username` / `smtp_password` | str | 登录账号与口令（口令不回显） |
+| `smtp_from` / `smtp_to` | str | 发件人；收件人支持逗号分隔多个 |
+| `smtp_starttls` | bool | 是否 STARTTLS |
+| `smtp_timeout_seconds` / `smtp_max_attempts` | int | 同 Webhook 边界 |
+| `levels` | list | 触发级别，`warning` / `critical`，默认 `["critical"]` |
+| `groups` | list | 设备分组白名单，空 = 全部分组 |
+| `device_allow` / `device_deny` | list | 设备 ID 白名单/黑名单；**deny 优先**，空 = 不限 |
+| `mute_minutes` | int | 静默窗口（0–1440 分钟），0 = 不去重 |
+| `retry_backoff_seconds` | float | 指数退避基数：`base × 2^(attempt-1)` |
+
+**规则语义（组合过滤）**：
+`levels` **且** 设备分组命中（`groups` 为空视为全部）**且** 不在 `device_deny`
+**且**（`device_allow` 为空或命中白名单）。任一不满足即不投递。
+级别不匹配时连投递记录都不写（避免把「规则排除」误报成投递失败）。
+
+**Webhook 请求**：
+
+```http
+POST <webhook_url>
+Content-Type: application/json
+X-Vikings-Event: alert            # 测试通知为 notification.test
+X-Vikings-Test: 1                 # 仅测试通知
+X-Vikings-Signature: sha256=<hex> # 配置了 webhook_secret 时
+```
+
+签名 = `HMAC-SHA256(secret, raw_body)`，十六进制小写，前缀 `sha256=`；
+接收端必须对**原始字节**验签。Payload 结构：
+
+```json
+{
+  "event": "alert",
+  "sentAt": "2026-11-05T06:00:00+00:00",
+  "alert": {"alertId": "alt-...", "deviceId": "dev-001", "level": "critical",
+            "metric": "voltage", "value": 2.9, "threshold": 3.2, "message": "..."},
+  "device": {"deviceId": "dev-001", "name": "设备名", "groupName": "默认分组", "status": "online"}
+}
+```
+
+**SMTP 邮件**：主题 `[CRITICAL] 设备 <deviceId> <message>`（测试通知加 `[测试]`）；
+正文为告警字段纯文本；支持 STARTTLS 与账号口令认证。
+超时与重试口径与 Webhook 相同。
+
+**重试与留痕**：每次通道投递独立记录到 `notification_delivery`：
+`sent`（成功）、`failed`（重试耗尽）、`suppressed`（被静默窗口抑制，`channel=mute`）。
+`error` 只记录可公开的错误类别（`HTTP <状态码>` / `请求超时` / `SMTP <异常类型>`），
+**不包含 URL、主机、账号或口令**。
+
+**安全**：GET 不回显 URL / 密钥 / 口令；PATCH 审计只记录变更字段名；
+界面仅显示「已配置 / 未配置」。Webhook URL 与签名密钥、SMTP 口令不得出现在日志。
 
 ### 3.7 指令 / OTA
 
@@ -856,14 +926,14 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 | --- | --- | --- |
 | id | bigserial PK | 自增 |
 | operator | varchar(64) | 操作人（登录用户名） |
-| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / user.* / device.* |
+| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / notify.config_update / user.* / device.* |
 | target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config / app_user） |
 | target_id | varchar(64) | 目标标识 |
 | detail | jsonb | 动作上下文（如指令类型、阈值变更明细） |
 | created_at | timestamptz | 操作时间，索引 |
 
-动作枚举：`login` / `command.create` / `ota.create` / `alert.ack` / `threshold.update` /
-`user.create` / `user.update` / `user.delete`。
+动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` /
+`threshold.update` / `notify.config_update` / `user.create` / `user.update` / `user.delete`。
 
 ### `app_user` 后台账号表
 
@@ -881,6 +951,41 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 （开发/测试默认开启，生产默认关闭，显式设为 `true` 才写入并打印 warning）。
 已有账号时不再覆盖，避免重启重置运维改过的口令。`APP_ENV=production` 且仍使用默认
 JWT/管理员口令/SQLite 时，网关启动直接失败。
+
+### 4.5 告警通知表（v1.29.0）
+
+#### `notification_config`
+
+单行配置表（`id=1`），每次告警派发热读取，因此界面保存后无需重启。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | int PK | 固定 1 |
+| enabled | boolean | 总开关 |
+| webhook_enabled / webhook_url / webhook_secret | bool / varchar(512) / varchar(128) | Webhook 通道与 HMAC 密钥 |
+| webhook_timeout_seconds / webhook_max_attempts | int | 超时与最大尝试 |
+| smtp_enabled / smtp_host / smtp_port | bool / varchar(128) / int | SMTP 通道 |
+| smtp_username / smtp_password | varchar(128) | 登录凭据；接口不回显 |
+| smtp_from / smtp_to | varchar(255) | 发件人 / 收件人（逗号分隔） |
+| smtp_starttls | boolean | STARTTLS |
+| smtp_timeout_seconds / smtp_max_attempts | int | 超时与最大尝试 |
+| levels / groups / device_allow / device_deny | varchar(255) | 逗号分隔的规则集合；空 = 不限制 |
+| mute_minutes | int | 静默窗口，0 = 不去重 |
+| retry_backoff_seconds | numeric(10,2) | 指数退避基数 |
+| updated_at / updated_by | timestamptz / varchar(64) | 最近修改与操作人 |
+
+#### `notification_delivery`
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigserial PK | 自增 |
+| alert_id | varchar(64) | 关联告警 ID（测试通知为 `test-*`） |
+| device_id / metric / level | varchar | 规则与排障维度 |
+| channel | varchar(16) | `webhook` / `smtp` / `mute` |
+| status | varchar(16) | `sent` / `failed` / `suppressed` |
+| attempts | int | 实际尝试次数 |
+| error | varchar(255) | 脱敏后的失败原因；成功为 NULL |
+| created_at | timestamptz | 投递时间，索引 `(created_at)` 与 `(device_id, metric, created_at)` |
 
 ---
 

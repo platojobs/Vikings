@@ -437,6 +437,96 @@ class AbnormalDeviceOut(BaseModel):
     reason: str
 
 
+class NotificationConfigUpdate(BaseModel):
+    """通知配置更新（v1.29.0）：未传字段保持不变。
+
+    敏感字段（webhook_url / webhook_secret / smtp_password）语义：
+    - 不传或 `null`：保持原值；
+    - 空字符串：清空；
+    - 有值：覆盖。
+    """
+
+    enabled: Optional[bool] = None
+    webhook_enabled: Optional[bool] = None
+    webhook_url: Optional[str] = Field(default=None, max_length=1024)
+    webhook_secret: Optional[str] = Field(default=None, max_length=128)
+    webhook_timeout_seconds: Optional[float] = Field(default=None, ge=1, le=60)
+    webhook_max_attempts: Optional[int] = Field(default=None, ge=1, le=10)
+
+    smtp_enabled: Optional[bool] = None
+    smtp_host: Optional[str] = Field(default=None, max_length=255)
+    smtp_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    smtp_username: Optional[str] = Field(default=None, max_length=255)
+    smtp_password: Optional[str] = Field(default=None, max_length=255)
+    smtp_from: Optional[str] = Field(default=None, max_length=255)
+    smtp_to: Optional[str] = Field(default=None, max_length=1024)
+    smtp_starttls: Optional[bool] = None
+    smtp_timeout_seconds: Optional[float] = Field(default=None, ge=1, le=60)
+    smtp_max_attempts: Optional[int] = Field(default=None, ge=1, le=10)
+
+    levels: Optional[List[Literal["warning", "critical"]]] = None
+    groups: Optional[List[str]] = None
+    device_allow: Optional[List[str]] = None
+    device_deny: Optional[List[str]] = None
+    mute_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    retry_backoff_seconds: Optional[float] = Field(default=None, ge=0, le=60)
+
+
+class NotificationConfigOut(BaseModel):
+    """通知配置对外视图：URL/密钥/口令只返回「是否已配置」，绝不回显明文。"""
+
+    enabled: bool
+    webhook_enabled: bool
+    webhook_url_configured: bool
+    webhook_secret_configured: bool
+    webhook_timeout_seconds: float
+    webhook_max_attempts: int
+    smtp_enabled: bool
+    smtp_host: Optional[str] = None
+    smtp_port: int
+    smtp_username: Optional[str] = None
+    smtp_password_configured: bool
+    smtp_from: Optional[str] = None
+    smtp_to: Optional[str] = None
+    smtp_starttls: bool
+    smtp_timeout_seconds: float
+    smtp_max_attempts: int
+    levels: List[str]
+    groups: List[str]
+    device_allow: List[str]
+    device_deny: List[str]
+    mute_minutes: int
+    retry_backoff_seconds: float
+    updated_at: Optional[datetime] = None
+    updated_by: str = "system"
+
+
+class NotificationDeliveryOut(BaseModel):
+    id: int
+    alert_id: str
+    device_id: str
+    metric: str
+    level: str
+    channel: str
+    status: str
+    attempts: int
+    error: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NotificationTestRequest(BaseModel):
+    channel: Literal["webhook", "smtp", "all"] = "all"
+
+
+class NotificationTestResult(BaseModel):
+    channel: str
+    status: str
+    attempts: int
+    error: Optional[str] = None
+
+
 class StatsOverviewOut(BaseModel):
     """GET /api/stats/overview：Web 指标卡与移动端概览共用一套口径。"""
 

@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0005_device_cred_revoked"
+HEAD = "0006_notifications"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
@@ -118,6 +118,9 @@ def test_upgrade_on_empty_database(tmp_path):
         "audit_log",
         "app_user",
         "refresh_token",
+        # v1.29.0 通知配置与投递记录
+        "notification_config",
+        "notification_delivery",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
     assert ACK_COLUMNS <= _alert_columns(db_path)
@@ -169,9 +172,15 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
 
     down = _run_alembic(db_path, "downgrade", "-1")
     assert down.returncode == 0, down.stderr
-    assert _alembic_version(db_path) == "0004_refresh_tokens"
-    assert "mqtt_credential_revoked_at" not in _device_columns(db_path), (
-        "downgrade -1 必须移除凭证吊销列"
+    assert _alembic_version(db_path) == "0005_device_cred_revoked"
+    assert "notification_config" not in _table_names(db_path), (
+        "downgrade -1 必须移除通知配置表"
+    )
+    assert "notification_delivery" not in _table_names(db_path), (
+        "downgrade -1 必须移除投递记录表"
+    )
+    assert "mqtt_credential_revoked_at" in _device_columns(db_path), (
+        "downgrade -1 不得影响凭证吊销列"
     )
     assert "refresh_token" in _table_names(db_path), "downgrade -1 不得影响刷新令牌表"
     assert ACK_COLUMNS <= _alert_columns(db_path), "downgrade -1 不得影响告警处置列"
@@ -180,6 +189,7 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     assert up.returncode == 0, up.stderr
     assert ACK_COLUMNS <= _alert_columns(db_path)
     assert "refresh_token" in _table_names(db_path)
+    assert "notification_config" in _table_names(db_path)
     assert "mqtt_credential_revoked_at" in _device_columns(db_path)
     assert _alembic_version(db_path) == HEAD
 

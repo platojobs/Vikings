@@ -482,6 +482,87 @@ export interface SystemStatus {
   generated_at: string
 }
 
+// ==================== 告警通知（v1.29.0） ====================
+
+/** 通道配置对外视图：URL/密钥/口令只返回「是否已配置」，不回显明文 */
+export interface NotificationConfig {
+  enabled: boolean
+  webhook_enabled: boolean
+  webhook_url_configured: boolean
+  webhook_secret_configured: boolean
+  webhook_timeout_seconds: number
+  webhook_max_attempts: number
+  smtp_enabled: boolean
+  smtp_host: string | null
+  smtp_port: number
+  smtp_username: string | null
+  smtp_password_configured: boolean
+  smtp_from: string | null
+  smtp_to: string | null
+  smtp_starttls: boolean
+  smtp_timeout_seconds: number
+  smtp_max_attempts: number
+  levels: string[]
+  groups: string[]
+  device_allow: string[]
+  device_deny: string[]
+  mute_minutes: number
+  retry_backoff_seconds: number
+  updated_at: string | null
+  updated_by: string
+}
+
+/** 更新入参：敏感字段空串表示清空，不传表示保持原值 */
+export type NotificationConfigPatch = Partial<{
+  enabled: boolean
+  webhook_enabled: boolean
+  webhook_url: string
+  webhook_secret: string
+  webhook_timeout_seconds: number
+  webhook_max_attempts: number
+  smtp_enabled: boolean
+  smtp_host: string
+  smtp_port: number
+  smtp_username: string
+  smtp_password: string
+  smtp_from: string
+  smtp_to: string
+  smtp_starttls: boolean
+  smtp_timeout_seconds: number
+  smtp_max_attempts: number
+  levels: Array<'warning' | 'critical'>
+  groups: string[]
+  device_allow: string[]
+  device_deny: string[]
+  mute_minutes: number
+  retry_backoff_seconds: number
+}>
+
+export type NotificationTestChannel = 'webhook' | 'smtp' | 'all'
+
+export interface NotificationTestResult {
+  channel: string
+  status: 'sent' | 'failed'
+  attempts: number
+  error: string | null
+}
+
+export type NotificationDeliveryStatus = 'sent' | 'failed' | 'suppressed'
+
+/** 投递记录：成功 / 最终失败 / 被静默抑制 */
+export interface NotificationDelivery {
+  id: number
+  alert_id: string
+  device_id: string
+  metric: string
+  level: string
+  channel: string
+  status: NotificationDeliveryStatus
+  attempts: number
+  error: string | null
+  created_at: string
+}
+
 // ==================== MQTT 报文（camelCase） ====================
 
 /** device/{deviceId}/sensor/report */

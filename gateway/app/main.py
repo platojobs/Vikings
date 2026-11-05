@@ -21,6 +21,7 @@ from app.api.routes import (
     auth,
     devices,
     health,
+    notifications,
     ota,
     rules,
     stats,
@@ -109,6 +110,7 @@ app.include_router(rules.router)
 app.include_router(audit.router)
 app.include_router(users.router)
 app.include_router(system.router)
+app.include_router(notifications.router)
 app.include_router(health.router)
 app.include_router(health.metrics_router)
 

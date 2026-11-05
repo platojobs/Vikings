@@ -136,6 +136,16 @@ def configure_logging(
         uvicorn_logger.propagate = True
     logging.getLogger("uvicorn.access").disabled = True
 
+    # 第三方客户端在 INFO/DEBUG 级别会打印完整 URL 或 SMTP 会话。Webhook URL
+    # 可能带 token/签名参数、SMTP AUTH 含口令，统一降到 WARNING，避免进入日志（v1.29.0）。
+    for name in ("httpx", "httpcore", "aiosmtplib"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # aiosqlite 的 DEBUG 日志会原样打印 SQL 参数，包含 Webhook 密钥与 SMTP 口令。
+    # 统一压到 WARNING：即使运维把 LOG_LEVEL 调成 DEBUG，也不得把敏感值写进日志。
+    for name in ("aiosqlite", "sqlalchemy.engine"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def _request_user(request: Request) -> str:
     """从 Bearer Token 解析用户名；解析失败记 anonymous，绝不回传 token。"""
