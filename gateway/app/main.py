@@ -36,7 +36,7 @@ from app.mqtt.client import MqttGatewayClient
 from app.mqtt.handlers import MessageHandler
 from app.observability import ObservabilityMiddleware, configure_logging
 from app.scheduler import BackgroundScheduler
-from app.services import rule_service, user_service
+from app.services import alert_rule_service, rule_service, user_service
 
 configure_logging()
 logger = logging.getLogger("app")
@@ -56,10 +56,14 @@ async def lifespan(app: FastAPI):
     await prepare_database()
     DB_READY.set(1)
 
-    # 启动时加载 rule_config 表中的阈值覆盖，恢复上次在线修改的配置
-    # 同时初始化账号表（仅首次启动，避免覆盖运维改过的口令）
+    # 启动时加载阈值覆盖与告警规则：恢复上次在线修改的配置，并补齐默认规则。
+    # 规则判定读进程内缓存，管理端写入后 write-through 刷新，无需重启。
     async with SessionFactory() as session:
         await rule_service.load_overrides(session)
+        seeded = await alert_rule_service.ensure_default_rules(session)
+        if seeded:
+            logger.info("告警规则表为空，已按默认阈值补齐 %d 条默认规则", seeded)
+        await alert_rule_service.load_rules(session)
         created_users = await user_service.ensure_bootstrap_users(session)
         await session.commit()
     if created_users:

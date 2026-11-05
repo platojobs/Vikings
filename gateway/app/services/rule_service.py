@@ -1,7 +1,10 @@
-"""阈值在线配置服务：rule_config 表与进程内覆盖缓存的同步。
+"""阈值在线配置服务：rule_config 表与进程内覆盖缓存的同步（v1.34.0 兼容层）。
 
-读取路径：rules.evaluate → 覆盖缓存（rule_config）→ 环境变量 → 默认值。
-写入路径：PUT 接口 → upsert rule_config 行 → patch 覆盖缓存 → 审计日志。
+读取路径：rules.evaluate → alert_rule 表缓存（默认规则）→ Settings。
+写入路径：PUT 接口 → upsert rule_config 行 → 同步默认规则阈值 → 刷新规则缓存。
+
+v1.34.0 起规则以 alert_rule 表为准；本模块保留旧 /api/rules/thresholds 契约，
+让升级前调用该接口的脚本/看板继续工作（写入会同步到默认规则，重启后不丢）。
 """
 
 import logging
@@ -11,8 +14,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import rules
+from app.config import get_settings
 from app.models import RuleConfig
 from app.schemas import ThresholdsUpdateRequest
+from app.services import alert_rule_service
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,10 @@ async def update_thresholds(
         updated[api_key] = value
 
     await session.flush()
+    # 判定读 alert_rule 表：旧接口的修改必须同步到默认规则，重启后才不会回退
+    await alert_rule_service.apply_threshold_overrides(
+        session, {KEY_TO_ATTR[key]: value for key, value in updated.items()}, operator
+    )
     logger.info("阈值在线更新 operator=%s changes=%s", operator, updated)
     return updated
 
@@ -74,7 +83,9 @@ def effective_view() -> Dict[str, Dict[str, float]]:
     def entry(group: str, name: str, api_key: str) -> Dict[str, float]:
         value = snapshot[group][name][0]
         attr = KEY_TO_ATTR[api_key]
-        return {"value": value, "source": "override" if attr in overrides else "env"}
+        # 来源标记：rule_config 覆盖过，或默认规则阈值已偏离环境变量，都算「在线修改」
+        overridden = attr in overrides or value != float(getattr(get_settings(), attr))
+        return {"value": value, "source": "override" if overridden else "env"}
 
     return {
         "voltage": {

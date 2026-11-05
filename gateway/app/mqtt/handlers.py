@@ -59,7 +59,9 @@ class MessageHandler:
             device = await device_service.ensure_device(session, msg.device_id)
             await session.commit()
 
-            alert_payloads = await alert_service.handle_report_alerts(session, msg, device.name)
+            alert_payloads = await alert_service.handle_report_alerts(
+                session, msg, device.name, group_name=device.group_name
+            )
             await session.commit()
 
         for alert in alert_payloads:

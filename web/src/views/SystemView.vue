@@ -11,6 +11,9 @@
  * 传输设置只保留全局开关/超时/退避/SMTP 服务器；投递历史移至独立页面。
  * 服务端配置存库、每次派发热读取，因此保存后无需重启网关；
  * URL / 签名密钥 / SMTP 口令只显示「是否已配置」，表单留空表示保持原值。
+ * v1.34.0：追加「告警规则」卡——阈值从告警中心抽屉迁到此处，支持指标/方向/
+ * 阈值/级别/生效范围/连续次数的新增、编辑、启停（均二次确认）与删除，
+ * 写入即时生效（网关判定读规则缓存）。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -26,8 +29,20 @@ import {
   updateNotificationConfig,
   updateNotificationRule,
 } from '@/api/notifications'
+import {
+  createAlertRule,
+  deleteAlertRule,
+  fetchAlertRules,
+  restoreDefaultAlertRules,
+  setAlertRuleEnabled,
+  updateAlertRule,
+} from '@/api/rules'
 import { formatDateTime } from '@/utils/format'
 import type {
+  AlertMetric,
+  AlertRule,
+  AlertRuleCreateBody,
+  AlertRuleScope,
   NotificationConfig,
   NotificationConfigPatch,
   NotificationRule,
@@ -414,11 +429,219 @@ async function saveSlaConfig(): Promise<void> {
   }
 }
 
+// ==================== 告警规则（v1.34.0） ====================
+
+const alertRules = ref<AlertRule[]>([])
+const alertRulesLoading = ref(false)
+const ruleEditorVisible = ref(false)
+const ruleEditorSaving = ref(false)
+const editingAlertRuleId = ref<number | null>(null)
+
+/** 指标元数据：前端只做输入范围约束，最终以服务端校验为准 */
+const METRIC_OPTIONS: Array<{
+  value: AlertMetric
+  label: string
+  unit: string
+  min: number
+  max: number
+  step: number
+  ops: Array<'lt' | 'gt'>
+}> = [
+  { value: 'voltage', label: '电压', unit: 'V', min: 2, max: 4.5, step: 0.1, ops: ['lt'] },
+  { value: 'temperature', label: '温度', unit: '℃', min: -40, max: 85, step: 1, ops: ['lt', 'gt'] },
+  { value: 'humidity', label: '湿度', unit: '%', min: 0, max: 100, step: 1, ops: ['gt'] },
+  { value: 'rssi', label: '信号强度', unit: 'dBm', min: -150, max: 0, step: 1, ops: ['lt'] },
+]
+
+const alertRuleForm = reactive({
+  name: '',
+  metric: 'voltage' as AlertMetric,
+  op: 'lt' as 'lt' | 'gt',
+  threshold: 3.4,
+  level: 'warning' as 'warning' | 'critical',
+  scope_type: 'global' as AlertRuleScope,
+  scope_value: '',
+  enabled: true,
+  consecutive_count: 1,
+  priority: 100,
+})
+
+const currentMetric = computed(
+  () => METRIC_OPTIONS.find((item) => item.value === alertRuleForm.metric) ?? METRIC_OPTIONS[0],
+)
+
+function metricMeta(metric: AlertMetric) {
+  return METRIC_OPTIONS.find((item) => item.value === metric) ?? METRIC_OPTIONS[0]
+}
+
+function opLabel(op: 'lt' | 'gt'): string {
+  return op === 'gt' ? '高于' : '低于'
+}
+
+function ruleConditionText(rule: AlertRule): string {
+  const meta = metricMeta(rule.metric)
+  return `${opLabel(rule.op)} ${rule.threshold}${meta.unit}`
+}
+
+function scopeText(rule: AlertRule): string {
+  if (rule.scope_type === 'group') return `分组：${rule.scope_value}`
+  if (rule.scope_type === 'device') return `设备：${rule.scope_value}`
+  return '全局'
+}
+
+/** 换指标时同步比较方向与阈值范围，避免把电压阈值带到湿度规则上 */
+function onMetricChange(): void {
+  const meta = currentMetric.value
+  if (!meta.ops.includes(alertRuleForm.op)) alertRuleForm.op = meta.ops[0]
+  alertRuleForm.threshold = Math.min(Math.max(alertRuleForm.threshold, meta.min), meta.max)
+}
+
+async function loadAlertRules(): Promise<void> {
+  alertRulesLoading.value = true
+  try {
+    alertRules.value = await fetchAlertRules()
+  } catch {
+    alertRules.value = []
+  } finally {
+    alertRulesLoading.value = false
+  }
+}
+
+function openCreateAlertRule(): void {
+  editingAlertRuleId.value = null
+  alertRuleForm.name = ''
+  alertRuleForm.metric = 'voltage'
+  alertRuleForm.op = 'lt'
+  alertRuleForm.threshold = 3.4
+  alertRuleForm.level = 'warning'
+  alertRuleForm.scope_type = 'global'
+  alertRuleForm.scope_value = ''
+  alertRuleForm.enabled = true
+  alertRuleForm.consecutive_count = 1
+  alertRuleForm.priority = 100
+  ruleEditorVisible.value = true
+}
+
+function openEditAlertRule(rule: AlertRule): void {
+  editingAlertRuleId.value = rule.id
+  alertRuleForm.name = rule.name
+  alertRuleForm.metric = rule.metric
+  alertRuleForm.op = rule.op
+  alertRuleForm.threshold = rule.threshold
+  alertRuleForm.level = rule.level
+  alertRuleForm.scope_type = rule.scope_type
+  alertRuleForm.scope_value = rule.scope_value ?? ''
+  alertRuleForm.enabled = rule.enabled
+  alertRuleForm.consecutive_count = rule.consecutive_count
+  alertRuleForm.priority = rule.priority
+  ruleEditorVisible.value = true
+}
+
+async function saveAlertRule(): Promise<void> {
+  if (!alertRuleForm.name.trim()) {
+    ElMessage.warning('请填写规则名称')
+    return
+  }
+  if (alertRuleForm.scope_type !== 'global' && !alertRuleForm.scope_value.trim()) {
+    ElMessage.warning('选择「指定分组 / 指定设备」时必须填写具体名称或设备 ID')
+    return
+  }
+
+  const payload: AlertRuleCreateBody = {
+    name: alertRuleForm.name.trim(),
+    metric: alertRuleForm.metric,
+    op: alertRuleForm.op,
+    threshold: alertRuleForm.threshold,
+    level: alertRuleForm.level,
+    scope_type: alertRuleForm.scope_type,
+    scope_value: alertRuleForm.scope_type === 'global' ? null : alertRuleForm.scope_value.trim(),
+    enabled: alertRuleForm.enabled,
+    consecutive_count: alertRuleForm.consecutive_count,
+    priority: alertRuleForm.priority,
+  }
+
+  ruleEditorSaving.value = true
+  try {
+    if (editingAlertRuleId.value !== null) {
+      await updateAlertRule(editingAlertRuleId.value, payload)
+      ElMessage.success('规则已更新，下一次上报立即按新阈值判定')
+    } else {
+      await createAlertRule(payload)
+      ElMessage.success('规则已创建并即时生效')
+    }
+    ruleEditorVisible.value = false
+    await loadAlertRules()
+  } catch {
+    // 请求层已提示（含服务端 400 的可读校验信息）
+  } finally {
+    ruleEditorSaving.value = false
+  }
+}
+
+async function toggleAlertRule(rule: AlertRule): Promise<void> {
+  const action = rule.enabled ? '停用' : '启用'
+  try {
+    await ElMessageBox.confirm(
+      `${action}规则「${rule.name}」？${rule.enabled ? '停用后该规则不再产生新告警，历史告警与统计不受影响。' : '启用后下一次上报立即参与判定。'}`,
+      `${action}告警规则`,
+      { type: 'warning', confirmButtonText: action, cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await setAlertRuleEnabled(rule.id, !rule.enabled)
+    ElMessage.success(`规则已${action}`)
+    await loadAlertRules()
+  } catch {
+    // 请求层已提示
+  }
+}
+
+async function removeAlertRule(rule: AlertRule): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除规则「${rule.name}」？删除后不可恢复；需要保留判定依据时请优先选择「停用」。`,
+      '删除告警规则',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteAlertRule(rule.id)
+    ElMessage.success('规则已删除')
+    await loadAlertRules()
+  } catch {
+    // 请求层已提示
+  }
+}
+
+async function restoreAlertRules(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '把所有默认规则的阈值恢复为环境变量/出厂值，自定义规则保持不变。历史告警不受影响，确认继续？',
+      '恢复默认阈值',
+      { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    const result = await restoreDefaultAlertRules()
+    ElMessage.success(`已恢复 ${result.restored} 条默认规则阈值`)
+    await loadAlertRules()
+  } catch {
+    // 请求层已提示
+  }
+}
+
 onMounted(() => {
   loadStatus()
   loadNotificationConfig()
   loadRules()
   loadSlaConfig()
+  loadAlertRules()
   timer = setInterval(loadStatus, 10_000)
 })
 
@@ -613,6 +836,82 @@ onBeforeUnmount(() => {
         show-icon
         title="升级通知复用现有通知规则链路，内容包含「超时升级、第几次、原 SLA 时长」；同一条告警同一步只发一次。"
       />
+    </el-card>
+
+    <el-card v-loading="alertRulesLoading" shadow="never">
+      <div class="section-head">
+        <div>
+          <span class="section-title">告警规则</span>
+          <span class="section-desc">
+            按「指标 + 比较方向 + 阈值 + 级别 + 生效范围」判定；同一指标多条命中取最高级别
+            （critical 优先），同级按优先级数字小的优先，每指标只产一条告警；保存后下一次上报即时生效
+          </span>
+        </div>
+        <div class="head-actions">
+          <el-button size="small" @click="restoreAlertRules">恢复默认阈值</el-button>
+          <el-button size="small" type="primary" @click="openCreateAlertRule">新增规则</el-button>
+        </div>
+      </div>
+
+      <el-alert type="warning" :closable="false" show-icon class="notify-hint">
+        <template #title>
+          停用规则只停止产生新告警，历史告警与统计不受影响；删除规则不可恢复。
+          阈值方向与级别关系由服务端校验（严重阈值必须比警告更严格），误配会被拒绝并给出原因。
+        </template>
+      </el-alert>
+
+      <el-table :data="alertRules" size="small" empty-text="暂无规则：所有指标都不会产生告警">
+        <el-table-column label="规则名称" min-width="170">
+          <template #default="{ row }">
+            <span>{{ row.name }}</span>
+            <el-tag v-if="row.is_default" size="small" type="info" class="inline-tag">默认</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="指标" width="110">
+          <template #default="{ row }">
+            {{ metricMeta(row.metric).label }}（{{ metricMeta(row.metric).unit }}）
+          </template>
+        </el-table-column>
+        <el-table-column label="条件" width="130">
+          <template #default="{ row }">{{ ruleConditionText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="级别" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.level === 'critical' ? 'danger' : 'warning'" size="small">
+              {{ row.level }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="生效范围" min-width="150">
+          <template #default="{ row }">{{ scopeText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="连续次数" width="100">
+          <template #default="{ row }">
+            {{ row.consecutive_count > 1 ? `连续 ${row.consecutive_count} 次` : '首次越限' }}
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="80">
+          <template #default="{ row }">
+            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
+              {{ row.enabled ? '启用' : '停用' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近修改" min-width="190">
+          <template #default="{ row }">
+            {{ row.updated_by }} · {{ row.updated_at ? formatDateTime(row.updated_at) : '—' }}
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="170" fixed="right">
+          <template #default="{ row }">
+            <el-button link size="small" @click="openEditAlertRule(row)">编辑</el-button>
+            <el-button link size="small" @click="toggleAlertRule(row)">
+              {{ row.enabled ? '停用' : '启用' }}
+            </el-button>
+            <el-button link size="small" type="danger" @click="removeAlertRule(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-card>
 
     <el-card v-loading="notifyLoading" shadow="never">
@@ -814,6 +1113,91 @@ onBeforeUnmount(() => {
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog
+      v-model="ruleEditorVisible"
+      :title="editingAlertRuleId === null ? '新增告警规则' : '编辑告警规则'"
+      width="640px"
+      destroy-on-close
+    >
+      <el-form label-width="110px" label-position="left">
+        <el-form-item label="规则名称" required>
+          <el-input v-model="alertRuleForm.name" maxlength="64" placeholder="如：华东机柜温度上限" />
+        </el-form-item>
+        <el-form-item label="指标" required>
+          <el-select v-model="alertRuleForm.metric" style="width: 240px" @change="onMetricChange">
+            <el-option
+              v-for="option in METRIC_OPTIONS"
+              :key="option.value"
+              :label="`${option.label}（${option.unit}）`"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="比较方向" required>
+          <el-radio-group v-model="alertRuleForm.op">
+            <el-radio-button v-for="op in currentMetric.ops" :key="op" :value="op">
+              {{ opLabel(op) }}阈值触发
+            </el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="阈值" required>
+          <el-input-number
+            v-model="alertRuleForm.threshold"
+            :min="currentMetric.min"
+            :max="currentMetric.max"
+            :step="currentMetric.step"
+            controls-position="right"
+          />
+          <span class="form-hint">{{ currentMetric.unit }}；等于阈值不告警</span>
+        </el-form-item>
+        <el-form-item label="级别" required>
+          <el-radio-group v-model="alertRuleForm.level">
+            <el-radio-button value="warning">warning（警告）</el-radio-button>
+            <el-radio-button value="critical">critical（严重）</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="生效范围">
+          <el-radio-group v-model="alertRuleForm.scope_type">
+            <el-radio-button value="global">全局</el-radio-button>
+            <el-radio-button value="group">指定分组</el-radio-button>
+            <el-radio-button value="device">指定设备</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item
+          v-if="alertRuleForm.scope_type !== 'global'"
+          :label="alertRuleForm.scope_type === 'group' ? '分组名称' : '设备 ID'"
+          required
+        >
+          <el-input
+            v-model="alertRuleForm.scope_value"
+            :placeholder="
+              alertRuleForm.scope_type === 'group'
+                ? '与设备分组完全一致，如：华东'
+                : '设备 ID，如：VG-100-001'
+            "
+          />
+        </el-form-item>
+        <el-form-item label="连续次数">
+          <el-input-number v-model="alertRuleForm.consecutive_count" :min="1" :max="20" />
+          <span class="form-hint">连续 N 次越限才触发；1 表示首次越限即触发</span>
+        </el-form-item>
+        <el-form-item label="优先级">
+          <el-input-number v-model="alertRuleForm.priority" :min="1" :max="1000" />
+          <span class="form-hint">同指标同级别多条命中时，数字小者优先</span>
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="alertRuleForm.enabled" />
+          <span class="form-hint">停用后保存也不参与判定</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="ruleEditorVisible = false">取消</el-button>
+        <el-button type="primary" :loading="ruleEditorSaving" @click="saveAlertRule">
+          保存并生效
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       v-model="ruleDialogVisible"

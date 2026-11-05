@@ -129,6 +129,9 @@ class DeviceAlert(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     ai_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    # v1.34.0：命中的告警规则快照（规则 ID/名称、比较方向、阈值、级别、实际值、连续次数）。
+    # 规则后续被修改或删除也不影响历史告警的「为什么触发」解释；v1.34.0 之前的历史行为 NULL。
+    matched_rule: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONPayload, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -204,6 +207,48 @@ class RuleConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class AlertRule(Base):
+    """可配置告警阈值规则（v1.34.0）。
+
+    一行一条规则：指标 + 比较方向 + 阈值 + 级别 + 生效范围。
+    - `is_default=True` 的 10 条规则由 v1.34.0 迁移/启动补齐，值取自 v1.33.0 的
+      环境变量或 rule_config 覆盖，保证升级前后判定结果一致；
+    - 同一指标多条规则同时命中时取最高级别（critical 胜 warning），同级按
+      `priority` 升序、再按 id 升序，每指标只产一条告警（见 docs/contracts.md）。
+    """
+
+    __tablename__ = "alert_rule"
+    __table_args__ = (
+        Index("idx_alert_rule_metric", "metric"),
+        Index("idx_alert_rule_scope", "scope_type", "scope_value"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(32), nullable=False)
+    # lt = 低于阈值触发，gt = 高于阈值触发
+    op: Mapped[str] = mapped_column(String(8), nullable=False)
+    threshold: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    # 仅 warning / critical（沿用 v1.21.0 收窄后的级别口径）
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    # global / group / device
+    scope_type: Mapped[str] = mapped_column(String(16), nullable=False, default="global")
+    scope_value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # 连续 N 次越限才触发（1 表示首次越限即触发，与 v1.33.0 行为一致）
+    consecutive_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    # 同级命中时的裁决顺序：数字越小越优先
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, server_default="100")
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system", server_default="system")
 
 
 class AuditLog(Base):

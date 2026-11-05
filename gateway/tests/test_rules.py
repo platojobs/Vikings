@@ -35,7 +35,12 @@ def test_voltage_critical():
 
 def test_temperature_high_critical():
     hits = evaluate(make_report(temperature=80))
-    assert hits[0] == {"metric": "temperature", "level": "critical", "value": 80.0, "threshold": 75.0}
+    # v1.34.0：命中结果追加规则标识（rules.py 自带默认规则视图，无需数据库）
+    assert {key: hits[0][key] for key in ("metric", "level", "value", "threshold")} == {
+        "metric": "temperature", "level": "critical", "value": 80.0, "threshold": 75.0
+    }
+    assert hits[0]["rule_name"] == "温度过高-严重"
+    assert hits[0]["op"] == "gt"
 
 
 def test_temperature_low_warning():
@@ -68,8 +73,10 @@ def test_multiple_metrics():
 @pytest.fixture(autouse=False)
 def clean_overrides():
     """每个覆盖用例前后清空进程内缓存，避免用例间串扰。"""
+    rules.reset_rules_cache()
     rules.set_overrides({})
     yield
+    rules.reset_rules_cache()
     rules.set_overrides({})
 
 

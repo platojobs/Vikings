@@ -928,5 +928,66 @@ viewer 若确有只读报表需求，应由 admin 临时提升为 operator，用
 | 值班交接 | `operator` / `admin` |
 | 修改 SLA 配置 | 仅 `admin` |
 
+## 16. 告警规则运维（v1.34.0）
+
+### 16.1 规则从哪来、怎么裁决
+
+- 升级时迁移 `0009_alert_rules` 会把 v1.33.0 的 10 个硬编码阈值写成 `is_default=true`
+  的默认规则（范围 global、连续次数 1），阈值优先取 `rule_config` 的在线覆盖值，否则取环境变量。
+  因此**升级后第一次上报的告警级别与阈值与升级前完全相同**。
+- 规则配置入口：系统设置 → 告警规则（新增/编辑/启停/删除，均二次确认）。
+  告警中心的旧「阈值配置」抽屉已移除，避免两处改同一件事。
+- 同一指标多条规则命中时取最高级别（critical 胜 warning），同级按 `priority` 数字小者优先，
+  每个指标只产一条告警。完整字段与口径见 `docs/contracts.md` 3.4。
+- 规则全禁用时该指标不产生新告警，既有告警、统计与导出不受影响。
+
+### 16.2 改阈值后为什么没生效：按顺序排查
+
+1. **改的是哪条规则**：告警详情里的「触发规则」显示 `matched_rule.rule_name`。
+   电压/湿度各有两条（warning 与 critical），只改 warning 时 2.9V 仍会被 critical 命中，
+   看起来「没生效」。对照 `GET /api/rules` 的 `metric` / `op` / `level` / `scope_*` 四列。
+2. **级别关系是否合法**：严重阈值必须比警告更严格；反向修改会返回 400 并说明原因，
+   不会静默保存。先改 critical、再改 warning（或反过来）可避免中间态被拒。
+3. **规则是否停用 / 范围是否匹配**：`enabled=false` 不参与判定；
+   `scope_type=group` 只匹配 `device.group_name`，`device` 只匹配该设备 ID。
+4. **是否被更高级别或更高优先级规则覆盖**：同一指标只展示裁决后的一条；
+   用 `/api/rules` 看所有同时命中项。
+5. **抑制窗口**：同设备同指标在 `ALERT_SUPPRESS_SECONDS`（默认 300s）内只入库一条。
+   验证新阈值时请换一台设备或等窗口结束，否则看到的是「抑制」而不是「新阈值」。
+6. **是否多实例部署**：规则缓存在进程内，写入后 write-through 重载本进程；
+   多实例网关各自持有缓存，需要每实例都执行一次规则写入（当前部署为单实例）。
+7. **是否改的是旧接口**：`PUT /api/rules/thresholds` 仍可用，且会同步默认规则；
+   但它只能改 10 个默认键，不能新增范围规则。新需求请用规则页。
+8. **连续次数**：`consecutive_count>1` 时需连续 N 次越限才触发，单次上报不产生告警；
+   中途一次正常上报会把计数清零。
+
+### 16.3 回滚到默认规则
+
+两种方式，均只影响默认规则，自定义规则保持不变：
+
+1. **界面**：系统设置 → 告警规则 → 「恢复默认阈值」，二次确认后调用
+   `POST /api/rules/restore-defaults`，写审计 `alert_rule.restore_defaults`。
+2. **命令行**（与界面等价）：
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' | jq -r .data.token)
+curl -s -X POST http://127.0.0.1:8000/api/rules/restore-defaults \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+恢复的是「环境变量/出厂值」，并会删除对应的 `rule_config` 覆盖行；
+若线上仍希望长期保留某个阈值，请不要用恢复默认，而是把该值写回规则本身。
+要彻底停用某指标告警，请**停用**规则而不是删除全部规则——删光后网关重启会按默认值重新补齐。
+
+### 16.4 审计与验证
+
+- 审计动作：`alert_rule.create/update/enable/disable/delete/restore_defaults`，
+  `detail` 只记录规则名、ID 与变更字段名，不记录阈值等具体数值。
+- 本版本真实验证脚本：`scripts/verify_alert_rules_v134.py`
+  （真实 PostgreSQL + Alembic + mosquitto + MQTT 上报 + uvicorn + HTTP，覆盖热生效、
+  范围隔离、裁决、连续次数、停用、重载去重、迁移往返与权限校验）。
+
 
 

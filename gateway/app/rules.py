@@ -1,18 +1,143 @@
-"""告警规则引擎：确定性阈值判定。
+"""告警规则引擎：可配置阈值的确定性判定（v1.34.0）。
 
-阈值来源优先级：rule_config 表（在线修改） > 环境变量 > 默认值。
-在线修改通过 /api/rules/thresholds 写入后由 rule_service 刷新进程内覆盖缓存，
-规则判定每次实时读取缓存，无需重启即可生效。
-规则与文案分离——本模块只负责「是否告警、告警级别、阈值」，
-文案生成交给 app/ai/diagnosis.py，便于单独测试与调整。
+与 v1.33.0 的差异：
+- 阈值不再只存在于 Settings / rule_config，而是 `alert_rule` 表中的一条条规则
+  （指标、比较方向、阈值、级别、生效范围、启用状态、连续次数、优先级）；
+- 规则由 alert_rule_service 全量加载进进程内缓存 `_RULES`，每次上报实时读缓存，
+  管理端增删改后用 write-through 刷新，**无需重启**即可生效；
+- 历史默认阈值以 `is_default=True` 的 10 条规则落库（迁移/首次启动补齐），
+  连续次数为 1、范围为 global，因此同一份数据在升级前后的判定结果完全一致。
+
+裁决口径（docs/contracts.md 3.4）：
+- 同一指标多条规则同时命中 → **取最高级别**（critical 胜 warning，与 v1.33.0 的
+  「critical 命中后不再叠加 warning」语义一致），同级按 priority 升序、再按 id 升序；
+- 每个指标最终只产一条告警，保持既有抑制/看板/移动端「一条告警一个指标」的语义。
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.config import get_settings
 
-# 进程内阈值覆盖缓存：{settings 属性名: 数值}，由 rule_service 维护
+METRICS = ("voltage", "temperature", "humidity", "rssi")
+LEVELS = ("warning", "critical")
+LEVEL_RANK = {"warning": 1, "critical": 2}
+# 指标物理方向：反向比较（如「电压高于 3.4V 告警」）属于误配，写入时拒绝
+METRIC_OPS = {
+    "voltage": ("lt",),
+    "temperature": ("lt", "gt"),
+    "humidity": ("gt",),
+    "rssi": ("lt",),
+}
+
+# v1.33.0 环境变量/覆盖表的 10 个阈值键 → 默认规则定义。
+# config_key 同时是 rule_config 的主键，升级时据此把在线修改过的阈值带入默认规则。
+DEFAULT_RULE_SPECS: Tuple[Dict, ...] = (
+    {
+        "config_key": "threshold_voltage_critical",
+        "name": "电压过低-严重",
+        "metric": "voltage",
+        "op": "lt",
+        "level": "critical",
+        "priority": 90,
+    },
+    {
+        "config_key": "threshold_voltage_warning",
+        "name": "电压过低-警告",
+        "metric": "voltage",
+        "op": "lt",
+        "level": "warning",
+        "priority": 100,
+    },
+    {
+        "config_key": "threshold_temperature_critical_high",
+        "name": "温度过高-严重",
+        "metric": "temperature",
+        "op": "gt",
+        "level": "critical",
+        "priority": 90,
+    },
+    {
+        "config_key": "threshold_temperature_warning_high",
+        "name": "温度过高-警告",
+        "metric": "temperature",
+        "op": "gt",
+        "level": "warning",
+        "priority": 100,
+    },
+    {
+        "config_key": "threshold_temperature_critical_low",
+        "name": "温度过低-严重",
+        "metric": "temperature",
+        "op": "lt",
+        "level": "critical",
+        "priority": 90,
+    },
+    {
+        "config_key": "threshold_temperature_warning_low",
+        "name": "温度过低-警告",
+        "metric": "temperature",
+        "op": "lt",
+        "level": "warning",
+        "priority": 100,
+    },
+    {
+        "config_key": "threshold_humidity_critical",
+        "name": "湿度偏高-严重",
+        "metric": "humidity",
+        "op": "gt",
+        "level": "critical",
+        "priority": 90,
+    },
+    {
+        "config_key": "threshold_humidity_warning",
+        "name": "湿度偏高-警告",
+        "metric": "humidity",
+        "op": "gt",
+        "level": "warning",
+        "priority": 100,
+    },
+    {
+        "config_key": "threshold_rssi_critical",
+        "name": "信号过弱-严重",
+        "metric": "rssi",
+        "op": "lt",
+        "level": "critical",
+        "priority": 90,
+    },
+    {
+        "config_key": "threshold_rssi_warning",
+        "name": "信号过弱-警告",
+        "metric": "rssi",
+        "op": "lt",
+        "level": "warning",
+        "priority": 100,
+    },
+)
+
+# config_key → thresholds_snapshot 的旧结构位置（兼容 /api/rules/thresholds）
+CONFIG_KEY_TO_SNAPSHOT = {
+    "threshold_voltage_warning": ("voltage", "warning"),
+    "threshold_voltage_critical": ("voltage", "critical"),
+    "threshold_temperature_warning_high": ("temperature", "warning_high"),
+    "threshold_temperature_critical_high": ("temperature", "critical_high"),
+    "threshold_temperature_warning_low": ("temperature", "warning_low"),
+    "threshold_temperature_critical_low": ("temperature", "critical_low"),
+    "threshold_humidity_warning": ("humidity", "warning"),
+    "threshold_humidity_critical": ("humidity", "critical"),
+    "threshold_rssi_warning": ("rssi", "warning"),
+    "threshold_rssi_critical": ("rssi", "critical"),
+}
+
+# 进程内阈值覆盖缓存：{settings 属性名: 数值}，由 rule_service 维护（兼容旧接口）
 _OVERRIDES: Dict[str, float] = {}
+
+# 进程内规则缓存：由 alert_rule_service 在启动/写入后整体替换；None 表示尚未加载，
+# 此时用 Settings + 覆盖合成默认规则，保证纯函数测试与旧调用方式仍可工作。
+_RULES: Optional[List[Dict]] = None
+
+# 连续越限计数：{(device_id, 规则标识): 连续次数}。
+# 只做进程内计数：高频上报场景写入计数表代价过大；重启后清零，最多延迟 N-1 次上报。
+_CONSECUTIVE: Dict[Tuple[str, str], int] = {}
 
 
 def set_overrides(overrides: Dict[str, float]) -> None:
@@ -21,48 +146,114 @@ def set_overrides(overrides: Dict[str, float]) -> None:
     _OVERRIDES.update(overrides)
 
 
+def _sync_rule_threshold(config_key: str, value: Optional[float]) -> None:
+    """把覆盖值同步到已加载的默认规则，保证旧 PUT 接口热生效。"""
+    if _RULES is None:
+        return
+    fallback = getattr(get_settings(), config_key)
+    resolved = float(value) if value is not None else float(fallback)
+    for rule in _RULES:
+        if rule.get("is_default") and rule.get("config_key") == config_key:
+            rule["threshold"] = resolved
+
+
 def patch_override(key: str, value: float) -> None:
     """更新单个覆盖项（PUT 接口写入后调用）。"""
     _OVERRIDES[key] = value
+    _sync_rule_threshold(key, value)
 
 
 def clear_override(key: str) -> None:
     _OVERRIDES.pop(key, None)
+    _sync_rule_threshold(key, None)
 
 
 def overrides_snapshot() -> Dict[str, float]:
     return dict(_OVERRIDES)
 
 
-def _get(attr: str):
-    """取阈值：覆盖缓存优先，其次环境变量配置。"""
-    if attr in _OVERRIDES:
-        return _OVERRIDES[attr]
-    return getattr(get_settings(), attr)
+def default_threshold(config_key: str) -> float:
+    """默认规则阈值：覆盖缓存优先，其次环境变量配置。"""
+    if config_key in _OVERRIDES:
+        return float(_OVERRIDES[config_key])
+    return float(getattr(get_settings(), config_key))
+
+
+def default_rules() -> List[Dict]:
+    """按 Settings + 覆盖合成 10 条默认规则（未从数据库加载时的兜底视图）。"""
+    rules: List[Dict] = []
+    for index, spec in enumerate(DEFAULT_RULE_SPECS, start=1):
+        rules.append(
+            {
+                "id": None,
+                "name": spec["name"],
+                "metric": spec["metric"],
+                "op": spec["op"],
+                "threshold": default_threshold(spec["config_key"]),
+                "level": spec["level"],
+                "scope_type": "global",
+                "scope_value": None,
+                "enabled": True,
+                "consecutive_count": 1,
+                "priority": spec["priority"],
+                "is_default": True,
+                "config_key": spec["config_key"],
+                "_order": index,
+            }
+        )
+    return rules
+
+
+def reset_rules_cache() -> None:
+    """清空规则缓存（进程重启或测试隔离）。"""
+    global _RULES
+    _RULES = None
+    _CONSECUTIVE.clear()
+
+
+def set_rules(rows: Optional[Sequence[Dict]]) -> None:
+    """整体替换规则缓存（None 表示回退到 Settings 合成视图）。"""
+    global _RULES
+    if rows is None:
+        _RULES = None
+        _CONSECUTIVE.clear()
+        return
+    _RULES = [dict(row) for row in rows]
+
+
+def rules_snapshot() -> List[Dict]:
+    """当前生效规则（只读副本），供内部排查与测试。"""
+    return [dict(rule) for rule in (_RULES if _RULES is not None else default_rules())]
+
+
+def reset_consecutive() -> None:
+    """清空连续计数（进程重启或测试隔离）。"""
+    _CONSECUTIVE.clear()
+
+
+def _active_rules() -> List[Dict]:
+    return _RULES if _RULES is not None else default_rules()
+
+
+def _snapshot_rule(config_key: str) -> Optional[Dict]:
+    for rule in _active_rules():
+        if rule.get("is_default") and rule.get("config_key") == config_key:
+            return rule
+    return None
 
 
 def _thresholds() -> Dict:
-    """组装当前生效阈值（覆盖 > 环境变量）。"""
-    return {
-        "voltage": {
-            "warning": (_get("threshold_voltage_warning"), "lt"),
-            "critical": (_get("threshold_voltage_critical"), "lt"),
-        },
-        "temperature": {
-            "critical_high": (_get("threshold_temperature_critical_high"), "gt"),
-            "warning_high": (_get("threshold_temperature_warning_high"), "gt"),
-            "warning_low": (_get("threshold_temperature_warning_low"), "lt"),
-            "critical_low": (_get("threshold_temperature_critical_low"), "lt"),
-        },
-        "humidity": {
-            "warning": (_get("threshold_humidity_warning"), "gt"),
-            "critical": (_get("threshold_humidity_critical"), "gt"),
-        },
-        "rssi": {
-            "warning": (_get("threshold_rssi_warning"), "lt"),
-            "critical": (_get("threshold_rssi_critical"), "lt"),
-        },
-    }
+    """组装当前生效阈值（兼容 v1.33.0 的嵌套结构）。"""
+    result: Dict[str, Dict[str, Tuple[float, str]]] = {}
+    for config_key, (group, name) in CONFIG_KEY_TO_SNAPSHOT.items():
+        rule = _snapshot_rule(config_key)
+        if rule is not None:
+            value, op = float(rule["threshold"]), rule["op"]
+        else:
+            value = default_threshold(config_key)
+            op = next(spec["op"] for spec in DEFAULT_RULE_SPECS if spec["config_key"] == config_key)
+        result.setdefault(group, {})[name] = (value, op)
+    return result
 
 
 def thresholds_snapshot() -> Dict:
@@ -70,49 +261,115 @@ def thresholds_snapshot() -> Dict:
     return _thresholds()
 
 
-def evaluate(report) -> List[Dict]:
-    """对一条上报数据执行规则判定，返回命中的告警列表。
+def _rule_identity(rule: Dict) -> str:
+    if rule.get("id") is None:
+        return f"{rule['name']}:{rule['op']}:{rule['level']}"
+    return f"id:{rule['id']}"
 
-    返回元素结构：
-        {"metric": "voltage", "level": "critical", "value": 2.91, "threshold": 3.2}
-    critical 优先，命中 critical 后不再叠加同指标 warning。
+
+def _in_scope(rule: Dict, device_id: Optional[str], group_name: Optional[str]) -> bool:
+    scope_type = rule.get("scope_type") or "global"
+    if scope_type == "global":
+        return True
+    if scope_type == "group":
+        return bool(group_name) and rule.get("scope_value") == group_name
+    if scope_type == "device":
+        return bool(device_id) and rule.get("scope_value") == device_id
+    return False
+
+
+def _metric_value(report, metric: str) -> Optional[float]:
+    raw = getattr(report, metric, None)
+    if raw is None:
+        return None
+    return float(raw)
+
+
+def _triggered(rule: Dict, value: float) -> bool:
+    # 严格小于/大于：等于阈值不告警，与 v1.33.0 一致
+    if rule["op"] == "lt":
+        return value < float(rule["threshold"])
+    return value > float(rule["threshold"])
+
+
+def _preferred(current: Optional[Dict], candidate: Dict) -> Dict:
+    """同指标裁决：级别高者优先；同级按 priority 升序、再按 id 升序。"""
+    if current is None:
+        return candidate
+    if LEVEL_RANK[candidate["level"]] != LEVEL_RANK[current["level"]]:
+        return candidate if LEVEL_RANK[candidate["level"]] > LEVEL_RANK[current["level"]] else current
+
+    def order(hit: Dict) -> Tuple[int, int, int]:
+        return (
+            hit["priority"],
+            hit["rule_id"] if hit["rule_id"] is not None else 10**9,
+            hit.get("_order") or 0,
+        )
+
+    return candidate if order(candidate) < order(current) else current
+
+
+def evaluate(
+    report,
+    device_id: Optional[str] = None,
+    group_name: Optional[str] = None,
+) -> List[Dict]:
+    """对一条上报执行规则判定，返回命中的告警列表（每指标最多一条）。
+
+    参数：
+    - `report`：含 voltage/temperature/humidity/rssi 字段的上报对象；
+    - `device_id` / `group_name`：用于「指定设备 / 指定分组」范围匹配；缺省时
+      仅 global 规则生效（纯函数测试无需构造设备）。
     """
-    t = _thresholds()
-    hits: List[Dict] = []
+    device = device_id or getattr(report, "device_id", None)
+    hits: Dict[str, Dict] = {}
 
-    def add(metric: str, level: str, value: float, threshold: float):
-        hits.append({"metric": metric, "level": level, "value": float(value), "threshold": float(threshold)})
+    for rule in _active_rules():
+        if not rule.get("enabled", True):
+            continue
+        metric = rule.get("metric")
+        value = _metric_value(report, metric) if metric in METRICS else None
+        if value is None:
+            continue
 
-    # ---- 电压 ----
-    voltage = float(report.voltage)
-    if voltage < t["voltage"]["critical"][0]:
-        add("voltage", "critical", voltage, t["voltage"]["critical"][0])
-    elif voltage < t["voltage"]["warning"][0]:
-        add("voltage", "warning", voltage, t["voltage"]["warning"][0])
+        rule_key = _rule_identity(rule)
+        counter_key = (device or "", rule_key)
+        scoped = _in_scope(rule, device, group_name)
+        triggered = scoped and _triggered(rule, value)
 
-    # ---- 温度（双向）----
-    temperature = float(report.temperature)
-    if temperature > t["temperature"]["critical_high"][0]:
-        add("temperature", "critical", temperature, t["temperature"]["critical_high"][0])
-    elif temperature > t["temperature"]["warning_high"][0]:
-        add("temperature", "warning", temperature, t["temperature"]["warning_high"][0])
-    elif temperature < t["temperature"]["critical_low"][0]:
-        add("temperature", "critical", temperature, t["temperature"]["critical_low"][0])
-    elif temperature < t["temperature"]["warning_low"][0]:
-        add("temperature", "warning", temperature, t["temperature"]["warning_low"][0])
+        if not triggered:
+            _CONSECUTIVE.pop(counter_key, None)
+            continue
 
-    # ---- 湿度 ----
-    humidity = float(report.humidity)
-    if humidity > t["humidity"]["critical"][0]:
-        add("humidity", "critical", humidity, t["humidity"]["critical"][0])
-    elif humidity > t["humidity"]["warning"][0]:
-        add("humidity", "warning", humidity, t["humidity"]["warning"][0])
+        count = _CONSECUTIVE.get(counter_key, 0) + 1
+        _CONSECUTIVE[counter_key] = count
+        if count < int(rule.get("consecutive_count") or 1):
+            continue
 
-    # ---- 信号强度 ----
-    rssi = int(report.rssi)
-    if rssi < t["rssi"]["critical"][0]:
-        add("rssi", "critical", rssi, t["rssi"]["critical"][0])
-    elif rssi < t["rssi"]["warning"][0]:
-        add("rssi", "warning", rssi, t["rssi"]["warning"][0])
+        hit = {
+            "metric": metric,
+            "level": rule["level"],
+            "value": value,
+            "threshold": float(rule["threshold"]),
+            "rule_id": rule.get("id"),
+            "rule_name": rule["name"],
+            "op": rule["op"],
+            "consecutive_count": int(rule.get("consecutive_count") or 1),
+            "priority": rule.get("priority", 100),
+            "_order": rule.get("_order") or rule.get("id") or 0,
+        }
+        hits[metric] = _preferred(hits.get(metric), hit)
 
-    return hits
+    return [
+        {
+            "metric": hit["metric"],
+            "level": hit["level"],
+            "value": hit["value"],
+            "threshold": hit["threshold"],
+            "rule_id": hit["rule_id"],
+            "rule_name": hit["rule_name"],
+            "op": hit["op"],
+            "consecutive_count": hit["consecutive_count"],
+        }
+        for hit in hits.values()
+    ]

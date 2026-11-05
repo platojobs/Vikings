@@ -40,10 +40,17 @@ async def _recent_alert_exists(session: AsyncSession, device_id: str, metric: st
 
 
 async def handle_report_alerts(
-    session: AsyncSession, report: SensorReportMessage, device_name: str
+    session: AsyncSession,
+    report: SensorReportMessage,
+    device_name: str,
+    group_name: Optional[str] = None,
 ) -> List[Dict]:
-    """对一条上报执行完整告警链路，返回需要发布到 device/system/alert 的报文列表。"""
-    hits = evaluate(report)
+    """对一条上报执行完整告警链路，返回需要发布到 device/system/alert 的报文列表。
+
+    v1.34.0：判定读取 alert_rule 规则缓存（支持分组/设备范围），命中结果带
+    matched_rule 快照并原样返回给 MQTT；规则变更无需重启即生效。
+    """
+    hits = evaluate(report, device_id=report.device_id, group_name=group_name)
     if not hits:
         return []
 
@@ -67,6 +74,16 @@ async def handle_report_alerts(
     # SLA 时限在创建时快照：之后修改配置只影响新告警，历史判定可复盘
     sla_config = await sla_service.get_or_create_config(session)
     for hit, (text, ai_generated) in zip(candidates, texts):
+        # 规则快照：规则后续修改/删除也不影响这条历史告警的解释
+        matched_rule = {
+            "rule_id": hit.get("rule_id"),
+            "rule_name": hit.get("rule_name"),
+            "op": hit.get("op"),
+            "threshold": float(hit["threshold"]),
+            "level": hit["level"],
+            "value": float(hit["value"]),
+            "consecutive": int(hit.get("consecutive_count") or 1),
+        }
         alert = DeviceAlert(
             alert_id="alt-" + uuid.uuid4().hex[:12],
             device_id=report.device_id,
@@ -77,6 +94,7 @@ async def handle_report_alerts(
             message=text,
             ai_generated=ai_generated,
             status="open",
+            matched_rule=matched_rule,
             created_at=now,
         )
         sla_service.apply_deadline(alert, sla_config)
@@ -92,12 +110,14 @@ async def handle_report_alerts(
                 "threshold": float(alert.threshold),
                 "message": alert.message,
                 "aiGenerated": alert.ai_generated,
+                "matchedRule": matched_rule,
                 "ts": int(now.timestamp() * 1000),
             }
         )
         logger.warning(
-            "生成告警 device=%s metric=%s level=%s value=%s threshold=%s ai=%s",
-            report.device_id, hit["metric"], hit["level"], hit["value"], hit["threshold"], ai_generated,
+            "生成告警 device=%s metric=%s level=%s value=%s threshold=%s rule=%s ai=%s",
+            report.device_id, hit["metric"], hit["level"], hit["value"], hit["threshold"],
+            hit.get("rule_name"), ai_generated,
         )
 
     await session.flush()

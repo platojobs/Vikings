@@ -290,6 +290,9 @@ class AlertOut(BaseModel):
     sla_response_seconds: Optional[int] = None
     escalation_count: int = 0
 
+    # v1.34.0：命中的规则快照（历史告警为 None，前端按「默认阈值（历史）」展示）
+    matched_rule: Optional[Dict[str, Any]] = None
+
     model_config = {"from_attributes": True}
 
 
@@ -757,6 +760,67 @@ class PageOut(BaseModel, Generic[T]):
 
 
 # ==================== 阈值在线配置 ====================
+
+
+class AlertRuleCreate(BaseModel):
+    """新建告警规则（v1.34.0）：字段范围按指标物理意义约束，越界返回 400。
+
+    NaN/Inf 不在 Pydantic 层拦截（带 NaN 的 422 响应本身无法序列化），
+    由服务层统一校验并返回可读的 400。
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    metric: Literal["voltage", "temperature", "humidity", "rssi"]
+    op: Literal["lt", "gt"]
+    threshold: float
+    level: Literal["warning", "critical"]
+    scope_type: Literal["global", "group", "device"] = "global"
+    scope_value: Optional[str] = Field(default=None, max_length=64)
+    enabled: bool = True
+    consecutive_count: int = Field(default=1, ge=1, le=20)
+    priority: int = Field(default=100, ge=1, le=1000)
+
+
+class AlertRuleUpdate(BaseModel):
+    """更新告警规则：未传字段保持不变；其余约束与新建一致。"""
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    metric: Optional[Literal["voltage", "temperature", "humidity", "rssi"]] = None
+    op: Optional[Literal["lt", "gt"]] = None
+    threshold: Optional[float] = None
+    level: Optional[Literal["warning", "critical"]] = None
+    scope_type: Optional[Literal["global", "group", "device"]] = None
+    # 显式传空串表示把范围改回全局；null 表示保持原值（与通知规则的「未传不变」一致）
+    scope_value: Optional[str] = Field(default=None, max_length=64)
+    enabled: Optional[bool] = None
+    consecutive_count: Optional[int] = Field(default=None, ge=1, le=20)
+    priority: Optional[int] = Field(default=None, ge=1, le=1000)
+
+
+class AlertRuleEnabledUpdate(BaseModel):
+    """启用/停用：独立端点，避免把「只改开关」误做成整条规则覆盖。"""
+
+    enabled: bool
+
+
+class AlertRuleOut(BaseModel):
+    id: int
+    name: str
+    metric: str
+    op: str
+    threshold: float
+    level: str
+    scope_type: str
+    scope_value: Optional[str] = None
+    enabled: bool
+    consecutive_count: int
+    priority: int
+    is_default: bool
+    updated_by: str = "system"
+    updated_at: Optional[datetime] = None
+    # 前端展示「最近修改人/时间」时无需再查审计
+
+    model_config = {"from_attributes": True}
 
 
 class ThresholdsUpdateRequest(BaseModel):

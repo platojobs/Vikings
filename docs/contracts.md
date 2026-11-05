@@ -176,9 +176,21 @@ Broker 的 1883（MQTT over TCP）与 9001（MQTT over WebSocket）**均关闭�
   "threshold": 3.2,
   "message": "设备 dev-0001 电池电压 2.91V 已低于安全阈值 3.2V，存在随时掉电风险，建议立即安排现场更换电池。",
   "aiGenerated": true,
+  "matchedRule": {
+    "rule_id": 12,
+    "rule_name": "电压过低-严重",
+    "op": "lt",
+    "threshold": 3.2,
+    "level": "critical",
+    "value": 2.91,
+    "consecutive": 1
+  },
   "ts": 1762137600000
 }
 ```
+
+`matchedRule` 为 v1.34.0 附加字段：命中的规则快照（规则后续被修改/删除也不影响这条报文的解释）。
+附加字段不破坏旧客户端解析；`device_alert.matched_rule` 与之一致，历史告警为 `null`。
 
 ### 2.6 设备分组变更 `device/system/group`（v1.14.0）
 
@@ -444,6 +456,18 @@ v1.21.0 之前已确认的历史行**不做臆测回填**：无法得知真实�
 页面显示「历史确认（无处置记录）」。重复确认（`already_acked`）不覆盖首次
 `acked_by` / `acked_at` / `ack_note`，保证处置证据稳定。
 
+**命中规则（v1.34.0）**：`AlertOut` 新增可选 `matched_rule`，回答「为什么触发」：
+
+```json
+{
+  "rule_id": 12, "rule_name": "电压过低-严重", "op": "lt",
+  "threshold": 3.2, "level": "critical", "value": 2.91, "consecutive": 1
+}
+```
+
+规则后续被修改或删除都不改写该快照；v1.34.0 之前的历史告警为 `null`，
+Web 显示「默认阈值（历史）」。裁决口径见 3.4。
+
 #### 3.3.1 批量确认 `POST /api/alerts/bulk-ack`（v1.15.0；v1.21.0 增备注）
 
 | 项 | 契约 |
@@ -543,21 +567,70 @@ Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正�
 
 `alert.handover` 的 `handover` 块：`{fromUser, to, operator, count, windowStart, windowEnd, note, message}`。
 
-### 3.4 阈值在线配置
+### 3.4 告警规则（v1.34.0）与旧阈值接口兼容
 
-| 方法 | 路径 | 说明 |
+规则 = 指标 + 比较方向 + 阈值 + 级别 + 生效范围 + 启用状态 + 连续次数 + 优先级。
+级别仍只有 `warning` / `critical`（沿用 v1.21.0 收窄口径）。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/rules` | 登录可读 | 规则列表；`operator` / `viewer` 只读 |
+| POST | `/api/rules` | admin | 新增规则；校验失败 400（中文可读原因） |
+| PUT | `/api/rules/{ruleId}` | admin | 修改规则；只传需要变更的字段 |
+| PATCH | `/api/rules/{ruleId}/enabled` | admin | 启停，入参 `{enabled: bool}`；审计 `alert_rule.enable/disable` |
+| DELETE | `/api/rules/{ruleId}` | admin | 删除规则（不可恢复；需保留判定依据时优先停用） |
+| POST | `/api/rules/restore-defaults` | admin | 默认规则阈值回滚到环境变量/出厂值，自定义规则不动 |
+| GET | `/api/rules/thresholds` | 登录可读 | **v1.33.0 兼容**：由默认规则推导的分组视图，每项 `{value, source}` |
+| PUT | `/api/rules/thresholds` | admin | **v1.33.0 兼容**：只传待改键；同步写 `rule_config` 与默认规则 |
+
+**规则字段**
+
+| 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| GET | `/api/rules/thresholds` | 当前生效阈值（分组视图），每项标注 `source`：override=在线覆盖 / env=环境变量 |
-| PUT | `/api/rules/thresholds` | 在线更新，入参只传待改键（如 `{voltage_warning: 3.3}`），持久化到 `rule_config` 并即时生效，写入审计日志 |
+| `name` | string ≤64 | 规则名称，告警详情展示 |
+| `metric` | `voltage` / `temperature` / `humidity` / `rssi` | 指标 |
+| `op` | `lt` / `gt` | `lt`=低于阈值触发，`gt`=高于阈值触发；等于阈值**不**触发（与 v1.33.0 一致） |
+| `threshold` | number | 阈值；范围 voltage 2~4.5、temperature -40~85、humidity 0~100、rssi -150~0 |
+| `level` | `warning` / `critical` | 级别 |
+| `scope_type` | `global` / `group` / `device` | 生效范围 |
+| `scope_value` | string \| null | 分组名或设备 ID；`global` 时强制为 null，其余必填 |
+| `enabled` | bool | 停用后不参与判定，历史告警与统计不变 |
+| `consecutive_count` | int 1~20 | 连续 N 次上报越限才触发；1 = 首次越限即触发 |
+| `priority` | int 1~1000 | 同指标同级别多条命中时数字小者优先 |
+| `is_default` | bool | 是否 v1.33.0 默认阈值的种子规则 |
+| `updated_by` / `updated_at` | string / ISO8601 | 最近修改人与时间 |
 
-可配置键共 10 项：`voltage_warning/critical`、`temperature_warning_high/critical_high/warning_low/critical_low`、
-`humidity_warning/critical`、`rssi_warning/critical`，取值范围按物理意义校验（见网关 `ThresholdsUpdateRequest`）。
+**方向与级别校验**：`voltage`/`rssi` 只允许 `lt`，`humidity` 只允许 `gt`，`temperature` 两者皆可；
+同指标、同方向、同范围下 critical 必须比 warning 更严格（lt：critical < warning；gt：critical > warning），
+反向配置返回 400；NaN/Inf、越界、分组/设备范围缺值同样 400。
+
+**裁决口径（v1.34.0 选定：同指标取最高级别）**
+
+1. 一条上报可同时命中同指标的多条规则（如电压 2.9V 同时低于 critical 3.2 与 warning 3.4）；
+2. **取最高级别**：critical 胜 warning——安全语义不能被低优先级规则掩盖，也与 v1.33.0
+   「critical 命中后不再叠加同指标 warning」的既有行为一致；
+3. 同级多条命中时，按 `priority` 升序、再按 `id` 升序取第一条；
+4. **每个指标最多产出一条告警**，保持既有抑制窗口、看板与移动端「一条告警一个指标」语义；
+5. 连续次数按 `(设备, 规则)` 在进程内计数：越限 +1、未越限清零；网关重启清零，
+   最多延迟 N-1 次上报（不建持久计数表，避免高频写库）。
+
+**运行时生效**：规则全量缓存在网关进程内，每次上报读缓存；管理端写入后 write-through
+重载缓存，无需重启。代价是单实例部署前提（多实例需各自刷新），MQTT 热路径不查库。
+
+**审计**：`alert_rule.create/update/enable/disable/delete/restore_defaults`；
+`detail` 只记录 `name`、`rule_id` 与**变更字段名**，不记录阈值等具体数值。
+
+**向后兼容**：升级时把 v1.33.0 的 10 个硬编码阈值（`rule_config` 在线覆盖优先，否则环境变量默认）
+写成 `is_default=true` 的默认规则，范围 global、连续次数 1；因此同一份数据升级前后告警结果一致
+（证据见 `gateway/tests/test_alert_rules.py::test_upgrade_behavior_matches_v133_samples` 与
+`scripts/verify_alert_rules_v134.py`）。旧 `/api/rules/thresholds` 保存时同步写默认规则，
+重启后不回退。
 
 ### 3.5 审计日志
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） / `notify.rule_create` / `notify.rule_update` / `notify.rule_delete`（v1.31.0） |
+| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） / `notify.rule_create` / `notify.rule_update` / `notify.rule_delete`（v1.31.0） / `alert_rule.create/update/enable/disable/delete/restore_defaults`（v1.34.0） |
 
 ### 3.6 告警通知通道（v1.29.0）
 
@@ -1115,6 +1188,7 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | sla_deadline_at | timestamptz NOT NULL | 创建时计算的截止时间 = `created_at + sla_minutes`（v1.33.0） |
 | escalation_count | int NOT NULL DEFAULT 0 | 已发出的升级次数（v1.33.0），满上限即停止 |
 | last_escalated_at | timestamptz NULL | 最近一次升级时间（v1.33.0） |
+| matched_rule | jsonb NULL | 命中规则快照（v1.34.0）：`rule_id/rule_name/op/threshold/level/value/consecutive`；历史行为 NULL |
 
 索引 `idx_alert_status_sla_deadline(status, sla_deadline_at)` 支撑巡检与「已超时」筛选。
 
@@ -1160,7 +1234,7 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 > 原需求「三张表足够」指核心业务三张表；OTA 管理页需要持久化任务与回执状态，
 > 因此额外增加 `device_command`、`ota_task` 两张支撑表，属于同一业务域，不引入额外技术栈。
 
-### `rule_config` 阈值在线配置表
+### `rule_config` 阈值在线配置表（v1.34.0 起为兼容层）
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -1169,8 +1243,32 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | updated_by | varchar(64) | 最后修改人 |
 | updated_at | timestamptz | 最后修改时间 |
 
-规则引擎读取顺序：`rule_config` 覆盖缓存 → 环境变量 → 代码默认值。网关启动时全量加载，
-PUT 接口更新后即时刷新进程内缓存，无需重启。
+v1.34.0 起判定读 `alert_rule` 表；本表由旧 `/api/rules/thresholds` 写入时同步维护，
+并作为 downgrade 回 v1.33.0 后的阈值来源。启动时仍全量加载进进程缓存，供旧接口视图使用。
+
+### `alert_rule` 告警规则表（v1.34.0）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigserial PK | 自增 |
+| name | varchar(64) | 规则名称（告警详情展示） |
+| metric | varchar(32) | voltage / temperature / humidity / rssi |
+| op | varchar(8) | lt（低于触发）/ gt（高于触发） |
+| threshold | numeric(10,2) | 阈值 |
+| level | varchar(16) | warning / critical |
+| scope_type | varchar(16) | global / group / device |
+| scope_value | varchar(64) NULL | 分组名或设备 ID；global 为 NULL |
+| enabled | boolean | 停用后不参与判定 |
+| consecutive_count | int DEFAULT 1 | 连续 N 次越限才触发（1~20） |
+| priority | int DEFAULT 100 | 同指标同级别裁决顺序（小者优先） |
+| is_default | boolean DEFAULT false | v1.33.0 默认阈值种子（共 10 条） |
+| created_at / updated_at | timestamptz | 时间戳，`updated_at` 供「最近修改时间」展示 |
+| updated_by | varchar(64) | 最近修改人 |
+
+索引：`idx_alert_rule_metric(metric)`、`idx_alert_rule_scope(scope_type, scope_value)`。
+
+默认规则由迁移 `0009_alert_rules` 种子（读取 `rule_config` 覆盖值，否则 v1.33.0 默认阈值），
+空表时网关启动也会幂等补齐。downgrade 会删除本表与 `device_alert.matched_rule`。
 
 ### `audit_log` 审计日志表
 
@@ -1178,14 +1276,16 @@ PUT 接口更新后即时刷新进程内缓存，无需重启。
 | --- | --- | --- |
 | id | bigserial PK | 自增 |
 | operator | varchar(64) | 操作人（登录用户名） |
-| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / notify.config_update / user.* / device.* |
-| target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config / app_user） |
+| action | varchar(32) | 动作：login / command.create / ota.create / alert.ack / threshold.update / alert_rule.* / notify.config_update / user.* / device.* |
+| target_type | varchar(32) | 目标类型（device / alert / ota_task / rule_config / alert_rule / app_user） |
 | target_id | varchar(64) | 目标标识 |
-| detail | jsonb | 动作上下文（如指令类型、阈值变更明细） |
+| detail | jsonb | 动作上下文（如指令类型、阈值变更明细；告警规则只记字段名，不记阈值） |
 | created_at | timestamptz | 操作时间，索引 |
 
 动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` /
-`threshold.update` / `notify.config_update` / `user.create` / `user.update` / `user.delete`。
+`threshold.update` / `notify.config_update` / `user.create` / `user.update` / `user.delete` /
+`alert_rule.create` / `alert_rule.update` / `alert_rule.enable` / `alert_rule.disable` /
+`alert_rule.delete` / `alert_rule.restore_defaults`（v1.34.0）。
 
 ### `app_user` 后台账号表
 

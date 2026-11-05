@@ -229,6 +229,19 @@ export interface AlertItem {
   sla_remaining_seconds?: number | null
   sla_response_seconds?: number | null
   escalation_count?: number
+  /** v1.34.0：命中的规则快照（规则 ID/名称、方向、阈值、级别、实际值、连续次数）；历史告警为 null */
+  matched_rule?: AlertMatchedRule | null
+}
+
+/** 告警命中的规则快照（设备告警详情「为什么触发」） */
+export interface AlertMatchedRule {
+  rule_id: number | null
+  rule_name: string
+  op: 'lt' | 'gt'
+  threshold: number
+  level: AlertLevel
+  value: number
+  consecutive: number
 }
 
 export type SlaState = 'met' | 'late' | 'pending' | 'overdue' | 'unknown'
@@ -297,7 +310,47 @@ export interface AlertSummary {
   overdue_open?: number
 }
 
-// ==================== 阈值在线配置 ====================
+// ==================== 告警规则（v1.34.0） ====================
+
+export type AlertMetric = 'voltage' | 'temperature' | 'humidity' | 'rssi'
+export type AlertRuleScope = 'global' | 'group' | 'device'
+
+/** GET /api/rules 列表项；阈值单位为指标本身单位（V / ℃ / % / dBm） */
+export interface AlertRule {
+  id: number
+  name: string
+  metric: AlertMetric
+  op: 'lt' | 'gt'
+  threshold: number
+  level: AlertLevel
+  scope_type: AlertRuleScope
+  scope_value: string | null
+  enabled: boolean
+  consecutive_count: number
+  priority: number
+  is_default: boolean
+  updated_by: string
+  updated_at?: string | null
+}
+
+/** POST /api/rules 入参 */
+export interface AlertRuleCreateBody {
+  name: string
+  metric: AlertMetric
+  op: 'lt' | 'gt'
+  threshold: number
+  level: AlertLevel
+  scope_type: AlertRuleScope
+  scope_value?: string | null
+  enabled?: boolean
+  consecutive_count?: number
+  priority?: number
+}
+
+/** PUT /api/rules/{id} 入参：只传需要修改的字段 */
+export type AlertRuleUpdateBody = Partial<AlertRuleCreateBody>
+
+// ==================== 阈值在线配置（v1.33.0 兼容） ====================
 
 /** 单项阈值的生效值与来源（override=在线覆盖 / env=环境变量） */
 export interface ThresholdEntry {
@@ -345,6 +398,12 @@ export type AuditAction =
   | 'ota.create'
   | 'alert.ack'
   | 'threshold.update'
+  | 'alert_rule.create'
+  | 'alert_rule.update'
+  | 'alert_rule.enable'
+  | 'alert_rule.disable'
+  | 'alert_rule.delete'
+  | 'alert_rule.restore_defaults'
 
 export interface AuditLog {
   id: number

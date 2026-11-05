@@ -1,11 +1,13 @@
 <script setup lang="ts">
 /**
- * 告警中心：统计卡片 + 筛选列表 + 单条/批量确认（含处置备注）+ 阈值在线配置。
+ * 告警中心：统计卡片 + 筛选列表 + 单条/批量确认（含处置备注）。
  * 订阅 device/system/alert，新告警实时插入列表头部并弹通知。
  * v1.21.0：批量确认复用 POST /api/alerts/bulk-ack，部分失败逐类展示；
  * viewer 只读，多选与确认按钮禁用并给出说明。
  * v1.30.0：新增时间范围筛选与「导出 CSV」，列表与导出共用同一套筛选参数。
  * v1.33.0：SLA 状态列与「已超时」筛选；值班交接（二次确认，operator/admin）。
+ * v1.34.0：移除阈值抽屉（改由系统设置「告警规则」管理），新增「触发规则」列展示
+ *          matched_rule，解释这条告警命中了哪条规则、阈值多少、实际值多少。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
@@ -17,9 +19,8 @@ import {
   handoverAlerts,
 } from '@/api/alerts'
 import { exportAlerts, formatBytes } from '@/api/exports'
-import { fetchThresholds, updateThresholds } from '@/api/rules'
 import { subscribe } from '@/services/mqtt'
-import { canOperate, isAdmin } from '@/utils/permissions'
+import { canOperate } from '@/utils/permissions'
 import { formatDateTime } from '@/utils/format'
 import { summarizeBulkAck, type BulkAckSummary } from '@/utils/alertSummary'
 import {
@@ -31,18 +32,16 @@ import {
 import type {
   AlertItem,
   AlertLevel,
+  AlertMatchedRule,
   AlertSummary,
   SlaState,
   SystemAlertMessage,
-  ThresholdsUpdateBody,
-  ThresholdsView,
 } from '@/types'
 
 // ==================== 统计卡片 ====================
 
-/** 只读角色不能确认告警；阈值配置仅管理员可见 */
+/** 只读角色不能确认告警；规则配置统一在系统设置中管理 */
 const canWrite = computed(() => canOperate())
-const isAdminOnly = computed(() => isAdmin())
 
 const summary = ref<AlertSummary>({ open: 0, critical_open: 0, today: 0, overdue_open: 0 })
 
@@ -385,126 +384,34 @@ const unsubscribeAlert = subscribe('device/system/alert', (payload) => {
   loadSummary()
 })
 
-// ==================== 阈值在线配置 ====================
+// ==================== 触发规则解释（v1.34.0） ====================
 
-/** 表单字段定义：api 键 → 文案与取值约束（与后端 ThresholdsUpdateRequest 一致） */
-const THRESHOLD_FIELDS = [
-  { group: '电压（V）', key: 'voltage_warning', label: '警告阈值', min: 2.0, max: 4.5, step: 0.1 },
-  { group: '电压（V）', key: 'voltage_critical', label: '严重阈值', min: 2.0, max: 4.5, step: 0.1 },
-  { group: '温度（℃）', key: 'temperature_warning_high', label: '警告上限', min: -40, max: 85, step: 1 },
-  { group: '温度（℃）', key: 'temperature_critical_high', label: '严重上限', min: -40, max: 85, step: 1 },
-  { group: '温度（℃）', key: 'temperature_warning_low', label: '警告下限', min: -40, max: 85, step: 1 },
-  { group: '温度（℃）', key: 'temperature_critical_low', label: '严重下限', min: -40, max: 85, step: 1 },
-  { group: '湿度（%）', key: 'humidity_warning', label: '警告阈值', min: 0, max: 100, step: 1 },
-  { group: '湿度（%）', key: 'humidity_critical', label: '严重阈值', min: 0, max: 100, step: 1 },
-  { group: '信号强度（dBm）', key: 'rssi_warning', label: '警告阈值', min: -150, max: 0, step: 1 },
-  { group: '信号强度（dBm）', key: 'rssi_critical', label: '严重阈值', min: -150, max: 0, step: 1 },
-] as const
-
-type ThresholdKey = (typeof THRESHOLD_FIELDS)[number]['key']
-
-const thresholdDrawer = ref(false)
-const thresholdLoading = ref(false)
-const thresholdSaving = ref(false)
-const thresholdForm = reactive<Record<ThresholdKey, number>>({
-  voltage_warning: 0,
-  voltage_critical: 0,
-  temperature_warning_high: 0,
-  temperature_critical_high: 0,
-  temperature_warning_low: 0,
-  temperature_critical_low: 0,
-  humidity_warning: 0,
-  humidity_critical: 0,
-  rssi_warning: 0,
-  rssi_critical: 0,
-})
-/** 打开抽屉时的快照，用于 diff 出实际修改的键 */
-const thresholdSnapshot = ref<Record<ThresholdKey, number> | null>(null)
-const thresholdSources = ref<Partial<Record<ThresholdKey, 'override' | 'env'>>>({})
-
-/** 把后端分组视图拍平成 { api键: 值 } */
-function flattenThresholds(view: ThresholdsView): Record<ThresholdKey, number> {
-  return {
-    voltage_warning: view.voltage.warning.value,
-    voltage_critical: view.voltage.critical.value,
-    temperature_warning_high: view.temperature.warning_high.value,
-    temperature_critical_high: view.temperature.critical_high.value,
-    temperature_warning_low: view.temperature.warning_low.value,
-    temperature_critical_low: view.temperature.critical_low.value,
-    humidity_warning: view.humidity.warning.value,
-    humidity_critical: view.humidity.critical.value,
-    rssi_warning: view.rssi.warning.value,
-    rssi_critical: view.rssi.critical.value,
-  }
+const METRIC_UNITS: Record<string, string> = {
+  voltage: 'V',
+  temperature: '℃',
+  humidity: '%',
+  rssi: 'dBm',
 }
 
-function flattenSources(view: ThresholdsView): Partial<Record<ThresholdKey, 'override' | 'env'>> {
-  return {
-    voltage_warning: view.voltage.warning.source,
-    voltage_critical: view.voltage.critical.source,
-    temperature_warning_high: view.temperature.warning_high.source,
-    temperature_critical_high: view.temperature.critical_high.source,
-    temperature_warning_low: view.temperature.warning_low.source,
-    temperature_critical_low: view.temperature.critical_low.source,
-    humidity_warning: view.humidity.warning.source,
-    humidity_critical: view.humidity.critical.source,
-    rssi_warning: view.rssi.warning.source,
-    rssi_critical: view.rssi.critical.source,
-  }
+function ruleDirection(op?: 'lt' | 'gt'): string {
+  return op === 'gt' ? '高于' : '低于'
 }
 
-async function openThresholdDrawer(): Promise<void> {
-  thresholdDrawer.value = true
-  thresholdLoading.value = true
-  try {
-    const view = await fetchThresholds()
-    const flat = flattenThresholds(view)
-    Object.assign(thresholdForm, flat)
-    thresholdSnapshot.value = flat
-    thresholdSources.value = flattenSources(view)
-  } catch {
-    thresholdDrawer.value = false
-  } finally {
-    thresholdLoading.value = false
-  }
+/** 表格副行：方向 + 阈值（带单位） */
+function ruleThresholdText(rule: AlertMatchedRule, metric: string): string {
+  const unit = METRIC_UNITS[metric] ?? ''
+  return `${ruleDirection(rule.op)} ${rule.threshold}${unit}`
 }
 
-async function handleSaveThresholds(): Promise<void> {
-  if (!thresholdSnapshot.value) return
-  // 只提交发生变化的键，避免无意义的全量覆盖与审计噪音
-  const body: ThresholdsUpdateBody = {}
-  for (const field of THRESHOLD_FIELDS) {
-    const key = field.key
-    if (thresholdForm[key] !== thresholdSnapshot.value[key]) {
-      body[key] = Number(thresholdForm[key])
-    }
-  }
-  if (Object.keys(body).length === 0) {
-    ElMessage.info('阈值没有变化')
-    return
-  }
-
-  thresholdSaving.value = true
-  try {
-    const result = await updateThresholds(body)
-    const flat = flattenThresholds(result.thresholds)
-    Object.assign(thresholdForm, flat)
-    thresholdSnapshot.value = flat
-    thresholdSources.value = flattenSources(result.thresholds)
-    ElMessage.success(`已更新 ${Object.keys(result.updated).length} 项阈值，即时生效`)
-  } catch {
-    // 错误提示已由 HTTP 层统一处理
-  } finally {
-    thresholdSaving.value = false
-  }
-}
-
-function sourceTagType(source?: 'override' | 'env'): 'warning' | 'info' {
-  return source === 'override' ? 'warning' : 'info'
-}
-
-function sourceLabel(source?: 'override' | 'env'): string {
-  return source === 'override' ? '在线配置' : '环境变量'
+/** 悬浮提示：完整回答「为什么触发」（规则名、条件、实际值、连续次数） */
+function ruleExplain(row: AlertItem): string {
+  const rule = row.matched_rule
+  if (!rule) return 'v1.34.0 之前的历史告警没有规则快照，按当时的默认阈值判定'
+  const unit = METRIC_UNITS[row.metric] ?? ''
+  const ruleRef = rule.rule_id ? `规则 #${rule.rule_id}` : '默认规则'
+  const continuity = rule.consecutive > 1 ? `，连续 ${rule.consecutive} 次越限` : ''
+  return `${ruleRef}「${rule.rule_name}」：${alertMetricLabel(row.metric)}${ruleDirection(rule.op)} ` +
+    `${rule.threshold}${unit}，实际 ${rule.value}${unit}${continuity}，按 ${rule.level} 级别产生告警`
 }
 
 onMounted(() => {
@@ -592,9 +499,6 @@ onUnmounted(() => {
         <el-button v-if="canWrite" type="primary" plain @click="openHandover">
           值班交接
         </el-button>
-        <el-button v-if="isAdminOnly" type="warning" plain @click="openThresholdDrawer">
-          阈值配置
-        </el-button>
       </div>
     </el-card>
 
@@ -650,6 +554,31 @@ onUnmounted(() => {
           <template #default="{ row }">
             <span class="value-text">{{ row.value }}</span>
             <span class="threshold-text"> / {{ row.threshold }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="触发规则" min-width="190">
+          <template #default="{ row }">
+            <template v-if="row.matched_rule">
+              <el-tooltip :content="ruleExplain(row)" placement="top">
+                <el-tag
+                  size="small"
+                  effect="plain"
+                  :type="alertLevelTagType(row.matched_rule.level)"
+                >
+                  {{ row.matched_rule.rule_name }}
+                </el-tag>
+              </el-tooltip>
+              <div class="rule-meta">
+                {{ ruleThresholdText(row.matched_rule, row.metric) }} · 实际 {{ row.matched_rule.value }}
+              </div>
+            </template>
+            <el-tooltip
+              v-else
+              content="v1.34.0 之前的历史告警按当时的硬编码默认阈值判定，没有规则快照"
+              placement="top"
+            >
+              <span class="acked-hint">默认阈值（历史）</span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="告警内容" min-width="240" show-overflow-tooltip>
@@ -801,50 +730,6 @@ onUnmounted(() => {
         </el-button>
       </template>
     </el-dialog>
-
-    <el-drawer
-      v-model="thresholdDrawer"
-      title="告警阈值在线配置"
-      size="480px"
-      destroy-on-close
-    >
-      <div v-loading="thresholdLoading" class="threshold-body">
-        <el-alert type="info" :closable="false" class="threshold-tip">
-          修改即时生效并持久化，重启网关后仍然保留；标为「在线配置」的项优先于环境变量。
-        </el-alert>
-
-        <template v-for="groupName in ['电压（V）', '温度（℃）', '湿度（%）', '信号强度（dBm）']" :key="groupName">
-          <div class="threshold-group">{{ groupName }}</div>
-          <div
-            v-for="field in THRESHOLD_FIELDS.filter((f) => f.group === groupName)"
-            :key="field.key"
-            class="threshold-item"
-          >
-            <span class="threshold-label">{{ field.label }}</span>
-            <el-input-number
-              v-model="thresholdForm[field.key]"
-              :min="field.min"
-              :max="field.max"
-              :step="field.step"
-              controls-position="right"
-              class="threshold-input"
-            />
-            <el-tag :type="sourceTagType(thresholdSources[field.key])" size="small" effect="plain">
-              {{ sourceLabel(thresholdSources[field.key]) }}
-            </el-tag>
-          </div>
-        </template>
-
-        <el-button
-          type="primary"
-          class="threshold-save"
-          :loading="thresholdSaving"
-          @click="handleSaveThresholds"
-        >
-          保存并生效
-        </el-button>
-      </div>
-    </el-drawer>
   </div>
 </template>
 
@@ -944,41 +829,10 @@ onUnmounted(() => {
   margin-top: 16px;
 }
 
-.threshold-body {
-  padding-bottom: 24px;
-}
-
-.threshold-tip {
-  margin-bottom: 16px;
-}
-
-.threshold-group {
-  margin: 16px 0 8px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #475569;
-}
-
-.threshold-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.threshold-label {
-  width: 72px;
-  font-size: 13px;
+.rule-meta {
+  margin-top: 2px;
+  font-size: 12px;
   color: #64748b;
-}
-
-.threshold-input {
-  flex: 1;
-}
-
-.threshold-save {
-  width: 100%;
-  margin-top: 20px;
 }
 
 /* v1.21.0 批量确认与处置信息 */

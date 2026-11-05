@@ -19,7 +19,10 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0008_alert_sla_handover"
+HEAD = "0009_alert_rules"
+# v1.34.0 规则表与命中规则快照列
+ALERT_RULE_INDEXES = {"idx_alert_rule_metric", "idx_alert_rule_scope"}
+MATCHED_RULE_COLUMN = {"matched_rule"}
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
@@ -105,11 +108,14 @@ def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
     with sqlite3.connect(db_path) as con:
         for name in NEW_INDEXES:
             con.execute(f"DROP INDEX {name}")
-        # create_all 会带上最新模型列；删掉它们才等价于 v1.32 生产库
+        # create_all 会带上最新模型列；删掉它们才等价于 v1.33.0 生产库
         for name in ACK_COLUMNS:
             con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
         for name in SLA_COLUMNS:
             con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
+        for name in MATCHED_RULE_COLUMN:
+            con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
+        con.execute("DROP TABLE alert_rule")
         # SQLite 删列会连带删除基于该列的索引（idx_alert_status_sla_deadline）
         con.execute("DROP TABLE sla_config")
         for name in DELIVERY_SLA_COLUMNS:
@@ -150,8 +156,11 @@ def test_upgrade_on_empty_database(tmp_path):
         "notification_rule",
         # v1.33.0 SLA 配置
         "sla_config",
+        # v1.34.0 可配置告警规则
+        "alert_rule",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
+    assert ALERT_RULE_INDEXES <= _index_names(db_path)
     assert {
         "idx_notify_delivery_status_next",
         "idx_notify_delivery_channel_created",
@@ -159,6 +168,19 @@ def test_upgrade_on_empty_database(tmp_path):
     } <= _index_names(db_path)
     assert DELIVERY_RETRY_COLUMNS <= _delivery_columns(db_path)
     assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert MATCHED_RULE_COLUMN <= _alert_columns(db_path)
+    # 空库升级也必须补齐 10 条默认规则，且阈值与 v1.33.0 默认值一致
+    with sqlite3.connect(db_path) as con:
+        rules = con.execute(
+            "select metric, op, level, threshold, scope_type, enabled, consecutive_count "
+            "from alert_rule order by metric, priority, id"
+        ).fetchall()
+    assert len(rules) == 10
+    assert rules[0] == ("humidity", "gt", "critical", 97, "global", 1, 1)
+    assert ("voltage", "lt", "critical", 3.2, "global", 1, 1) in rules
+    assert ("voltage", "lt", "warning", 3.4, "global", 1, 1) in rules
+    assert ("temperature", "gt", "critical", 75, "global", 1, 1) in rules
+    assert ("rssi", "lt", "critical", -110, "global", 1, 1) in rules
     assert _alembic_version(db_path) == HEAD
 
 
@@ -187,6 +209,16 @@ def test_existing_database_is_stamped_and_data_preserved(tmp_path):
     assert ACK_COLUMNS <= _alert_columns(db_path)
     assert SLA_COLUMNS <= _alert_columns(db_path)
     assert DELIVERY_SLA_COLUMNS <= _delivery_columns(db_path)
+    assert MATCHED_RULE_COLUMN <= _alert_columns(db_path)
+    assert ALERT_RULE_INDEXES <= _index_names(db_path)
+    # v1.33.0 既有库：默认规则按 v1.33.0 阈值回填，历史告警 matched_rule 保持 NULL
+    with sqlite3.connect(db_path) as con:
+        rule_count = con.execute("select count(*) from alert_rule where is_default=1").fetchone()[0]
+        matched = con.execute(
+            "select matched_rule from device_alert where alert_id='alt-legacy-acked'"
+        ).fetchone()[0]
+    assert rule_count == 10, "既有库升级必须补齐 10 条默认规则"
+    assert matched is None, "历史告警不做臆测回填"
     assert _alembic_version(db_path) == HEAD
 
 
@@ -210,10 +242,12 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    # 从 0008 连降三步（0008 → 0007 → 0006 → 0005）验证往返
-    down = _run_alembic(db_path, "downgrade", "-3")
+    # 从 0009 连降四步（0009 → 0008 → 0007 → 0006 → 0005）验证往返
+    down = _run_alembic(db_path, "downgrade", "-4")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
+    assert "alert_rule" not in _table_names(db_path), "downgrade 必须移除告警规则表"
+    assert not (MATCHED_RULE_COLUMN & _alert_columns(db_path)), "downgrade 必须移除 matched_rule 列"
     assert "notification_config" not in _table_names(db_path), (
         "downgrade 必须移除通知配置表"
     )
@@ -234,9 +268,15 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     up = _run_alembic(db_path, "upgrade", "head")
     assert up.returncode == 0, up.stderr
     assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert MATCHED_RULE_COLUMN <= _alert_columns(db_path)
     assert "refresh_token" in _table_names(db_path)
     assert "notification_config" in _table_names(db_path)
     assert "notification_rule" in _table_names(db_path)
+    assert "alert_rule" in _table_names(db_path)
+    with sqlite3.connect(db_path) as con:
+        assert con.execute("select count(*) from alert_rule").fetchone()[0] == 10, (
+            "downgrade 再 upgrade 应重新补齐默认规则"
+        )
     assert "mqtt_credential_revoked_at" in _device_columns(db_path)
     assert _alembic_version(db_path) == HEAD
 
@@ -284,6 +324,32 @@ def test_v129_config_and_delivery_preserved_and_default_rule_seeded(tmp_path):
     assert delivery == ("sent", 1), "投递历史必须保留"
     assert DELIVERY_RETRY_COLUMNS <= delivery_columns
     assert _alembic_version(db_path) == HEAD
+
+
+def test_v133_threshold_overrides_seeded_into_default_rules(tmp_path):
+    """v1.33.0 库中在线改过的阈值：升级后必须成为默认规则的低值，行为不回退。"""
+    db_path = tmp_path / "v133-override.db"
+    assert _run_alembic(db_path, "upgrade", "0008_alert_sla_handover").returncode == 0
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO rule_config (key, value, updated_by) "
+            "VALUES ('threshold_voltage_warning', 3.00, 'ops'), "
+            "       ('threshold_rssi_critical', -105.00, 'ops')"
+        )
+        con.commit()
+
+    up = _run_alembic(db_path, "upgrade", "head")
+    assert up.returncode == 0, up.stderr
+    with sqlite3.connect(db_path) as con:
+        rows = con.execute(
+            "select metric, level, threshold from alert_rule where is_default=1"
+        ).fetchall()
+        total = con.execute("select count(*) from alert_rule").fetchone()[0]
+    assert total == 10
+    assert ("voltage", "warning", 3.0) in rows, "在线覆盖值必须带入默认规则"
+    assert ("rssi", "critical", -105.0) in rows
+    assert ("voltage", "critical", 3.2) in rows, "未覆盖项保持 v1.33.0 默认值"
+    assert ("humidity", "warning", 90.0) in rows
 
 
 def test_upgrade_to_head_inside_running_loop(tmp_path):
