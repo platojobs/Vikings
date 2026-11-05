@@ -80,6 +80,8 @@ class _FakeApiClient extends ApiClient {
   _FakeApiClient({
     List<AlertItem>? alerts,
     this.bulkError,
+    this.failBulkCall,
+    this.singlePageAlerts = false,
     List<DeviceSummary>? devices,
   }) : alerts = List<AlertItem>.of(alerts ?? const <AlertItem>[]),
        devices = List<DeviceSummary>.of(
@@ -91,15 +93,26 @@ class _FakeApiClient extends ApiClient {
   final List<DeviceSummary> devices;
   final Object? bulkError;
 
+  /// 指定第几次批量请求失败（从 1 开始），用于验证单批失败不拖累已成功批次。
+  final int? failBulkCall;
+
+  /// 测试用：让告警列表一次返回全部结果，便于构造 150 条多选场景。
+  final bool singlePageAlerts;
+
   int alertFetchCalls = 0;
   int bulkCalls = 0;
   int summaryCalls = 0;
+  int deviceFetchCalls = 0;
   int? lastPage;
   String? lastLevel;
   String? lastStatus;
   String? lastDeviceId;
+  String? lastDeviceKeyword;
+  int? lastDevicePage;
+  int? lastDevicePageSize;
   List<String> lastBulkIds = const <String>[];
   String? lastBulkNote;
+  final List<List<String>> bulkBatches = <List<String>>[];
 
   @override
   Future<AlertPage> fetchAlerts({
@@ -126,6 +139,14 @@ class _FakeApiClient extends ApiClient {
       filtered = filtered.where((item) => item.deviceId == deviceId).toList();
     }
     final total = filtered.length;
+    if (singlePageAlerts) {
+      return AlertPage(
+        items: filtered,
+        total: total,
+        page: 1,
+        pageSize: total == 0 ? pageSize : total,
+      );
+    }
     final start = (page - 1) * pageSize;
     final items = start >= total
         ? const <AlertItem>[]
@@ -161,9 +182,13 @@ class _FakeApiClient extends ApiClient {
     bulkCalls += 1;
     lastBulkIds = List<String>.of(alertIds);
     lastBulkNote = note;
+    bulkBatches.add(List<String>.of(alertIds));
     final error = bulkError;
     if (error != null) {
       throw error;
+    }
+    if (failBulkCall != null && bulkCalls == failBulkCall) {
+      throw const ApiException(ApiErrorKind.network, '网络中断');
     }
     final acked = <String>[];
     final already = <String>[];
@@ -212,12 +237,36 @@ class _FakeApiClient extends ApiClient {
     String? group,
     bool hasAlert = false,
     bool withAlertCount = false,
-  }) async => DevicePage(
-    items: devices,
-    total: devices.length,
-    page: page,
-    pageSize: pageSize,
-  );
+  }) async {
+    deviceFetchCalls += 1;
+    lastDeviceKeyword = keyword;
+    lastDevicePage = page;
+    lastDevicePageSize = pageSize;
+    var filtered = devices;
+    final text = (keyword ?? '').trim();
+    if (text.isNotEmpty) {
+      filtered = filtered
+          .where(
+            (device) =>
+                device.deviceId.contains(text) || device.name.contains(text),
+          )
+          .toList(growable: false);
+    }
+    final total = filtered.length;
+    final start = (page - 1) * pageSize;
+    final items = start >= total
+        ? const <DeviceSummary>[]
+        : filtered.sublist(
+            start,
+            start + pageSize > total ? total : start + pageSize,
+          );
+    return DevicePage(
+      items: items,
+      total: total,
+      page: page,
+      pageSize: pageSize,
+    );
+  }
 
   // 以下为 HomeShell 中移动看板 tab 启动所需的最小返回，避免真实网络请求。
   @override
@@ -548,6 +597,160 @@ void main() {
       find.byKey(const ValueKey('bulk-ack-button')),
     );
     expect(button.onPressed, isNull);
+  });
+
+  testWidgets('设备筛选远程搜索：250 台设备仍能搜到第 200 台之后并提示缩小范围', (tester) async {
+    final devices = List<DeviceSummary>.generate(250, (index) {
+      final seq = (index + 1).toString().padLeft(4, '0');
+      return DeviceSummary(
+        deviceId: 'dev-$seq',
+        name: '设备${index + 1}',
+        model: 'VG-S100',
+        firmwareVersion: '1.0.0',
+        groupName: '默认分组',
+        status: 'online',
+      );
+    });
+    final api = _FakeApiClient(
+      devices: devices,
+      alerts: <AlertItem>[
+        _alert('alt-x', 'warning', 'open', deviceId: 'dev-0200'),
+      ],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    // 首屏只为告警行名称缓存取 20 台，不再一次性拉 200 台。
+    expect(api.lastDevicePageSize, 20);
+    expect(api.lastDeviceKeyword, isNull);
+
+    // 关键词命中第 200 台之后的设备。
+    await tester.enterText(
+      find.byKey(const ValueKey('device-search-field')),
+      'dev-0200',
+    );
+    await tester.pump(const Duration(milliseconds: 350));
+    await tester.pumpAndSettle();
+
+    expect(api.lastDeviceKeyword, 'dev-0200');
+    expect(api.lastDevicePageSize, 20);
+    expect(find.byKey(const ValueKey('device-result-dev-0200')), findsOneWidget);
+    expect(find.textContaining('继续输入以缩小范围'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('device-result-dev-0200')));
+    await tester.pumpAndSettle();
+    expect(api.lastDeviceId, 'dev-0200');
+    expect(find.byKey(const ValueKey('device-filter-active')), findsOneWidget);
+  });
+
+  testWidgets('设备搜索宽关键词：结果被截断时明确展示总数与仅显示条数', (tester) async {
+    final devices = List<DeviceSummary>.generate(250, (index) {
+      final seq = (index + 1).toString().padLeft(4, '0');
+      return DeviceSummary(
+        deviceId: 'dev-$seq',
+        name: '设备${index + 1}',
+        model: 'VG-S100',
+        firmwareVersion: '1.0.0',
+        groupName: '默认分组',
+        status: 'online',
+      );
+    });
+    final api = _FakeApiClient(devices: devices);
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const ValueKey('device-search-field')),
+      'dev-',
+    );
+    await tester.pump(const Duration(milliseconds: 350));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('共 250 台匹配，仅显示前 4 台；继续输入以缩小范围'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('device-result-dev-0250')), findsNothing);
+  });
+
+  testWidgets('批量确认 150 条：按 100 串行拆成 2 批并累加结果', (tester) async {
+    tester.view.physicalSize = const Size(900, 20000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final alerts = List<AlertItem>.generate(
+      150,
+      (index) => _alert(
+        'alt-${index.toString().padLeft(3, '0')}',
+        'warning',
+        'open',
+      ),
+    );
+    final api = _FakeApiClient(alerts: alerts, singlePageAlerts: true);
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    for (var index = 0; index < 150; index += 1) {
+      final id = 'alt-${index.toString().padLeft(3, '0')}';
+      await tester.tap(find.byKey(ValueKey('select-$id')));
+    }
+    await tester.pumpAndSettle();
+    expect(find.text('已选择 150 条'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(api.bulkCalls, 2);
+    expect(api.bulkBatches.map((batch) => batch.length).toList(), <int>[100, 50]);
+    expect(api.bulkBatches.first.first, 'alt-000');
+    expect(api.bulkBatches.last.first, 'alt-100');
+    expect(find.textContaining('已确认 150 条告警'), findsOneWidget);
+    expect(find.textContaining('共分 2 批串行提交'), findsOneWidget);
+  });
+
+  testWidgets('批量确认某批失败：保留已成功部分并标出失败批次', (tester) async {
+    tester.view.physicalSize = const Size(900, 20000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final alerts = List<AlertItem>.generate(
+      150,
+      (index) => _alert(
+        'alt-${index.toString().padLeft(3, '0')}',
+        'warning',
+        'open',
+      ),
+    );
+    final api = _FakeApiClient(
+      alerts: alerts,
+      failBulkCall: 2,
+      singlePageAlerts: true,
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    for (var index = 0; index < 150; index += 1) {
+      final id = 'alt-${index.toString().padLeft(3, '0')}';
+      await tester.tap(find.byKey(ValueKey('select-$id')));
+    }
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('bulk-ack-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(api.bulkCalls, 2);
+    expect(find.textContaining('已确认 100 条告警'), findsOneWidget);
+    expect(find.textContaining('第 2 批共 50 条提交失败'), findsOneWidget);
+    expect(find.textContaining('已成功部分保留'), findsOneWidget);
+    // 第一批成功行已移除，第二批失败的 50 条仍在列表中（不回滚、不谎报）。
+    expect(find.byKey(const ValueKey('alert-row-alt-000')), findsNothing);
+    expect(find.byKey(const ValueKey('alert-row-alt-100')), findsOneWidget);
   });
 
   testWidgets('实时新告警插入列表顶部并累加未读回调', (tester) async {

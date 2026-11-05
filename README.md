@@ -260,7 +260,7 @@ App 启动后底部有三个入口，默认进入「设备模拟」，原有模�
 | --- | --- | --- |
 | 设备模拟 | 模拟电池传感器：间歇上线、周期上报、收指令、OTA | 只依赖 MQTT Broker |
 | 移动看板 | 登录网关后查看真实数据（设备/实时值/历史/告警/指令回执），实时增量走 WebSocket；admin / operator 可下发指令、确认告警 | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
-| 告警中心 | 多设备告警筛选 / 滚动分页 / 多选批量确认；实时新告警入顶，tab 角标显示未读，进入页面清零 | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
+| 告警中心 | 设备远程搜索筛选 / 滚动分页 / 多选批量确认（>100 条自动分批）；实时新告警入顶，tab 角标显示未读，进入页面清零 | 依赖网关 REST（8000）与 MQTT over WebSocket（9001） |
 
 设备模拟页的「Broker 地址」按运行环境填写，填错会表现为一直连不上：
 
@@ -434,14 +434,15 @@ http://192.168.1.8:5173
 
 | 能力 | 行为 |
 | --- | --- |
-| 列表与筛选 | 级别（info / notice / warning / critical）、状态（open / acked）、设备三组条件可组合；切换即重置到第 1 页并按新参数重拉，接口为 `GET /api/alerts?deviceId&level&status&page&pageSize` |
+| 列表与筛选 | 级别（warning / critical）、状态（open / acked）、设备三组条件可组合；切换即重置到第 1 页并按新参数重拉，接口为 `GET /api/alerts?deviceId&level&status&page&pageSize`；设备条件为输入关键词远程搜索（300ms 防抖，`GET /api/devices?keyword=…&pageSize=20`），不再预拉 200 台 |
 | 分页 | 首屏 `page=1&pageSize=20`，滚动到页脚自动追加下一页；加载中显示「加载中…」，末页「没有更多了」，首页即空按状态给出可读空态 |
 | 每行信息 | 设备名（ID）、指标、当前值、阈值、级别、时间、状态；只读账号也能勾选查看 |
-| 批量确认 | 多选后一次请求 `POST /api/alerts/bulk-ack`（`alert_ids` 1~100 条），响应逐类返回 `acked` / `already_acked` / `not_found` / `requested`；部分失败在页面提示，不整批回滚，也不以 N 次单条请求伪装批量 |
+| 批量确认 | 多选后调用 `POST /api/alerts/bulk-ack`（服务端单次 `alert_ids` 上限 100 条）；超过 100 条时客户端按 100 条**串行自动分批**并合并 `acked` / `already_acked` / `not_found`；单批失败不回滚已成功批次，摘要标出失败批次并保留其选中项便于重试，不以 N 次单条请求伪装批量 |
 | 实时 | 新告警经 `device/system/alert` 插入列表顶部（当前筛选不匹配时只累加角标不插入）；实时断开时 15 秒轮询第 1 页 + `/api/alerts/summary` 补齐，不漏告警 |
 | tab 角标 | 角标展示本地未读计数：初始取 `/api/alerts/summary.open`，实时新增 +1，进入告警中心即清零；新告警确认后计数同步减少。告警中心在前台保持实时订阅，保证切到其它 tab 时角标仍能累加（代价是一条 MQTT 连接，与看板互不影响） |
 | 权限 | 与单条确认一致：viewer 只读，批量确认按钮禁用并说明原因；operator / admin 可确认；服务端 403 提示后禁用本轮写操作，401 清除会话回登录页 |
-| 兼容 | `GET /api/alerts` 原参数与默认行为不变，仅把 `level` 校验放宽到 info/notice/warning/critical（老数据不受影响）；单条 `POST /api/alerts/{id}/ack` 语义保持不变 |
+| 兼容 | `GET /api/alerts` 原参数与默认行为不变；级别枚举收窄为 `warning` / `critical`（`info` / `notice` 返回 422）；单条 `POST /api/alerts/{id}/ack` 语义保持不变 |
+| 规模化（v1.25.0） | 设备搜索在网关 `keyword` 前缀/片段匹配后只取前 20 台，面板展示 4 条并明确提示「共 N 台匹配，仅显示前 M 台；继续输入以缩小范围」，不静默截断；批量确认按 100 条串行分批，结果合并展示 |
 
 写操作（仅 admin / operator，viewer 只读）：
 
@@ -727,7 +728,7 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 | --- | --- | --- |
 | 设备端单测 | `cd device_app && flutter test` | 实时报文解析与断线重连、token 迁移与安全存储、指令参数校验、REST 结果分类 |
 | 设备端 Widget 测试 | `cd device_app && flutter test test/mobile_board_widget_test.dart` | 登录进入看板、指令下发二次确认 / 取消 / 回执、告警确认移除、viewer 与 403 禁用、实时降级轮询、401 回登录、分组变更移出当前筛选与 chips 刷新 |
-| 告警中心 Widget 测试 | `cd device_app && flutter test test/alert_center_widget_test.dart` | 级别 / 状态筛选切换、滚动分页与没有更多、空态、批量确认成功与 403、viewer 禁用、实时入顶与未读角标清零 |
+| 告警中心 Widget 测试 | `cd device_app && flutter test test/alert_center_widget_test.dart` | 级别 / 状态筛选切换、滚动分页与没有更多、空态、批量确认成功与 403、viewer 禁用、实时入顶与未读角标清零、250 台设备远程搜索与截断提示、150 条自动分批与单批失败摘要 |
 | 网关 | `cd gateway && ./.venv/bin/python -m pytest -q` | 认证、设备、告警、指令、OTA 契约；分组变更事件字段与发布降级；告警筛选 / 分页 / 批量确认（含部分失败）与 PATCH 设备 HTTP 回归 |
 | Web 单元测试 | `cd web && npm run test` | 路由守卫：未登录重定向、登录回跳、admin 专属页、非 admin 拒绝、未知路径兜底 |
 | Web | `cd web && npm run build` | 生产构建回归 |
@@ -810,3 +811,4 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.22.0` | P1-5 移动端发布工程：release 签名支持环境变量/`key.properties`（缺密钥显式降级并标注 `debug-signed`）、CI 在 main/标签构建 APK+AAB 并上传制品（含版本号与 SHA、`SHA256SUMS`、`SIGNING.txt`）、标签版本/构建号递增校验、Dependabot 四生态分组更新、Actions 升级到 Node 24 运行时；真实临时 keystore 验签与无密钥路径验证（[发布说明](docs/releases/v1.22.0.md)） |
 | `v1.23.0` | P1-7 测试盲区收敛：OTA 全链路进 E2E（创建→下发→分片进度→成功→REST/固件/审计一致）、设备失败与超时两条失败路径；修复终态可回退、下发失败不计任务、跨设备回执、无回执永久 running（新增指令超时巡检与 `COMMAND_TIMEOUT_SECONDS`）；真实故障注入（网关重启、设备重连、DB 短暂不可用）；Postgres 作业扩到告警/设备/认证/HTTP/指令 56 条核心用例；新增真机验收清单（[发布说明](docs/releases/v1.23.0.md)） |
 | `v1.24.0` | P2-4 认证生命周期：access 20 分钟 + refresh 14 天（只存指纹、单次使用与轮换、重放检测），登出/管理员吊销/改密三类吊销；Web 与移动端 401 单飞自动续期、失败回登录页；反代安全头补齐并用真实 Chrome 实测 CSP（含 ECharts blob worker 与 MQTT WSS）；修复生产构建同源 API 相对路径失效（[发布说明](docs/releases/v1.24.0.md)） |
+| `v1.25.0` | P2-3 + P2-5 规模化与 CI 体验：移动端设备筛选改为关键词远程搜索（300ms 防抖、前 20 台 + 截断提示），批量确认超过 100 条自动按 100 串行分批并合并结果、单批失败保留已成功部分；CI 增加分支级 `concurrency` 取消旧运行（标签构建不取消），gateway/Flutter/E2E 失败时上传日志 artifact（保留 7 天）（[发布说明](docs/releases/v1.25.0.md)） |

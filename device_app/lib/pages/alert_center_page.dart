@@ -8,6 +8,7 @@ import '../models/mobile_api_models.dart';
 import '../models/realtime_payload.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
+import '../services/bulk_ack_runner.dart';
 import '../services/session_refresh.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
@@ -22,8 +23,8 @@ typedef AlertRealtimeFactory = BoardRealtimeService Function(String url);
 /// 告警中心：HomeShell 的第三个 tab。
 ///
 /// 能力：
-/// - 按级别 / 状态 / 设备筛选，滚动分页（加载中 / 没有更多 / 空态）；
-/// - 多选后一次请求批量确认（`POST /api/alerts/bulk-ack`），部分失败可见；
+/// - 按级别 / 状态筛选，设备筛选走远程关键词搜索（防抖），滚动分页（加载中 / 没有更多 / 空态）；
+/// - 多选后按 100 条串行分批确认（`POST /api/alerts/bulk-ack`），合并结果、部分失败可见；
 /// - 实时新告警插入列表顶部，未读角标在 tab 上展示（进入页面清零）；
 /// - viewer 只读、operator/admin 可确认；403 禁用本轮写操作，401 回登录页；
 /// - 实时断开时切 REST 轮询补齐，不依赖单条事件不漏告警。
@@ -84,9 +85,32 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   String _status = 'open';
   String _deviceId = '';
 
+  /// P2-3（v1.25.0）：设备筛选改为输入关键词远程查询，首屏不再拉 200 台。
+  static const int _deviceSearchPageSize = 20;
+
+  /// 下拉面板最多展示 4 条，避免占满整屏；剩余部分用文字如实说明。
+  static const int _deviceSearchVisibleResults = 4;
+  static const Duration _deviceSearchDebounceDuration = Duration(
+    milliseconds: 300,
+  );
+
   List<AlertItem> _alerts = const <AlertItem>[];
-  List<DeviceSummary> _devices = const <DeviceSummary>[];
+
+  /// 设备名称缓存：仅用于告警行展示名称，由远程搜索结果与首屏轻量查询填充，
+  /// 不再作为筛选下拉的数据源。
+  final Map<String, DeviceSummary> _deviceCache = <String, DeviceSummary>{};
   final Set<String> _selected = <String>{};
+
+  /// 设备搜索状态：关键词、结果、总数与错误；总数大于当前结果数时如实提示未展示的部分。
+  late final TextEditingController _deviceSearchController;
+  late final FocusNode _deviceSearchFocus;
+  Timer? _deviceSearchDebounce;
+  int _deviceSearchSeq = 0;
+  String _deviceSearchKeyword = '';
+  List<DeviceSummary> _deviceResults = const <DeviceSummary>[];
+  int _deviceSearchTotal = 0;
+  bool _deviceSearching = false;
+  String? _deviceSearchError;
 
   int _page = 1;
   int _total = 0;
@@ -138,6 +162,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         );
     WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_onScroll);
+    _deviceSearchController = TextEditingController();
+    _deviceSearchFocus = FocusNode();
     _bootstrap();
   }
 
@@ -172,6 +198,9 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     WidgetsBinding.instance.removeObserver(this);
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _deviceSearchDebounce?.cancel();
+    _deviceSearchController.dispose();
+    _deviceSearchFocus.dispose();
     _pollTimer?.cancel();
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
@@ -277,18 +306,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       } on ApiException catch (_) {
         // 汇总失败不影响列表；角标沿用实时计数
       }
-      if (_devices.isEmpty) {
-        try {
-          final devices = await client.fetchDevices(
-            token: session.token,
-            page: 1,
-            pageSize: 200,
-          );
-          _devices = devices.items;
-        } on ApiException catch (_) {
-          // 设备筛选是辅助能力，拉取失败不阻塞告警列表
-        }
-      }
+      // 仅为告警行展示名称补一次首屏缓存；设备筛选已改为远程搜索，不再拉 200 台。
+      await _ensureDeviceNameCache(client, session.token, page.items);
       if (!mounted || requestId != _requestSeq) {
         return;
       }
@@ -383,6 +402,135 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     } finally {
       client.close();
     }
+  }
+
+  /// 首屏补设备名缓存：只取 20 台用于列表展示名称，失败时行内退回设备 ID。
+  Future<void> _ensureDeviceNameCache(
+    ApiClient client,
+    String token,
+    List<AlertItem> alerts,
+  ) async {
+    final missing = alerts
+        .map((item) => item.deviceId)
+        .where((id) => id.isNotEmpty && !_deviceCache.containsKey(id))
+        .toSet();
+    if (missing.isEmpty) {
+      return;
+    }
+    try {
+      final page = await client.fetchDevices(
+        token: token,
+        page: 1,
+        pageSize: _deviceSearchPageSize,
+      );
+      for (final device in page.items) {
+        _deviceCache[device.deviceId] = device;
+      }
+    } on ApiException catch (_) {
+      // 名称缓存是辅助能力，失败不阻塞告警列表
+    }
+  }
+
+  // ---------------- 设备远程搜索（P2-3） ----------------
+
+  void _onDeviceSearchChanged(String raw) {
+    final keyword = raw.trim();
+    _deviceSearchDebounce?.cancel();
+    final seq = ++_deviceSearchSeq;
+    if (keyword.isEmpty) {
+      setState(() {
+        _deviceSearchKeyword = '';
+        _deviceResults = const <DeviceSummary>[];
+        _deviceSearchTotal = 0;
+        _deviceSearching = false;
+        _deviceSearchError = null;
+      });
+      return;
+    }
+    setState(() {
+      _deviceSearchKeyword = keyword;
+      _deviceSearching = true;
+      _deviceSearchError = null;
+    });
+    _deviceSearchDebounce = Timer(
+      _deviceSearchDebounceDuration,
+      () => unawaited(_searchDevices(keyword, seq)),
+    );
+  }
+
+  Future<void> _searchDevices(String keyword, int seq) async {
+    final session = _session;
+    if (session == null) {
+      return;
+    }
+    final client = _client();
+    try {
+      final page = await client.fetchDevices(
+        token: session.token,
+        page: 1,
+        pageSize: _deviceSearchPageSize,
+        keyword: keyword,
+      );
+      if (!mounted || seq != _deviceSearchSeq) {
+        return;
+      }
+      for (final device in page.items) {
+        _deviceCache[device.deviceId] = device;
+      }
+      setState(() {
+        _deviceResults = page.items;
+        _deviceSearchTotal = page.total;
+        _deviceSearching = false;
+      });
+    } on ApiException catch (error) {
+      if (!mounted || seq != _deviceSearchSeq) {
+        return;
+      }
+      if (error.kind == ApiErrorKind.unauthorized) {
+        _handleUnauthorized();
+        return;
+      }
+      setState(() {
+        _deviceSearching = false;
+        _deviceSearchError = error.userMessage;
+      });
+    } finally {
+      client.close();
+    }
+  }
+
+  void _selectDevice(DeviceSummary device) {
+    _deviceSearchDebounce?.cancel();
+    _deviceSearchSeq += 1;
+    final label = '${device.name}（${device.deviceId}）';
+    _deviceSearchController.text = label;
+    _deviceSearchController.selection = TextSelection.collapsed(
+      offset: label.length,
+    );
+    _deviceSearchFocus.unfocus();
+    setState(() {
+      _deviceSearchKeyword = '';
+      _deviceResults = const <DeviceSummary>[];
+      _deviceSearchTotal = 0;
+      _deviceSearching = false;
+      _deviceSearchError = null;
+    });
+    _applyDevice(device.deviceId);
+  }
+
+  void _clearDeviceFilter() {
+    _deviceSearchDebounce?.cancel();
+    _deviceSearchSeq += 1;
+    _deviceSearchController.clear();
+    _deviceSearchFocus.unfocus();
+    setState(() {
+      _deviceSearchKeyword = '';
+      _deviceResults = const <DeviceSummary>[];
+      _deviceSearchTotal = 0;
+      _deviceSearching = false;
+      _deviceSearchError = null;
+    });
+    _applyDevice('');
   }
 
   void _applyLevel(String level) {
@@ -629,25 +777,48 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     });
     final client = _client();
     try {
-      final result = await client.bulkAckAlerts(
-        token: session.token,
+      // 网关单次上限 100 条；超出后在客户端按 100 串行分批，避免手工分批与瞬时压力。
+      final run = await runBulkAckInBatches(
         alertIds: ids,
-        note: note.isEmpty ? null : note,
+        submit: (batch) => client.bulkAckAlerts(
+          token: session.token,
+          alertIds: batch,
+          note: note.isEmpty ? null : note,
+        ),
       );
       if (!mounted) {
         return;
       }
-      final acked = result.acked.toSet();
+      final summary = _formatAckResult(run);
+      final forbidden = run.failedBatches
+          .where((batch) => batch.kind == ApiErrorKind.forbidden)
+          .toList(growable: false);
+      if (forbidden.isNotEmpty) {
+        _writeBlockedReason = forbidden.first.message;
+      }
+      if (run.unauthorized) {
+        setState(() => _acking = false);
+        _handleUnauthorized();
+        setState(() => _notice = '登录已失效；$summary');
+        return;
+      }
+      final acked = run.acked.toSet();
+      final failedIds = run.failedBatches
+          .expand((batch) => batch.ids)
+          .toSet();
       setState(() {
         _acking = false;
-        _selected.clear();
+        // 只保留失败批次的选中项，成功/已确认/不存在均不再选中，便于直接重试失败部分。
+        _selected.removeWhere((id) => !failedIds.contains(id));
         _alerts = _alerts
             .where((item) => !acked.contains(item.alertId))
             .toList(growable: false);
-        _total = math.max(0, _total - result.acked.length);
+        _total = math.max(0, _total - run.acked.length);
         _hasMore = _page * _pageSize < _total;
-        _unread = math.max(0, _unread - result.acked.length);
-        _notice = _formatAckResult(result);
+        _unread = math.max(0, _unread - run.acked.length);
+        _notice = forbidden.isEmpty
+            ? summary
+            : '$summary，本轮写操作已禁用';
       });
       _notifyUnread();
     } on ApiException catch (error) {
@@ -673,15 +844,32 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     }
   }
 
-  String _formatAckResult(BulkAckResult result) {
-    final buffer = StringBuffer('已确认 ${result.acked.length} 条告警');
-    if (result.alreadyAcked.isNotEmpty) {
-      buffer.write('；${result.alreadyAcked.length} 条此前已确认');
+  String _formatAckResult(BulkAckRunResult run) {
+    final buffer = StringBuffer('已确认 ${run.acked.length} 条告警');
+    if (run.alreadyAcked.isNotEmpty) {
+      buffer.write('；${run.alreadyAcked.length} 条此前已确认');
     }
-    if (result.notFound.isNotEmpty) {
-      buffer.write('；${result.notFound.length} 条不存在');
+    if (run.notFound.isNotEmpty) {
+      buffer.write('；${run.notFound.length} 条不存在');
     }
-    if (result.acked.isEmpty) {
+    if (run.batchCount > 1) {
+      buffer.write('；共分 ${run.batchCount} 批串行提交');
+    }
+    if (run.failedBatches.isNotEmpty) {
+      final numbers = run.failedBatches
+          .map((batch) => batch.batchNumber)
+          .join('、');
+      buffer.write(
+        '；第 $numbers 批共 ${run.failedCount} 条提交失败'
+        '（${run.failedBatches.first.message}），失败批次未计入已确认，已成功部分保留',
+      );
+    }
+    if (run.unsubmitted > 0) {
+      buffer.write('；因登录失效，后续 ${run.unsubmitted} 条未提交');
+    }
+    if (run.acked.isEmpty &&
+        run.failedBatches.isEmpty &&
+        run.unsubmitted == 0) {
       buffer.write('；本次没有状态变化');
     }
     return buffer.toString();
@@ -720,7 +908,12 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildFilterBar(),
+            ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * 0.5,
+              ),
+              child: SingleChildScrollView(child: _buildFilterBar()),
+            ),
             if (_notice != null) _buildBanner(_notice!, Colors.blue),
             if (_error != null) _buildBanner(_error!, Colors.red),
             if (!_canWrite && _session?.role == 'viewer')
@@ -772,33 +965,163 @@ class _AlertCenterPageState extends State<AlertCenterPage>
           ),
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
-            child: DropdownButtonFormField<String>(
-              key: const ValueKey('device-filter'),
-              initialValue: _deviceId,
-              isDense: true,
-              decoration: const InputDecoration(
-                labelText: '设备筛选',
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-              ),
-              items: [
-                const DropdownMenuItem(value: '', child: Text('全部设备')),
-                ..._devices.map(
-                  (device) => DropdownMenuItem(
-                    value: device.deviceId,
-                    child: Text('${device.name}（${device.deviceId}）'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  key: const ValueKey('device-search-field'),
+                  controller: _deviceSearchController,
+                  focusNode: _deviceSearchFocus,
+                  onChanged: _onDeviceSearchChanged,
+                  decoration: InputDecoration(
+                    labelText: '设备筛选（输入设备 ID 或名称）',
+                    hintText: '例如 dev-0001 或 一号机',
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    suffixIcon:
+                        _deviceSearchController.text.isEmpty &&
+                            _deviceId.isEmpty
+                        ? null
+                        : IconButton(
+                            key: const ValueKey('device-search-clear'),
+                            tooltip: '清除设备筛选',
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: _clearDeviceFilter,
+                          ),
+                    border: const OutlineInputBorder(),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    isDense: true,
                   ),
                 ),
+                if (_deviceId.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Chip(
+                        key: const ValueKey('device-filter-active'),
+                        visualDensity: VisualDensity.compact,
+                        label: Text(
+                          '设备：${_deviceFor(_deviceId)?.name ?? _deviceId}',
+                        ),
+                        onDeleted: _clearDeviceFilter,
+                        deleteIcon: const Icon(Icons.close, size: 16),
+                      ),
+                    ),
+                  ),
+                if (_deviceSearchKeyword.isNotEmpty) _buildDeviceSearchPanel(),
               ],
-              onChanged: (value) => _applyDevice(value ?? ''),
             ),
           ),
         ],
       ),
     );
+  }
+
+  /// 设备搜索结果面板：只展示匹配项，截断时明确提示总匹配数与可继续输入的说明。
+  Widget _buildDeviceSearchPanel() {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Material(
+        color: theme.colorScheme.surface,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          side: BorderSide(color: theme.dividerColor.withValues(alpha: 0.5)),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_deviceSearching)
+              const Padding(
+                padding: EdgeInsets.all(10),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 8),
+                    Text('搜索中…', style: TextStyle(fontSize: 12)),
+                  ],
+                ),
+              )
+            else if (_deviceSearchError != null)
+              Padding(
+                padding: const EdgeInsets.all(10),
+                child: Text(
+                  _deviceSearchError!,
+                  style: const TextStyle(fontSize: 12, color: Colors.red),
+                ),
+              )
+            else if (_deviceResults.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(10),
+                child: Text(
+                  '没有匹配的设备，试着输入设备 ID 或名称的一部分',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              )
+            else ...[
+              ..._deviceResults.take(_deviceSearchVisibleResults).map((device) {
+                final selected = device.deviceId == _deviceId;
+                return ListTile(
+                  key: ValueKey('device-result-${device.deviceId}'),
+                  dense: true,
+                  selected: selected,
+                  leading: Icon(
+                    selected ? Icons.check_circle : Icons.circle_outlined,
+                    size: 18,
+                  ),
+                  title: Text(
+                    device.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(
+                    device.deviceId,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: Text(
+                    device.online ? '在线' : '离线',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: device.online ? Colors.green : Colors.black45,
+                    ),
+                  ),
+                  onTap: () => _selectDevice(device),
+                );
+              }),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                child: Text(
+                  _deviceSearchHint(),
+                  key: const ValueKey('device-search-hint'),
+                  style: const TextStyle(fontSize: 11, color: Colors.black54),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 结果被服务端分页或展示上限截断时不静默：给出总匹配数、当前展示条数与缩小范围提示。
+  String _deviceSearchHint() {
+    final shown = math.min(
+      _deviceResults.length,
+      _deviceSearchVisibleResults,
+    );
+    if (_deviceSearchTotal > shown) {
+      return '共 $_deviceSearchTotal 台匹配，仅显示前 $shown 台；继续输入以缩小范围';
+    }
+    return '共 $_deviceSearchTotal 台匹配；继续输入以缩小范围';
   }
 
   Widget _levelChip(String label, String value) {
@@ -1090,14 +1413,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     );
   }
 
-  DeviceSummary? _deviceFor(String deviceId) {
-    for (final device in _devices) {
-      if (device.deviceId == deviceId) {
-        return device;
-      }
-    }
-    return null;
-  }
+  DeviceSummary? _deviceFor(String deviceId) => _deviceCache[deviceId];
 
   Color _levelColor(String level) => switch (level) {
     'critical' => Colors.red,

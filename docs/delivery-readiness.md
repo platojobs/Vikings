@@ -1,4 +1,4 @@
-# 交付就绪审计（v1.15.1，状态更新至 v1.21.0）
+# 交付就绪审计（v1.15.1，状态更新至 v1.25.0）
 
 > 审计日期：2026-11-05
 > 审计方式：只读代码与配置核对 + 本地真实命令验证；本轮不修改任何业务代码。
@@ -8,8 +8,10 @@
 > P1-1（可观测性）于 v1.20.0 完成；
 > P1-4（Web 批量确认）、P2-2（处置备注）、P2-1（级别口径统一）于 v1.21.0 合并完成；
 > P1-5（移动端可发布产物与依赖治理）于 v1.22.0 完成；
-> P1-7（OTA E2E、故障注入、Postgres 扩容、真机清单）于 v1.23.0 完成。
-> P0 阻断项已全部关闭。
+> P1-7（OTA E2E、故障注入、Postgres 扩容、真机清单）于 v1.23.0 完成；
+> P2-4（认证生命周期与安全头）于 v1.24.0 完成；
+> P2-3（设备远程搜索与批量确认自动分批）与 P2-5（CI concurrency 与失败日志 artifact）于 v1.25.0 完成。
+> **P0 / P1 / P2 清单已全部关闭**；剩余未覆盖项见文末「需要用户侧动作」。
 
 ## 总体结论
 
@@ -413,12 +415,32 @@
     敏感口令/token 不会原样进入审计或日志。
   - Web 与移动端均支持备注输入、展示确认人/时间/备注；旧客户端不传备注照常工作。
 
-### P2-3 移动端规模化上限写死在页面
+### P2-3 移动端规模化上限写死在页面 ✅ 已完成（v1.25.0）
 
 - **现状证据**：设备筛选一次拉 200 台（`alert_center_page.dart` 的 `fetchDevices(pageSize: 200)`）；批量确认上限 100 条（`gateway/app/schemas.py` 的 `AlertBulkAckRequest`）。
 - **缺口**：超过 200 台后部分设备无法在下拉中选择；超过 100 条要手工分批。
 - **做法**：设备筛选改远程搜索/下拉分页；批量确认在客户端自动分批并汇总 `acked/not_found`。
 - **预估**：1 人日。**依赖**：无。
+- **完成证据（v1.25.0）**
+  - **设备筛选远程搜索**：`device_app/lib/pages/alert_center_page.dart` 移除
+    `fetchDevices(pageSize: 200)`；改为输入框 300ms 防抖后调用
+    `fetchDevices(page: 1, pageSize: 20, keyword: <输入>)`，复用网关既有的
+    `keyword`（`device_service.list_devices` 对 `device_id` / `name` 做 ilike）。
+  - **不静默截断**：网关单页上限 200，客户端只取前 20；面板最多展示 4 条，
+    底部固定显示「共 N 台匹配，仅显示前 M 台；继续输入以缩小范围」。
+    选择设备后以可删除 Chip 展示当前筛选，清空后回到全部设备。
+  - **名称缓存**：仅为告警行展示设备名，首次轻量取首页 20 台；取不到时行内退回设备 ID，
+    不再作为筛选数据源。
+  - **批量确认自动分批**：新增 `device_app/lib/services/bulk_ack_runner.dart`，
+    按 100 条**严格串行**分批（第 N 批完成后再发第 N+1 批，避免瞬时压力），
+    合并 `acked / already_acked / not_found`；单批失败只记录该批，不回滚已成功批次，
+    摘要标明「第 X 批共 N 条提交失败」，并保留失败批次选中项便于重试；
+    401 中止后续批次，未提交条数如实写入结果并回登录页。
+  - **测试**：`device_app/test/alert_center_widget_test.dart` 新增
+    250 台设备搜索（命中第 200 台之后的 `dev-0200`）、宽关键词截断提示、
+    150 条拆 2 批累加、单批失败摘要；`device_app/test/bulk_ack_runner_test.dart`
+    覆盖 150→2 批、部分失败、401 中止。
+  - **Flutter**：`flutter analyze` 无问题；`flutter test` **80 passed**（v1.24.0 为 73）。
 
 ### P2-4 认证生命周期与 API 安全头不完整 ✅ 已完成（v1.24.0）
 
@@ -444,12 +466,33 @@
 - **明确未覆盖**：吊销后已签发 access 的残留窗口（≤ access TTL）不做逐请求黑名单校验；
   移动端未做真机 Keychain/Keystore 验证（沿用既有发布验证边界）。
 
-### P2-5 CI/运维体验细节
+### P2-5 CI/运维体验细节 ✅ 已完成（v1.25.0）
 
 - **现状证据**：`.github/workflows/ci.yml:17-18,37-40` actions 仍为 v4/v5，v1.15.0 运行出现 Node 20 弃用提示；无缓存策略说明（已有 npm cache）；无构建耗时/失败趋势看板。
 - **缺口**：提示噪音、长期维护成本。
 - **做法**：升级 actions、按需加 `concurrency` 取消旧运行、把 E2E 日志 artifact 化（失败时上传）。
 - **预估**：0.5 人日。**依赖**：无。
+- **完成证据（v1.25.0）**
+  - **取消旧运行**：工作流级 `concurrency.group = CI-${github.ref}`，
+    `cancel-in-progress = github.ref_type != 'tag'`——同分支/PR 的新推送取消旧运行，
+    标签构建（每个标签独立分组且永不取消）不受影响。
+  - **失败日志 artifact**（`retention-days: 7`，仅 `if: failure()` 上传，不增加成功路径耗时）：
+    - `gateway-test-log-<run_id>` ← `gateway/pytest.log`（`pytest -q 2>&1 | tee`，`pipefail` 保留退出码）；
+    - `flutter-test-logs-<run_id>` ← `device_app/flutter-analyze.log` + `flutter-test.log`；
+    - `e2e-logs-<run_id>` ← `.run/e2e/*.log`（保留原有 tail 输出）。
+  - **真实证据**：临时分支 `ci-verify-tmp`（基于本版本工作内容、仅额外加入一个必败用例，
+    验证后删除）连续推送：
+    - 第 1 次 run [41938001536](https://github.com/platojobs/Vikings/actions/runs/41938001536)
+      （`f16f375`）→ **`cancelled`**；
+    - 第 2 次 run [41938074378](https://github.com/platojobs/Vikings/actions/runs/41938074378)
+      （`3141da6`）在旧 run 进行中替换了同组运行，随后被第 3 次推送取消；
+    - 第 3 次（必败）run [41938271871](https://github.com/platojobs/Vikings/actions/runs/41938271871)
+      （`d766221`）→ `failure`；gateway 作业产 artifact
+      `gateway-test-log-41938271871`，`gh run download` 成功解压出 `pytest.log`
+      （2,087 bytes，末尾 `1 failed, 125 passed`，含真实失败断言）。
+    - 临时分支（远端与本地）与 draft PR #12 已删除，主分支历史无额外提交。
+  - **耗时**：`tee` 仅本地文件写入；artifact 上传只在失败时执行，成功路径无额外步骤。
+
 
 ---
 
@@ -484,4 +527,27 @@
 - `v1.22.0`：P1-5（移动端 release 签名、CI 制品、构建号策略、依赖治理）✅ 已完成；
 - `v1.23.0`：P1-7（OTA 全链路 E2E、故障注入、Postgres 作业扩容、真机验收清单）✅ 已完成；
 - `v1.24.0`：P2-4（access/refresh 生命周期、三类吊销、客户端自动续期、反代安全头与 CSP 实测）✅ 已完成；
-- 下一批：P2-3 移动端规模化上限、P2-5 CI/运维体验细节。
+- `v1.25.0`：P2-3 + P2-5（设备远程搜索、批量确认自动分批、CI concurrency、失败日志 artifact）✅ 已完成。
+- **P0（3/3）、P1（7/7）、P2（5/5）全部关闭。** 下一版本无审计遗留项，按产品需求迭代。
+
+---
+
+## 需要用户侧动作（形式上关闭但仍有外部缺口）
+
+以下事项代码侧已就绪，但必须由仓库管理员/运维/真机环境完成，**不得视为已完成**：
+
+1. **生产 secrets 未配置**：`ANDROID_KEYSTORE_BASE64` 等 release 签名 secrets 未配置，
+   CI 产物仍是 `-debug-signed`（仅限内部测试，不可分发）；如需强制签名，
+   配置 secrets 并设置仓库变量 `REQUIRE_SIGNED_RELEASE=true`。
+2. **真机验收未做**：`docs/device-acceptance.md` 的清单（弱网/切后台/权限拒绝/推送、
+   Keychain/Keystore、OTA 真机）需要在真实 Android/iOS 设备上逐项执行并留痕；
+   本轮只有模拟器与 Widget/集成测试。
+3. **定时任务未安装**：数据清理与备份依赖外部 cron/systemd timer
+   （`docs/operations.md` 已给命令），生产主机上尚未实际安装与告警联动。
+4. **日志聚合未接入**：Prometheus 抓取、告警规则投递与日志收集端（Loki/ELK 等）
+   需要运维侧配置；`/metrics` 与告警规则文件本身已就绪。
+5. **生产域名/证书**：正式 ACME 证书、域名与 DNS 未由代码仓库掌握；
+   当前验收使用自签证书。
+6. **分支保护/必需检查**：GitHub 仓库的分支保护与 required checks 需管理员在
+   Settings 中开启；CI 配置本身不强制合并策略。
+
