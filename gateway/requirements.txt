@@ -20,7 +20,7 @@ pydantic>=2.6
 pydantic-settings>=2.2
 
 # 可观测性：Prometheus 指标（/metrics）
-prometheus-client>=0.20
+prometheus-client>=0.26.0
 
 # JWT 鉴权 / LLM 调用
 PyJWT>=2.8
