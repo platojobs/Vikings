@@ -19,14 +19,18 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0007_notification_rules_retry"
+HEAD = "0008_alert_sla_handover"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
     "idx_alert_status_device",
+    "idx_alert_status_sla_deadline",
     "idx_audit_operator_created",
 }
 ACK_COLUMNS = {"ack_note", "acked_by", "acked_at"}
+# v1.33.0：SLA 快照与值班交接字段
+SLA_COLUMNS = {"assignee", "sla_minutes", "sla_deadline_at", "escalation_count", "last_escalated_at"}
+DELIVERY_SLA_COLUMNS = {"kind", "extra"}
 # v1.31.0：规则表、重试队列字段与索引
 DELIVERY_RETRY_COLUMNS = {
     "rule_id",
@@ -101,9 +105,15 @@ def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
     with sqlite3.connect(db_path) as con:
         for name in NEW_INDEXES:
             con.execute(f"DROP INDEX {name}")
-        # create_all 会带上最新模型列；删掉它们才等价于 v1.20 生产库
+        # create_all 会带上最新模型列；删掉它们才等价于 v1.32 生产库
         for name in ACK_COLUMNS:
             con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
+        for name in SLA_COLUMNS:
+            con.execute(f"ALTER TABLE device_alert DROP COLUMN {name}")
+        # SQLite 删列会连带删除基于该列的索引（idx_alert_status_sla_deadline）
+        con.execute("DROP TABLE sla_config")
+        for name in DELIVERY_SLA_COLUMNS:
+            con.execute(f"ALTER TABLE notification_delivery DROP COLUMN {name}")
         if seed_device:
             con.execute(
                 "INSERT INTO device (device_id, name, model, firmware_version, group_name, status) "
@@ -138,6 +148,8 @@ def test_upgrade_on_empty_database(tmp_path):
         "notification_delivery",
         # v1.31.0 多规则路由
         "notification_rule",
+        # v1.33.0 SLA 配置
+        "sla_config",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
     assert {
@@ -162,14 +174,19 @@ def test_existing_database_is_stamped_and_data_preserved(tmp_path):
     with sqlite3.connect(db_path) as con:
         rows = con.execute("select device_id, status from device").fetchall()
         alert_rows = con.execute(
-            "select alert_id, status, acked_by, acked_at, ack_note from device_alert"
+            "select alert_id, status, acked_by, acked_at, ack_note, "
+            "assignee, sla_minutes, sla_deadline_at, escalation_count from device_alert"
         ).fetchall()
     assert rows == [("dev-legacy", "online")], "迁移不得清空或重建存量数据"
-    assert alert_rows == [("alt-legacy-acked", "acked", None, None, None)], (
-        "历史已确认行必须保留 acked 状态，且不臆测回填处置人/时间/备注"
+    assert alert_rows == [("alt-legacy-acked", "acked", None, None, None, None, 30,
+                           "2026-11-04 08:30:00", 0)], (
+        "历史已确认行保留 acked 与 NULL acked_at；SLA 只按级别回填默认时限，"
+        "不臆造责任人（assignee 仍为 NULL），升级计数回填 0"
     )
     assert NEW_INDEXES <= _index_names(db_path)
     assert ACK_COLUMNS <= _alert_columns(db_path)
+    assert SLA_COLUMNS <= _alert_columns(db_path)
+    assert DELIVERY_SLA_COLUMNS <= _delivery_columns(db_path)
     assert _alembic_version(db_path) == HEAD
 
 
@@ -193,8 +210,8 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    # v1.31.0 在 v1.29.0 之上加了一步：downgrade 两步回到 0005
-    down = _run_alembic(db_path, "downgrade", "-2")
+    # 从 0008 连降三步（0008 → 0007 → 0006 → 0005）验证往返
+    down = _run_alembic(db_path, "downgrade", "-3")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
     assert "notification_config" not in _table_names(db_path), (
@@ -206,6 +223,8 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     assert "notification_rule" not in _table_names(db_path), (
         "downgrade 必须移除通知规则表"
     )
+    assert "sla_config" not in _table_names(db_path), "downgrade 必须移除 SLA 配置表"
+    assert not (SLA_COLUMNS & _alert_columns(db_path)), "downgrade 必须移除 SLA 列"
     assert "mqtt_credential_revoked_at" in _device_columns(db_path), (
         "downgrade 不得影响凭证吊销列"
     )

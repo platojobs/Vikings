@@ -279,6 +279,17 @@ class AlertOut(BaseModel):
     acked_by: Optional[str] = None
     acked_at: Optional[datetime] = None
 
+    # v1.33.0 SLA 与值班交接：sla_state 为服务端统一口径
+    # met / late / pending / overdue / unknown（历史确认无 acked_at）
+    assignee: Optional[str] = None
+    sla_minutes: Optional[int] = None
+    sla_deadline_at: Optional[datetime] = None
+    sla_state: Optional[str] = None
+    # 未处理：距截止还剩多少秒（负数表示已超出）；已确认：实际响应秒数
+    sla_remaining_seconds: Optional[int] = None
+    sla_response_seconds: Optional[int] = None
+    escalation_count: int = 0
+
     model_config = {"from_attributes": True}
 
 
@@ -322,6 +333,54 @@ class AlertBulkAckResult(BaseModel):
     already_acked: List[str]
     not_found: List[str]
     requested: int
+
+
+# ==================== 告警 SLA 与值班交接（v1.33.0） ====================
+
+
+class SlaConfigOut(BaseModel):
+    critical_minutes: int
+    warning_minutes: int
+    max_escalations: int
+    escalation_interval_minutes: int
+    updated_at: Optional[datetime] = None
+    updated_by: str = "system"
+
+
+class SlaConfigUpdate(BaseModel):
+    """只允许修改四个阈值；约束防止把 SLA 配成 0 分钟或无限升级。"""
+
+    critical_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
+    warning_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
+    max_escalations: Optional[int] = Field(default=None, ge=0, le=10)
+    escalation_interval_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
+
+
+class AlertHandoverRequest(BaseModel):
+    """值班交接入参：把未处理告警的责任人从 `from_user` 交接到 `to`。
+
+    `from_user` 省略时默认当前登录操作人；`include_unassigned` 默认 true，
+    表示没有责任人的未处理告警也一并交给下一班（不留无人认领的告警）。
+    """
+
+    to: str = Field(min_length=2, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
+    from_user: Optional[str] = Field(default=None, min_length=2, max_length=64)
+    include_unassigned: bool = True
+    note: Optional[str] = Field(default=None, max_length=ACK_NOTE_MAX_LENGTH)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _clean_note(cls, value):
+        return _normalize_ack_note(value)
+
+
+class AlertHandoverResult(BaseModel):
+    from_user: str
+    to: str
+    count: int
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
+    notification: str = "queued"
 
 
 class CommandCreateRequest(BaseModel):
@@ -633,6 +692,8 @@ class NotificationDeliveryOut(BaseModel):
     channel: str
     status: str
     attempts: int
+    # v1.33.0：alert / escalation / handover，用于历史页区分通知类型
+    kind: str = "alert"
     error: Optional[str] = None
     # v1.31.0：路由快照与重试/耗时信息
     rule_id: Optional[int] = None
@@ -757,6 +818,8 @@ class AlertSummaryOut(BaseModel):
     open: int
     critical_open: int
     today: int
+    # v1.33.0：未处理中已超过响应时限的条数（其余未处理按 pending 计）
+    overdue_open: int = 0
 
 
 # ==================== 账号与权限 ====================

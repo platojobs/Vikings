@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.models import DeviceAlert
 from app.rules import evaluate
 from app.schemas import SensorReportMessage
+from app.services import sla_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -63,6 +64,8 @@ async def handle_report_alerts(
 
     messages: List[Dict] = []
     now = datetime.now(timezone.utc)
+    # SLA 时限在创建时快照：之后修改配置只影响新告警，历史判定可复盘
+    sla_config = await sla_service.get_or_create_config(session)
     for hit, (text, ai_generated) in zip(candidates, texts):
         alert = DeviceAlert(
             alert_id="alt-" + uuid.uuid4().hex[:12],
@@ -76,6 +79,7 @@ async def handle_report_alerts(
             status="open",
             created_at=now,
         )
+        sla_service.apply_deadline(alert, sla_config)
         session.add(alert)
         messages.append(
             {
@@ -109,6 +113,8 @@ async def list_alerts(
     page_size: int,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
+    sla_state: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> Tuple[List[DeviceAlert], int]:
     """按创建时间倒序分页；`start` / `end` 为 created_at 闭区间（v1.30.0）。
 
@@ -132,6 +138,13 @@ async def list_alerts(
     if end:
         stmt = stmt.where(DeviceAlert.created_at <= end)
         count_stmt = count_stmt.where(DeviceAlert.created_at <= end)
+    # v1.33.0：SLA 状态筛选（尤其「已超时」）下推到 SQL，分页 total 与展示一致
+    if sla_state:
+        for condition in sla_service.sla_filter_conditions(
+            sla_state, now or datetime.now(timezone.utc)
+        ):
+            stmt = stmt.where(condition)
+            count_stmt = count_stmt.where(condition)
 
     stmt = stmt.order_by(DeviceAlert.created_at.desc())
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
@@ -250,4 +263,6 @@ async def alert_summary(session: AsyncSession) -> Dict:
         "open": int((await session.execute(open_stmt)).scalar_one()),
         "critical_open": int((await session.execute(critical_stmt)).scalar_one()),
         "today": int((await session.execute(today_stmt)).scalar_one()),
+        # v1.33.0：未处理中已超出响应时限的条数，便于首页一眼看出「欠账」
+        "overdue_open": await sla_service.count_overdue_open(session),
     }

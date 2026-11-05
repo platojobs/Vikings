@@ -12,7 +12,14 @@ import { summarizeBulkAck } from '@/utils/alertSummary'
 const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }))
 vi.mock('@/api/http', () => ({ request: requestMock }))
 
-import { ackAlert, bulkAckAlerts } from '@/api/alerts'
+import {
+  ackAlert,
+  bulkAckAlerts,
+  fetchAlerts,
+  fetchSlaConfig,
+  handoverAlerts,
+  updateSlaConfig,
+} from '@/api/alerts'
 import type { BulkAckResult } from '@/types'
 
 const result: BulkAckResult = {
@@ -65,6 +72,56 @@ describe('告警确认 API', () => {
     expect(requestMock).toHaveBeenCalledWith('/api/alerts/alt-1/ack', {
       method: 'POST',
       body: undefined,
+    })
+  })
+})
+
+describe('告警 SLA 与值班交接 API（v1.33.0）', () => {
+  it('列表把 sla 筛选下推到后端', async () => {
+    requestMock.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 10 })
+    await fetchAlerts({ sla: 'overdue', page: 1, pageSize: 10 })
+
+    expect(requestMock).toHaveBeenCalledWith('/api/alerts', {
+      params: {
+        deviceId: undefined,
+        level: undefined,
+        status: undefined,
+        sla: 'overdue',
+        start: undefined,
+        end: undefined,
+        page: 1,
+        pageSize: 10,
+      },
+    })
+  })
+
+  it('交接只传目标与可选范围，不夹带页面状态', async () => {
+    requestMock.mockResolvedValue({
+      from_user: 'alice', to: 'next-shift', count: 2,
+      window_start: null, window_end: null, notification: 'queued',
+    })
+    const data = await handoverAlerts({ to: 'next-shift', from_user: 'alice', include_unassigned: true })
+
+    expect(requestMock).toHaveBeenCalledWith('/api/alerts/handover', {
+      method: 'POST',
+      body: { to: 'next-shift', from_user: 'alice', include_unassigned: true },
+    })
+    expect(data.count).toBe(2)
+  })
+
+  it('SLA 配置读取 GET / 保存 PUT 使用同一路径', async () => {
+    requestMock.mockResolvedValue({
+      critical_minutes: 5, warning_minutes: 60,
+      max_escalations: 1, escalation_interval_minutes: 30, updated_by: 'admin',
+    })
+    await fetchSlaConfig()
+    expect(requestMock).toHaveBeenCalledWith('/api/alerts/sla-config')
+
+    requestMock.mockClear()
+    await updateSlaConfig({ critical_minutes: 5, warning_minutes: 60, max_escalations: 1 })
+    expect(requestMock).toHaveBeenCalledWith('/api/alerts/sla-config', {
+      method: 'PUT',
+      body: { critical_minutes: 5, warning_minutes: 60, max_escalations: 1 },
     })
   })
 })

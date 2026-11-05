@@ -1384,6 +1384,26 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                               : Colors.green,
                         ),
                       ),
+                      if (_slaBadge(alert) != null) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 5,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: _slaBadgeColor(alert).withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            _slaBadge(alert)!,
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: _slaBadgeColor(alert),
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                   const SizedBox(height: 4),
@@ -1531,6 +1551,31 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     'warning' => Colors.orange,
     _ => Colors.grey,
   };
+
+  /// SLA 标记：移动端只读展示，不提供交接/改配置（这些操作在 Web 端完成）
+  String? _slaBadge(AlertItem alert) {
+    switch (alert.slaState) {
+      case 'overdue':
+        return '已超时';
+      case 'late':
+        return '超时达成';
+      case 'unknown':
+        return '历史确认';
+      default:
+        return null;
+    }
+  }
+
+  Color _slaBadgeColor(AlertItem alert) {
+    switch (alert.slaState) {
+      case 'overdue':
+        return Colors.red;
+      case 'late':
+        return Colors.deepOrange;
+      default:
+        return Colors.blueGrey;
+    }
+  }
 
   String _formatNumber(double value) {
     if (value == value.roundToDouble()) {

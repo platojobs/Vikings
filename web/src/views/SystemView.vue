@@ -15,6 +15,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { fetchSlaConfig, updateSlaConfig } from '@/api/alerts'
 import { fetchSystemStatus } from '@/api/system'
 import {
   createNotificationRule,
@@ -363,10 +364,61 @@ async function runTestNotification(): Promise<void> {
   }
 }
 
+// ==================== 告警 SLA 配置（v1.33.0） ====================
+
+const slaLoading = ref(false)
+const slaSaving = ref(false)
+const slaUpdated = ref('')
+const slaForm = reactive({
+  critical_minutes: 30,
+  warning_minutes: 120,
+  max_escalations: 2,
+  escalation_interval_minutes: 30,
+})
+
+async function loadSlaConfig(): Promise<void> {
+  slaLoading.value = true
+  try {
+    const config = await fetchSlaConfig()
+    slaForm.critical_minutes = config.critical_minutes
+    slaForm.warning_minutes = config.warning_minutes
+    slaForm.max_escalations = config.max_escalations
+    slaForm.escalation_interval_minutes = config.escalation_interval_minutes
+    slaUpdated.value = config.updated_at
+      ? `${config.updated_by} · ${formatDateTime(config.updated_at)}`
+      : ''
+  } catch {
+    // 请求层已提示
+  } finally {
+    slaLoading.value = false
+  }
+}
+
+/** 修改只影响之后创建的告警：历史告警保留创建时的时限快照，可复盘 */
+async function saveSlaConfig(): Promise<void> {
+  slaSaving.value = true
+  try {
+    const config = await updateSlaConfig({ ...slaForm })
+    slaForm.critical_minutes = config.critical_minutes
+    slaForm.warning_minutes = config.warning_minutes
+    slaForm.max_escalations = config.max_escalations
+    slaForm.escalation_interval_minutes = config.escalation_interval_minutes
+    slaUpdated.value = config.updated_at
+      ? `${config.updated_by} · ${formatDateTime(config.updated_at)}`
+      : ''
+    ElMessage.success('SLA 配置已保存，新告警立即生效')
+  } catch {
+    // 请求层已提示
+  } finally {
+    slaSaving.value = false
+  }
+}
+
 onMounted(() => {
   loadStatus()
   loadNotificationConfig()
   loadRules()
+  loadSlaConfig()
   timer = setInterval(loadStatus, 10_000)
 })
 
@@ -500,6 +552,67 @@ onBeforeUnmount(() => {
           下方「通知规则」按分组配置接收人，抑制只影响发送，不影响告警入库
         </el-descriptions-item>
       </el-descriptions>
+    </el-card>
+
+    <el-card v-loading="slaLoading" shadow="never">
+      <div class="section-head">
+        <div>
+          <span class="section-title">告警 SLA 与超时升级</span>
+          <span class="section-desc">
+            按级别配置响应时限与升级上限；修改只影响新告警，历史告警保留创建时的时限快照
+            <template v-if="slaUpdated">（最近修改：{{ slaUpdated }}）</template>
+          </span>
+        </div>
+        <div class="head-actions">
+          <el-button size="small" type="primary" :loading="slaSaving" @click="saveSlaConfig">
+            保存配置
+          </el-button>
+        </div>
+      </div>
+      <el-form label-width="150px" class="sla-form">
+        <el-form-item label="严重告警响应时限">
+          <el-input-number
+            v-model="slaForm.critical_minutes"
+            :min="1"
+            :max="10080"
+            controls-position="right"
+          />
+          <span class="form-hint">分钟；从告警创建到确认</span>
+        </el-form-item>
+        <el-form-item label="警告告警响应时限">
+          <el-input-number
+            v-model="slaForm.warning_minutes"
+            :min="1"
+            :max="10080"
+            controls-position="right"
+          />
+          <span class="form-hint">分钟；默认比严重告警更长</span>
+        </el-form-item>
+        <el-form-item label="升级上限">
+          <el-input-number
+            v-model="slaForm.max_escalations"
+            :min="0"
+            :max="10"
+            controls-position="right"
+          />
+          <span class="form-hint">0 表示不升级；达上限后停止升级，但告警仍标记「已超时」</span>
+        </el-form-item>
+        <el-form-item label="升级间隔">
+          <el-input-number
+            v-model="slaForm.escalation_interval_minutes"
+            :min="1"
+            :max="10080"
+            controls-position="right"
+          />
+          <span class="form-hint">分钟；第 N 次升级 = 截止时间 + (N-1) × 间隔</span>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="升级通知复用现有通知规则链路，内容包含「超时升级、第几次、原 SLA 时长」；同一条告警同一步只发一次。"
+      />
     </el-card>
 
     <el-card v-loading="notifyLoading" shadow="never">

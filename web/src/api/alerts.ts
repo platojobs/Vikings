@@ -1,12 +1,14 @@
-/** 告警接口：列表、单条确认、批量确认、统计 */
+/** 告警接口：列表、确认、统计、SLA 配置与值班交接（v1.33.0） */
 
 import { request } from '@/api/http'
 import type {
+  AlertHandoverResult,
   AlertItem,
   AlertListQuery,
   AlertSummary,
   BulkAckResult,
   PageResult,
+  SlaConfig,
 } from '@/types'
 
 export function fetchAlerts(query: AlertListQuery = {}): Promise<PageResult<AlertItem>> {
@@ -15,6 +17,7 @@ export function fetchAlerts(query: AlertListQuery = {}): Promise<PageResult<Aler
       deviceId: query.deviceId,
       level: query.level,
       status: query.status,
+      sla: query.sla,
       start: query.start,
       end: query.end,
       page: query.page,
@@ -46,4 +49,23 @@ export function bulkAckAlerts(alertIds: string[], note?: string): Promise<BulkAc
 
 export function fetchAlertSummary(): Promise<AlertSummary> {
   return request<AlertSummary>('/api/alerts/summary')
+}
+
+export function fetchSlaConfig(): Promise<SlaConfig> {
+  return request<SlaConfig>('/api/alerts/sla-config')
+}
+
+/** 仅 admin 可调用；修改只影响新告警，历史告警保留创建时的时限快照 */
+export function updateSlaConfig(payload: Partial<SlaConfig>): Promise<SlaConfig> {
+  return request<SlaConfig>('/api/alerts/sla-config', { method: 'PUT', body: payload })
+}
+
+/** 值班交接：把 from_user（默认当前登录人）名下未处理告警交给下一班 */
+export function handoverAlerts(payload: {
+  to: string
+  from_user?: string
+  include_unassigned?: boolean
+  note?: string
+}): Promise<AlertHandoverResult> {
+  return request<AlertHandoverResult>('/api/alerts/handover', { method: 'POST', body: payload })
 }

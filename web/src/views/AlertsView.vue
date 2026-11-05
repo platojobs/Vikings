@@ -5,10 +5,17 @@
  * v1.21.0：批量确认复用 POST /api/alerts/bulk-ack，部分失败逐类展示；
  * viewer 只读，多选与确认按钮禁用并给出说明。
  * v1.30.0：新增时间范围筛选与「导出 CSV」，列表与导出共用同一套筛选参数。
+ * v1.33.0：SLA 状态列与「已超时」筛选；值班交接（二次确认，operator/admin）。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { ElMessage, ElNotification } from 'element-plus'
-import { ackAlert, bulkAckAlerts, fetchAlerts, fetchAlertSummary } from '@/api/alerts'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
+import {
+  ackAlert,
+  bulkAckAlerts,
+  fetchAlerts,
+  fetchAlertSummary,
+  handoverAlerts,
+} from '@/api/alerts'
 import { exportAlerts, formatBytes } from '@/api/exports'
 import { fetchThresholds, updateThresholds } from '@/api/rules'
 import { subscribe } from '@/services/mqtt'
@@ -25,6 +32,7 @@ import type {
   AlertItem,
   AlertLevel,
   AlertSummary,
+  SlaState,
   SystemAlertMessage,
   ThresholdsUpdateBody,
   ThresholdsView,
@@ -36,7 +44,7 @@ import type {
 const canWrite = computed(() => canOperate())
 const isAdminOnly = computed(() => isAdmin())
 
-const summary = ref<AlertSummary>({ open: 0, critical_open: 0, today: 0 })
+const summary = ref<AlertSummary>({ open: 0, critical_open: 0, today: 0, overdue_open: 0 })
 
 async function loadSummary(): Promise<void> {
   try {
@@ -48,9 +56,15 @@ async function loadSummary(): Promise<void> {
 
 // ==================== 告警列表 ====================
 
-const query = reactive<{ level: AlertLevel | ''; status: 'open' | 'acked' | ''; deviceId: string }>({
+const query = reactive<{
+  level: AlertLevel | ''
+  status: 'open' | 'acked' | ''
+  sla: SlaState | ''
+  deviceId: string
+}>({
   level: '',
   status: '',
+  sla: '',
   deviceId: '',
 })
 /** 时间范围筛选（v1.30.0）：与导出共用，null 表示不限时间 */
@@ -99,6 +113,7 @@ async function loadAlerts(): Promise<void> {
     const result = await fetchAlerts({
       level: query.level || undefined,
       status: query.status || undefined,
+      sla: query.sla || undefined,
       deviceId: query.deviceId.trim() || undefined,
       start: start ? start.getTime() : undefined,
       end: end ? end.getTime() : undefined,
@@ -137,10 +152,114 @@ function handleSearch(): void {
 function handleReset(): void {
   query.level = ''
   query.status = ''
+  query.sla = ''
   query.deviceId = ''
   range.value = null
   page.value = 1
   loadAlerts()
+}
+
+// ==================== SLA 展示与值班交接（v1.33.0） ====================
+
+const SLA_LABELS: Record<SlaState, string> = {
+  met: '达标',
+  late: '超时达成',
+  pending: '未超时',
+  overdue: '已超时',
+  unknown: '历史确认',
+}
+
+const SLA_TAG_TYPES: Record<SlaState, 'success' | 'warning' | 'info' | 'danger'> = {
+  met: 'success',
+  late: 'warning',
+  pending: 'info',
+  overdue: 'danger',
+  unknown: 'info',
+}
+
+function slaLabel(state?: SlaState | null): string {
+  return state ? SLA_LABELS[state] ?? state : '—'
+}
+
+function slaTagType(state?: SlaState | null): 'success' | 'warning' | 'info' | 'danger' {
+  return state ? SLA_TAG_TYPES[state] ?? 'info' : 'info'
+}
+
+/** 未处理显示剩余/超出，已确认显示实际响应；历史确认无处置时间时明确提示 */
+function slaDuration(row: AlertItem): string {
+  if (row.sla_state === 'unknown') return '无处置时间'
+  const seconds =
+    row.sla_state === 'pending' || row.sla_state === 'overdue'
+      ? row.sla_remaining_seconds
+      : row.sla_response_seconds
+  if (seconds === null || seconds === undefined) return '—'
+  const minutes = Math.floor(Math.abs(seconds) / 60)
+  const value = minutes >= 60 ? `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分` : `${minutes} 分`
+  if (row.sla_state === 'pending') return `剩余 ${value}`
+  if (row.sla_state === 'overdue') return `超出 ${value}`
+  return `响应 ${value}`
+}
+
+const handoverDialog = reactive({
+  visible: false,
+  loading: false,
+  to: '',
+  fromUser: '',
+  includeUnassigned: true,
+  note: '',
+})
+
+function openHandover(): void {
+  if (!canWrite.value) return
+  handoverDialog.to = ''
+  handoverDialog.fromUser = ''
+  handoverDialog.includeUnassigned = true
+  handoverDialog.note = ''
+  handoverDialog.visible = true
+}
+
+/** 交接不可撤销，提交前二次确认（含交接范围与接收人） */
+async function confirmHandover(): Promise<void> {
+  const to = handoverDialog.to.trim()
+  if (!to) {
+    ElMessage.warning('请填写接收人（下一值班人）')
+    return
+  }
+  const from = handoverDialog.fromUser.trim()
+  const scope = handoverDialog.includeUnassigned
+    ? `「${from || '当前登录人'}」名下及未指派的未处理告警`
+    : `「${from || '当前登录人'}」名下的未处理告警`
+  try {
+    await ElMessageBox.confirm(
+      `将把${scope}全部交接给「${to}」，交接后 SLA 计时与升级次数不会重置。是否继续？`,
+      '确认值班交接',
+      { type: 'warning', confirmButtonText: '确认交接', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  handoverDialog.loading = true
+  try {
+    const result = await handoverAlerts({
+      to,
+      from_user: from || undefined,
+      include_unassigned: handoverDialog.includeUnassigned,
+      note: handoverDialog.note.trim() || undefined,
+    })
+    if (result.count === 0) {
+      ElMessage.info('没有需要交接的未处理告警')
+    } else {
+      ElMessage.success(
+        `已交接 ${result.count} 条未处理告警给「${result.to}」，汇总通知已排队发送`,
+      )
+    }
+    handoverDialog.visible = false
+    await Promise.all([loadAlerts(), loadSummary()])
+  } catch (error) {
+    ElMessage.error((error as Error).message || '交接失败，请稍后重试')
+  } finally {
+    handoverDialog.loading = false
+  }
 }
 
 /** 导出当前筛选范围；不做静默放宽，筛选为空就是不限 */
@@ -401,19 +520,25 @@ onUnmounted(() => {
 <template>
   <div class="page alerts-page">
     <el-row :gutter="16" class="summary-row">
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card shadow="never" class="summary-card">
           <div class="summary-value warning">{{ summary.open }}</div>
           <div class="summary-label">未处理告警</div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :span="6">
+        <el-card shadow="never" class="summary-card">
+          <div class="summary-value critical">{{ summary.overdue_open ?? 0 }}</div>
+          <div class="summary-label">其中已超时</div>
+        </el-card>
+      </el-col>
+      <el-col :span="6">
         <el-card shadow="never" class="summary-card">
           <div class="summary-value critical">{{ summary.critical_open }}</div>
           <div class="summary-label">未处理严重告警</div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card shadow="never" class="summary-card">
           <div class="summary-value">{{ summary.today }}</div>
           <div class="summary-label">今日新增告警</div>
@@ -430,6 +555,13 @@ onUnmounted(() => {
         <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-select">
           <el-option label="未处理" value="open" />
           <el-option label="已确认" value="acked" />
+        </el-select>
+        <el-select v-model="query.sla" placeholder="全部 SLA" clearable class="filter-select">
+          <el-option label="已超时" value="overdue" />
+          <el-option label="未超时" value="pending" />
+          <el-option label="达标" value="met" />
+          <el-option label="超时达成" value="late" />
+          <el-option label="历史确认（无处置时间）" value="unknown" />
         </el-select>
         <el-input
           v-model="query.deviceId"
@@ -457,6 +589,9 @@ onUnmounted(() => {
           {{ exporting ? `导出中 ${formatBytes(exportLoaded)}` : '导出 CSV' }}
         </el-button>
         <div class="filter-spacer" />
+        <el-button v-if="canWrite" type="primary" plain @click="openHandover">
+          值班交接
+        </el-button>
         <el-button v-if="isAdminOnly" type="warning" plain @click="openThresholdDrawer">
           阈值配置
         </el-button>
@@ -532,6 +667,20 @@ onUnmounted(() => {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="SLA" width="130">
+          <template #default="{ row }">
+            <el-tag :type="slaTagType(row.sla_state)" size="small" effect="plain">
+              {{ slaLabel(row.sla_state) }}
+            </el-tag>
+            <div class="sla-meta">{{ slaDuration(row) }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="责任人" width="110">
+          <template #default="{ row }">
+            <span v-if="row.assignee">{{ row.assignee }}</span>
+            <span v-else class="acked-hint">未指派</span>
+          </template>
+        </el-table-column>
         <el-table-column label="处置信息" min-width="200">
           <template #default="{ row }">
             <template v-if="row.status === 'acked'">
@@ -580,6 +729,49 @@ onUnmounted(() => {
         />
       </div>
     </el-card>
+
+    <el-dialog v-model="handoverDialog.visible" title="值班交接" width="460px">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="交接只转移责任归属，不重置 SLA 计时与升级次数"
+        description="已超时的告警交接后仍标「已超时」，避免换班把欠账洗白。"
+        class="handover-tip"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="接收人">
+          <el-input v-model="handoverDialog.to" placeholder="下一值班人用户名" maxlength="64" />
+        </el-form-item>
+        <el-form-item label="交接人（可选）">
+          <el-input
+            v-model="handoverDialog.fromUser"
+            placeholder="默认当前登录人"
+            maxlength="64"
+          />
+        </el-form-item>
+        <el-form-item label="包含未指派">
+          <el-switch v-model="handoverDialog.includeUnassigned" />
+          <span class="handover-hint">未指派告警也一并交给下一班</span>
+        </el-form-item>
+        <el-form-item label="备注">
+          <el-input
+            v-model="handoverDialog.note"
+            type="textarea"
+            :rows="2"
+            maxlength="200"
+            show-word-limit
+            placeholder="交接说明（可选）"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="handoverDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="handoverDialog.loading" @click="confirmHandover">
+          交接
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       v-model="ackDialog.visible"
@@ -728,6 +920,22 @@ onUnmounted(() => {
 
 .acked-hint {
   color: #cbd5e1;
+}
+
+.sla-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.handover-tip {
+  margin-bottom: 12px;
+}
+
+.handover-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #94a3b8;
 }
 
 .pagination-bar {

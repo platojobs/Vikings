@@ -219,6 +219,38 @@ export interface AlertItem {
   acked_by?: string | null
   /** 确认时间（ISO8601）；历史确认行为 null */
   acked_at?: string | null
+  // v1.33.0 SLA 与值班交接：服务端统一口径，前端不重复计算
+  assignee?: string | null
+  sla_minutes?: number | null
+  sla_deadline_at?: string | null
+  /** met=达标 / late=超时达成 / pending=未超时 / overdue=已超时 / unknown=历史确认无时间 */
+  sla_state?: SlaState | null
+  /** 未处理为剩余秒数（负数即超出）；已确认行为空，改用 sla_response_seconds */
+  sla_remaining_seconds?: number | null
+  sla_response_seconds?: number | null
+  escalation_count?: number
+}
+
+export type SlaState = 'met' | 'late' | 'pending' | 'overdue' | 'unknown'
+
+/** SLA 配置（GET/PUT /api/alerts/sla-config，仅 admin 可改） */
+export interface SlaConfig {
+  critical_minutes: number
+  warning_minutes: number
+  max_escalations: number
+  escalation_interval_minutes: number
+  updated_at?: string | null
+  updated_by: string
+}
+
+/** 值班交接结果（POST /api/alerts/handover） */
+export interface AlertHandoverResult {
+  from_user: string
+  to: string
+  count: number
+  window_start: string | null
+  window_end: string | null
+  notification: string
 }
 
 /** 批量确认结果：三类 ID 逐类返回，部分失败对调用方可见 */
@@ -247,6 +279,8 @@ export interface AlertListQuery {
   deviceId?: string
   level?: AlertLevel
   status?: 'open' | 'acked'
+  /** v1.33.0：SLA 状态筛选（已超时 = overdue） */
+  sla?: SlaState
   /** 创建时间下限/上限（毫秒时间戳），v1.30.0 与导出口径一致 */
   start?: number
   end?: number
@@ -259,6 +293,8 @@ export interface AlertSummary {
   open: number
   critical_open: number
   today: number
+  /** v1.33.0：未处理中已超过 SLA 时限的条数 */
+  overdue_open?: number
 }
 
 // ==================== 阈值在线配置 ====================

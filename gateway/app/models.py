@@ -115,6 +115,8 @@ class DeviceAlert(Base):
         Index("idx_alert_level_created", "level", "created_at"),
         # 移动端/看板按设备聚合未处理告警（status + device_id）
         Index("idx_alert_status_device", "status", "device_id"),
+        # v1.33.0：超时升级巡检与「已超时」筛选按 status + 截止时间扫描
+        Index("idx_alert_status_sla_deadline", "status", "sla_deadline_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
@@ -135,6 +137,21 @@ class DeviceAlert(Base):
     ack_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     acked_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     acked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ---- SLA 与值班交接（v1.33.0）----
+    # 当前责任人：创建时为空（未指派），值班交接时批量改写；与 acked_by 不同，
+    # 它表示「谁现在负责处理」，不是「谁确认过」。
+    assignee: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # 响应时限快照：创建时按级别从 SLA 配置写入，之后修改配置不影响历史告警口径。
+    sla_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    sla_deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 已发出的超时升级次数：巡检以「条件自增」原子领取升级名额，防止重复轰炸。
+    escalation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_escalated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class DeviceCommand(Base):
@@ -318,6 +335,29 @@ class NotificationRule(Base):
     updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
 
 
+class SlaConfig(Base):
+    """告警 SLA 单行配置（v1.33.0）：按级别响应时限 + 超时升级策略。
+
+    存库热读取，Web「系统设置」修改后下一轮巡检立即生效；修改不回写历史告警，
+    因为每条告警在创建时已快照自己的 `sla_minutes` / `sla_deadline_at`。
+    """
+
+    __tablename__ = "sla_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    # 从告警创建到确认的响应时限；critical 默认更短，warning 更长
+    critical_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    warning_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=120)
+    # 升级上限：0 表示不升级；达到上限后停止升级但告警仍标记「已超时」
+    max_escalations: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # 第 N 次升级的触发时间 = 截止时间 + (N-1) * 该间隔；默认 30 分钟
+    escalation_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+
+
 class NotificationDelivery(Base):
     """通知投递记录（v1.31.0 起同时是持久化重试队列）。
 
@@ -350,6 +390,12 @@ class NotificationDelivery(Base):
     channel: Mapped[str] = mapped_column(String(16), nullable=False)
     # pending / sent / failed / suppressed
     status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 投递类型（v1.33.0）：alert=首条告警 / escalation=超时升级 / handover=交接汇总。
+    # 与 channel 正交，便于历史页区分「这是升级通知还是首次告警」。
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="alert", server_default="alert")
+    # 附加载荷快照：升级的「第几次/原 SLA」或交接的「交接人/接收人/条数/时间窗口」。
+    # 与告警正文分开存，网关重启后重试仍能还原完整通知内容。
+    extra: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONPayload, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 

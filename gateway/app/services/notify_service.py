@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import time
+import uuid
 import weakref
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -393,9 +394,15 @@ def _build_payload(
     test: bool,
     delivery_id: Optional[int] = None,
     rule: Optional[Any] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
-        "event": "notification.test" if test else "alert",
+    """通知载荷：v1.33.0 起支持升级/交接的附加块。
+
+    `extra` 由投递记录持久化，网关重启后重试仍能还原「第几次升级 / 原 SLA」
+    或「交接人 / 接收人 / 条数 / 时间窗口」，不依赖进程内内存。
+    """
+    payload = {
+        "event": "notification.test" if test else (extra or {}).get("event", "alert"),
         "sentAt": datetime.now(timezone.utc).isoformat(),
         # 接收端幂等键：同一 delivery 在崩溃/重试后可能重复到达，按此去重
         "deliveryId": delivery_id,
@@ -408,6 +415,11 @@ def _build_payload(
             "status": device.status if device else "unknown",
         },
     }
+    if extra:
+        for key in ("escalation", "handover"):
+            if key in extra:
+                payload[key] = extra[key]
+    return payload
 
 
 async def _attempt_webhook(
@@ -417,9 +429,10 @@ async def _attempt_webhook(
     test: bool,
     timeout: float,
     delivery_id: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], int]:
     """单次 Webhook 尝试；返回 (是否成功, 脱敏错误, 耗时毫秒)。"""
-    payload = _build_payload(alert, device, test, delivery_id, rule)
+    payload = _build_payload(alert, device, test, delivery_id, rule, extra)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -451,6 +464,7 @@ async def _attempt_smtp(
     test: bool,
     timeout: float,
     delivery_id: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], int]:
     """单次 SMTP 尝试；SMTP 服务器沿用全局配置，收件人来自规则。"""
     recipients = _as_list(rule.smtp_to)
@@ -459,20 +473,50 @@ async def _attempt_smtp(
     subject = f"[{level}] 设备 {alert.get('deviceId')} {alert.get('message') or '告警'}"
     if test:
         subject = "[测试] " + subject
-    body = "\n".join(
-        [
-            "设备 ID: " + str(alert.get("deviceId")),
-            "设备名称: " + str(alert.get("deviceName") or (device.name if device else "")),
-            "分组: " + (device.group_name if device else ""),
-            "级别: " + level,
-            "指标: " + str(alert.get("metric")),
-            "当前值: " + str(alert.get("value")),
-            "阈值: " + str(alert.get("threshold")),
-            "内容: " + str(alert.get("message")),
-            "规则: " + str(rule.name),
-            "时间: " + datetime.now(timezone.utc).isoformat(),
-        ]
-    )
+    extra = extra or {}
+    escalation = extra.get("escalation")
+    handover = extra.get("handover")
+    if escalation:
+        subject = (
+            f"[超时升级 第{escalation.get('attempt')}/{escalation.get('maxAttempts')}次] "
+            f"设备 {alert.get('deviceId')} {alert.get('message') or '告警'}"
+        )
+    elif handover:
+        subject = f"[值班交接] {handover.get('fromUser')} → {handover.get('to')}（{handover.get('count')} 条）"
+
+    lines = [
+        "设备 ID: " + str(alert.get("deviceId")),
+        "设备名称: " + str(alert.get("deviceName") or (device.name if device else "")),
+        "分组: " + (device.group_name if device else ""),
+        "级别: " + level,
+        "指标: " + str(alert.get("metric")),
+        "当前值: " + str(alert.get("value")),
+        "阈值: " + str(alert.get("threshold")),
+        "内容: " + str(alert.get("message")),
+        "规则: " + str(rule.name),
+        "时间: " + datetime.now(timezone.utc).isoformat(),
+    ]
+    if escalation:
+        lines.extend(
+            [
+                "升级类型: 超时升级",
+                f"第几次: {escalation.get('attempt')} / {escalation.get('maxAttempts')}",
+                f"原 SLA: {escalation.get('slaMinutes')} 分钟",
+                f"已超出: {escalation.get('overdueMinutes')} 分钟",
+            ]
+        )
+    if handover:
+        lines.extend(
+            [
+                "交接类型: 值班交接汇总",
+                f"交接人: {handover.get('fromUser')}",
+                f"接收人: {handover.get('to')}",
+                f"交接条数: {handover.get('count')}",
+                f"告警时间窗口: {handover.get('windowStart')} ~ {handover.get('windowEnd')}",
+                f"操作人: {handover.get('operator')}",
+            ]
+        )
+    body = "\n".join(lines)
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = config.smtp_from or ""
@@ -556,6 +600,8 @@ def _new_delivery(
     *,
     status: str = "pending",
     error: Optional[str] = None,
+    kind: str = "alert",
+    extra: Optional[Dict[str, Any]] = None,
 ) -> NotificationDelivery:
     now = datetime.now(timezone.utc)
     return NotificationDelivery(
@@ -565,6 +611,8 @@ def _new_delivery(
         level=str(alert.get("level") or "")[:16],
         channel=channel,
         status=status,
+        kind=kind,
+        extra=extra,
         attempts=0,
         error=(error or "")[:255] or None,
         rule_id=getattr(rule, "id", None) if rule is not None else None,
@@ -626,6 +674,8 @@ async def process_delivery(
             return _summary(row)
 
         channel = row.channel
+        # 升级/交接的附加载荷从投递记录读取：首投与重启后重试走同一份快照
+        extra = dict(row.extra or {})
         if context is not None:
             config, rule, device, alert = context
         else:
@@ -651,23 +701,38 @@ async def process_delivery(
                 rule = _LegacyRule(config)
 
             device = await session.get(Device, row.device_id)
-            # 重试可能发生在网关重启后，内存里的原始告警已丢失：从告警表重建内容
-            alert_row = (
-                await session.execute(
-                    select(DeviceAlert).where(DeviceAlert.alert_id == row.alert_id).limit(1)
-                )
-            ).scalar_one_or_none()
-            alert = {
-                "alertId": row.alert_id,
-                "deviceId": row.device_id,
-                "deviceName": device.name if device else row.device_id,
-                "level": row.level,
-                "metric": row.metric,
-                "value": float(alert_row.value) if alert_row else None,
-                "threshold": float(alert_row.threshold) if alert_row else None,
-                "message": alert_row.message if alert_row else f"{row.metric} 越过阈值",
-                "aiGenerated": bool(alert_row.ai_generated) if alert_row else False,
-            }
+            if row.kind == "handover":
+                # 交接汇总不对应具体告警，载荷全部来自投递记录里的快照
+                handover = extra.get("handover", {})
+                alert = {
+                    "alertId": row.alert_id,
+                    "deviceId": row.device_id,
+                    "deviceName": f"值班交接 → {handover.get('to', '')}",
+                    "level": row.level,
+                    "metric": "handover",
+                    "value": handover.get("count"),
+                    "threshold": 0,
+                    "message": handover.get("message") or "值班交接汇总",
+                    "aiGenerated": False,
+                }
+            else:
+                # 重试可能发生在网关重启后，内存里的原始告警已丢失：从告警表重建内容
+                alert_row = (
+                    await session.execute(
+                        select(DeviceAlert).where(DeviceAlert.alert_id == row.alert_id).limit(1)
+                    )
+                ).scalar_one_or_none()
+                alert = {
+                    "alertId": row.alert_id,
+                    "deviceId": row.device_id,
+                    "deviceName": device.name if device else row.device_id,
+                    "level": row.level,
+                    "metric": row.metric,
+                    "value": float(alert_row.value) if alert_row else None,
+                    "threshold": float(alert_row.threshold) if alert_row else None,
+                    "message": alert_row.message if alert_row else f"{row.metric} 越过阈值",
+                    "aiGenerated": bool(alert_row.ai_generated) if alert_row else False,
+                }
 
         missing = _channel_missing_reason(config, rule, channel)
         if missing:
@@ -683,11 +748,12 @@ async def process_delivery(
     # ---- 阶段 2：执行网络尝试（不持有数据库连接，慢接收端不会拖垮连接池）----
     if channel == "webhook":
         ok, error, elapsed_ms = await _attempt_webhook(
-            rule, alert, device, test=False, timeout=timeout, delivery_id=delivery_id
+            rule, alert, device, test=False, timeout=timeout, delivery_id=delivery_id, extra=extra
         )
     else:
         ok, error, elapsed_ms = await _attempt_smtp(
-            config, rule, alert, device, test=False, timeout=timeout, delivery_id=delivery_id
+            config, rule, alert, device, test=False, timeout=timeout, delivery_id=delivery_id,
+            extra=extra,
         )
 
     # ---- 阶段 3：写回尝试结果（单次短事务）----
@@ -807,6 +873,120 @@ async def list_deliveries(
         page=page,
         page_size=page_size,
     )
+
+
+async def _resolve_handover_rule(
+    session: AsyncSession, config: NotificationConfig, level: str
+) -> Optional[Any]:
+    """交接汇总的规则裁决：按优先级取第一条可用规则。
+
+    与普通告警不同，交接是多设备汇总、没有单一分组，因此**忽略规则里的分组/设备
+    条件**，只按级别与可用渠道筛选；否则「交接通知」会因分组不匹配而永远发不出。
+    其余行为（priority ASC, id ASC、无规则时回退 v1.29.0 单行配置）与告警一致。
+    """
+    rules = await list_rules(session)
+    if not rules:
+        legacy = _LegacyRule(config)
+        if _rule_usable(legacy) and (not _as_list(legacy.levels) or level in _as_list(legacy.levels)):
+            return legacy
+        return None
+    for rule in rules:
+        if not rule.enabled or not _rule_usable(rule):
+            continue
+        levels = _as_list(rule.levels)
+        if levels and level not in levels:
+            continue
+        return rule
+    return None
+
+
+async def send_handover_summary(
+    *,
+    to: str,
+    from_user: str,
+    count: int,
+    window_start: Optional[datetime],
+    window_end: Optional[datetime],
+    level: str,
+    operator: str,
+    note: Optional[str] = None,
+    session_factory=None,
+) -> List[Dict[str, Any]]:
+    """值班交接汇总：复用 v1.31.0 的规则链路与投递队列，只发**一条汇总**。
+
+    设计取舍：
+    - 不是给每条告警发一次通知（N 条会淹没接收人），而是把条数与时间窗口聚合成
+      一条 `alert.handover` 事件；
+    - 仍先落 `notification_delivery` 再首投，网关重启后由调度器续投；
+    - 交接汇总没有具体设备，按级别选第一条可用规则，忽略分组/设备过滤条件。
+    """
+    async with _dispatch_gate():
+        factory = session_factory or SessionFactory
+        alert = {
+            "alertId": "hnd-" + uuid.uuid4().hex[:12],
+            "deviceId": "handover",
+            "deviceName": f"值班交接 → {to}",
+            "level": level,
+            "metric": "handover",
+            "value": count,
+            "threshold": 0,
+            "message": f"值班交接：{from_user} → {to}，共 {count} 条未处理告警",
+            "aiGenerated": False,
+        }
+        extra = {
+            "event": "alert.handover",
+            "handover": {
+                "fromUser": from_user,
+                "to": to,
+                "count": count,
+                "windowStart": window_start.isoformat() if window_start else None,
+                "windowEnd": window_end.isoformat() if window_end else None,
+                "operator": operator,
+                "note": note,
+                "message": alert["message"],
+            },
+        }
+
+        ids: List[int] = []
+        async with factory() as session:
+            config = await session.get(NotificationConfig, CONFIG_ID)
+            if config is None or not config.enabled:
+                logger.info("交接汇总未发送：通知总开关关闭 to=%s count=%d", to, count)
+                return []
+            rule = await _resolve_handover_rule(session, config, level)
+            if rule is None:
+                row = _new_delivery(
+                    alert, channel="rule", rule=None, group_name="",
+                    status="suppressed", error="未匹配任何可用通知规则", kind="handover", extra=extra,
+                )
+                session.add(row)
+                await session.commit()
+                return [{"channel": "rule", "status": "suppressed", "attempts": 0, "error": row.error}]
+
+            for channel in ("webhook", "smtp"):
+                if _channel_missing_reason(config, rule, channel) is None:
+                    row = _new_delivery(
+                        alert, channel=channel, rule=rule, group_name="",
+                        status="pending", kind="handover", extra=extra,
+                    )
+                    session.add(row)
+                    await session.flush()
+                    ids.append(row.id)
+            if not ids:
+                row = _new_delivery(
+                    alert, channel="rule", rule=rule, group_name="",
+                    status="suppressed", error="规则未启用任何可用渠道（Webhook/SMTP）",
+                    kind="handover", extra=extra,
+                )
+                session.add(row)
+                await session.commit()
+                return [{"channel": "rule", "status": "suppressed", "attempts": 0, "error": row.error}]
+            await session.commit()
+
+        results = []
+        for delivery_id in ids:
+            results.append(await process_delivery(delivery_id, factory))
+        return results
 
 
 # ==================== 派发入口 ====================

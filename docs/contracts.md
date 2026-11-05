@@ -420,10 +420,13 @@ v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`start`/`end`（v1.30.0，`created_at` 闭区间）、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`sla`（v1.33.0：met/late/pending/overdue/unknown）、`start`/`end`（v1.30.0，`created_at` 闭区间）、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
 | POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增，v1.21.0 支持备注），见 3.3.1 |
-| POST | `/api/alerts/{alertId}/ack` | 单条告警确认（v1.21.0 支持备注），见 3.3.2 |
-| GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today}` |
+| POST | `/api/alerts/{alertId}/ack` | 单条告警确认（v1.21.0 支持备注，v1.33.0 返回 SLA 状态），见 3.3.2 |
+| GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today, overdue_open}`（v1.33.0 增 `overdue_open`） |
+| GET | `/api/alerts/sla-config` | 读取 SLA 配置（登录即可读） |
+| PUT | `/api/alerts/sla-config` | 修改 SLA 配置（仅 `admin`），写审计 `sla.config_update` |
+| POST | `/api/alerts/handover` | 值班交接（`operator`/`admin`），见 3.3.4 |
 
 **级别口径（P2-1 / v1.21.0）**：规则引擎按阈值真实产出的级别只有 `warning` 与
 `critical` 两级；对外枚举同步收敛，`level` 传 `info` / `notice` 一律 422。
@@ -464,6 +467,81 @@ v1.21.0 之前已确认的历史行**不做臆测回填**：无法得知真实�
 | 幂等 | 已 acked 的行再次确认返回 200，保留首次处置信息（不覆盖） |
 | 错误 | 告警不存在 404；备注超长 422 |
 | 审计 | 写 `alert.ack`，`detail` 含 `deviceId` / `level` / `metric` / `note_summary`（脱敏摘要） |
+
+#### 3.3.3 SLA 口径与超时升级（v1.33.0）
+
+`AlertOut` 在 v1.33.0 新增以下字段（列表、确认、详情同口径，均由网关计算后才返回）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `assignee` | string \| null | 责任人；未指派为 `null`，交接后为目标值班人 |
+| `sla_minutes` | int | 创建时的时限快照（分钟） |
+| `sla_deadline_at` | ISO8601 | 截止时间 = 创建时刻 + 快照时限 |
+| `sla_state` | string | `met` / `late` / `pending` / `overdue` / `unknown` |
+| `sla_remaining_seconds` | int \| null | 未确认时剩余秒数；已超时为负数；已确认为 `null` |
+| `sla_response_seconds` | int \| null | 确认时与创建时的差值；未确认为 `null` |
+| `escalation_count` | int | 已发出的升级次数 |
+
+**三态判定（含历史行）**：
+
+| `sla_state` | 条件 | 是否达标 |
+| --- | --- | --- |
+| `met` | `status=acked` 且 `acked_at` 存在且 `acked_at <= sla_deadline_at` | 是 |
+| `late` | `status=acked` 且 `acked_at` 存在且 `acked_at > sla_deadline_at` | 是（超时达成） |
+| `unknown` | `status=acked` 但 `acked_at` 为 `NULL`（v1.21.0 之前的历史确认行） | **否**，不计入达标 |
+| `overdue` | `status=open` 且当前时间已过 `sla_deadline_at` | 否 |
+| `pending` | `status=open` 且未到 `sla_deadline_at` | 否 |
+
+历史已确认但 `acked_at` 为 `NULL` 的行**不臆测时间**，统一归为 `unknown`：
+既不算达标也不算超时，筛选「达标」时不会出现，避免把无法证明的处置当成合规。
+
+**按级别时限**：创建告警时按 `level` 取 `critical_minutes` / `warning_minutes`，写入
+`sla_minutes` 与 `sla_deadline_at` 快照。之后改配置只影响新告警，不回改存量。
+
+**升级策略：逐级升级（fixed-step）+ 上限**。第 N 次升级在
+`sla_deadline_at + (N-1) * escalation_interval_minutes` 触发，`N` 从 1 开始；
+`max_escalations` 为上限，达到后停止升级但 SLA 仍为 `overdue`（不洗白）。
+选择逐级升级而非「首个超时点连续升级」，是为了让值班人有真实的处理间隔，
+同时上限能防止长期无人处理时反复轰炸接收端。
+
+**幂等**：巡检用条件更新原子领取名额（`WHERE escalation_count = N-1`），
+同一告警同一级别只发一次；先落 `notification_delivery` 再提交，网关重启后续投，
+不会重复也不会丢。**同一条告警同一次升级只发一次**由 `escalation_count` 保证。
+
+**升级通知载荷**（复用 v1.31.0 规则链路与投递重试，`event = alert.escalation`）：
+
+```json
+{
+  "event": "alert.escalation",
+  "deliveryId": 1,
+  "alert": {"alertId": "...", "deviceId": "...", "level": "critical", "..." : "原有告警字段"},
+  "escalation": {
+    "attempt": 1,
+    "maxAttempts": 2,
+    "slaMinutes": 30,
+    "deadlineAt": "2026-11-05T13:22:05+00:00",
+    "overdueMinutes": 12
+  }
+}
+```
+
+Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正文含原 SLA 与超时时长。
+无规则命中或通知总开关关闭时，投递记 `suppressed` 且不发送，可在投递历史看到原因。
+
+#### 3.3.4 值班交接 `POST /api/alerts/handover`（v1.33.0）
+
+| 项 | 契约 |
+| --- | --- |
+| 权限 | `operator` / `admin`；`viewer` 403，未登录 401 |
+| 入参 | `{"to": "下一值班人", "from_user": "可选，默认当前登录人", "include_unassigned": true, "note": "可选备注 ≤500 字"}` |
+| 范围 | `status != acked` 且（`assignee == from_user`，或 `include_unassigned` 为真时 `assignee IS NULL`）；**不会接管他人名下告警** |
+| 出参 | `data: {from_user, to, count, window_start, window_end, max_level, alerts, notification}`；`notification` 为 `queued` / `skipped` |
+| SLA | **不重置** `sla_deadline_at` 与 `escalation_count`：换班不应洗白已超时或重新触发升级 |
+| 审计 | 一条 `alert.handover`，`detail` 含 `from` / `to` / `count` / `window_start` / `window_end` / `include_unassigned` / `note_summary` |
+| 通知 | 给接收人**只发一条汇总**（`event = alert.handover`），不按条发送；复用 v1.31.0 规则链路，忽略分组/设备条件，只按级别与可用渠道 |
+| 幂等 | 交接本身可重复调用；第二次范围为空时 `count=0`，仍写审计但不再发汇总 |
+
+`alert.handover` 的 `handover` 块：`{fromUser, to, operator, count, windowStart, windowEnd, note, message}`。
 
 ### 3.4 阈值在线配置
 
@@ -1032,6 +1110,24 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | ack_note | text NULL | 处置备注（v1.21.0，≤500 字由 API 校验） |
 | acked_by | varchar(64) NULL | 确认人；v1.21.0 之前的历史确认行为 NULL |
 | acked_at | timestamptz NULL | 确认时间；历史确认行为 NULL |
+| assignee | varchar(64) NULL | 责任人（v1.33.0）；未指派为 NULL |
+| sla_minutes | int NOT NULL | 创建时的 SLA 时限快照（v1.33.0，分钟），此后改配置不影响既有告警 |
+| sla_deadline_at | timestamptz NOT NULL | 创建时计算的截止时间 = `created_at + sla_minutes`（v1.33.0） |
+| escalation_count | int NOT NULL DEFAULT 0 | 已发出的升级次数（v1.33.0），满上限即停止 |
+| last_escalated_at | timestamptz NULL | 最近一次升级时间（v1.33.0） |
+
+索引 `idx_alert_status_sla_deadline(status, sla_deadline_at)` 支撑巡检与「已超时」筛选。
+
+### `sla_config`（v1.33.0，单行）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | int PK | 固定为 1 |
+| critical_minutes | int | critical 告警响应时限，默认 30，1~1440 |
+| warning_minutes | int | warning 告警响应时限，默认 120，1~1440 |
+| max_escalations | int | 单条告警最多升级次数，默认 2，0~10（0 = 不升级） |
+| escalation_interval_minutes | int | 相邻升级间隔，默认 30，1~1440 |
+| updated_at / updated_by | timestamptz / varchar(64) | 最近修改时间与人员 |
 
 ### 4.4 支撑表（OTA / 指令链路必需）
 

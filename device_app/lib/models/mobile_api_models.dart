@@ -4,6 +4,19 @@
 /// MQTT 报文模型仍留在 [SensorPayload] 系列，两类协议不混用。
 library;
 
+int? _asNullableInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? num.tryParse(value)?.toInt();
+  }
+  return null;
+}
+
 int _asInt(Object? value, [int fallback = 0]) {
   if (value is int) {
     return value;
@@ -530,6 +543,11 @@ class AlertItem {
     this.ackNote,
     this.ackedBy,
     this.ackedAt,
+    this.slaState,
+    this.slaRemainingSeconds,
+    this.slaResponseSeconds,
+    this.assignee,
+    this.escalationCount = 0,
   });
 
   final String alertId;
@@ -556,6 +574,20 @@ class AlertItem {
   /// 确认时间；历史确认行为 null
   final DateTime? ackedAt;
 
+  /// SLA 状态（v1.33.0）：met / late / pending / overdue / unknown。
+  /// 移动端只读展示，不在设备端做交接或改 SLA 配置。
+  final String? slaState;
+
+  /// 未处理为剩余秒数（负数即超出）；已确认行为空
+  final int? slaRemainingSeconds;
+  final int? slaResponseSeconds;
+
+  /// 当前责任人；未指派为 null
+  final String? assignee;
+
+  /// 已发出的超时升级次数
+  final int escalationCount;
+
   bool get critical => level == 'critical';
 
   factory AlertItem.fromJson(Map<String, dynamic> json) => AlertItem(
@@ -572,6 +604,11 @@ class AlertItem {
     ackNote: _asNullableString(json['ack_note']),
     ackedBy: _asNullableString(json['acked_by']),
     ackedAt: _asTime(json['acked_at']),
+    slaState: _asNullableString(json['sla_state']),
+    slaRemainingSeconds: _asNullableInt(json['sla_remaining_seconds']),
+    slaResponseSeconds: _asNullableInt(json['sla_response_seconds']),
+    assignee: _asNullableString(json['assignee']),
+    escalationCount: _asInt(json['escalation_count']),
   );
 }
 
