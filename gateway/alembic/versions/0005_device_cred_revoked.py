@@ -4,7 +4,7 @@
 - 非 NULL：该凭证已被吊销，设备必须重新签发才能接入 Broker；
 - 仅新增一列，不改动既有数据，存量设备默认 NULL（按「未吊销」解释）。
 
-Revision ID: 0005_device_credential_revoked_at
+Revision ID: 0005_device_cred_revoked
 Revises: 0004_refresh_tokens
 Create Date: 2026-11-05
 """
@@ -14,7 +14,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0005_device_credential_revoked_at"
+revision: str = "0005_device_cred_revoked"
 down_revision: Union[str, None] = "0004_refresh_tokens"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

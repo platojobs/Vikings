@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0005_device_credential_revoked_at"
+HEAD = "0005_device_cred_revoked"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
