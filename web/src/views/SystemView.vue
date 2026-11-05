@@ -6,29 +6,38 @@
  * 这一页回答「故障在哪一层」——网关进程？MQTT 连接？数据库容量？
  * 每 10 秒自动刷新一次，不订阅 MQTT，Broker 断开时本页仍可用。
  *
- * v1.29.0：追加「告警通知通道」配置卡与最近投递记录。
+ * v1.29.0：追加「告警通知通道」配置卡。
+ * v1.31.0：通道传输设置与多规则分开——规则决定收件人与路由，
+ * 传输设置只保留全局开关/超时/退避/SMTP 服务器；投递历史移至独立页面。
  * 服务端配置存库、每次派发热读取，因此保存后无需重启网关；
  * URL / 签名密钥 / SMTP 口令只显示「是否已配置」，表单留空表示保持原值。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { fetchSystemStatus } from '@/api/system'
 import {
+  createNotificationRule,
+  deleteNotificationRule,
   fetchNotificationConfig,
-  fetchNotificationDeliveries,
+  fetchNotificationRules,
   sendTestNotification,
   updateNotificationConfig,
+  updateNotificationRule,
 } from '@/api/notifications'
 import { formatDateTime } from '@/utils/format'
 import type {
   NotificationConfig,
   NotificationConfigPatch,
-  NotificationDelivery,
-  NotificationDeliveryStatus,
+  NotificationRule,
+  NotificationRulePatch,
+  NotificationRulePayload,
   NotificationTestChannel,
   NotificationTestResult,
   SystemStatus,
 } from '@/types'
+
+const router = useRouter()
 
 const status = ref<SystemStatus | null>(null)
 const loading = ref(true)
@@ -64,41 +73,25 @@ const onlineRate = computed(() => {
 
 const totalUptime = computed(() => formatUptime(status.value?.gateway.uptime_seconds ?? 0))
 
-// ==================== 告警通知（v1.29.0） ====================
+// ==================== 通知传输设置（v1.31.0） ====================
 
 const notifyConfig = ref<NotificationConfig | null>(null)
 const notifyLoading = ref(false)
 const notifySaving = ref(false)
-const testing = ref(false)
-const testChannel = ref<NotificationTestChannel>('all')
-const testResults = ref<NotificationTestResult[]>([])
 const clearSecretsBusy = ref(false)
-
-const deliveries = ref<NotificationDelivery[]>([])
-const deliveriesLoading = ref(false)
-const deliveryStatus = ref<NotificationDeliveryStatus | ''>('')
 
 const form = reactive({
   enabled: false,
-  webhook_enabled: false,
-  webhook_url: '',
-  webhook_secret: '',
   webhook_timeout_seconds: 10,
   webhook_max_attempts: 3,
-  smtp_enabled: false,
   smtp_host: '',
   smtp_port: 587,
   smtp_username: '',
   smtp_password: '',
   smtp_from: '',
-  smtp_to: '',
   smtp_starttls: true,
   smtp_timeout_seconds: 10,
   smtp_max_attempts: 3,
-  levels: ['critical'] as Array<'warning' | 'critical'>,
-  groupsText: '',
-  allowText: '',
-  denyText: '',
   mute_minutes: 10,
   retry_backoff_seconds: 1,
 })
@@ -114,30 +107,18 @@ function splitList(text: string): string[] {
 function applyConfig(config: NotificationConfig): void {
   notifyConfig.value = config
   form.enabled = config.enabled
-  form.webhook_enabled = config.webhook_enabled
   form.webhook_timeout_seconds = config.webhook_timeout_seconds
   form.webhook_max_attempts = config.webhook_max_attempts
-  form.smtp_enabled = config.smtp_enabled
   form.smtp_host = config.smtp_host ?? ''
   form.smtp_port = config.smtp_port
   form.smtp_username = config.smtp_username ?? ''
   form.smtp_from = config.smtp_from ?? ''
-  form.smtp_to = config.smtp_to ?? ''
   form.smtp_starttls = config.smtp_starttls
   form.smtp_timeout_seconds = config.smtp_timeout_seconds
   form.smtp_max_attempts = config.smtp_max_attempts
-  form.levels = config.levels.filter(
-    (level): level is 'warning' | 'critical' => level === 'warning' || level === 'critical',
-  )
-  if (form.levels.length === 0) form.levels = ['critical']
-  form.groupsText = config.groups.join(', ')
-  form.allowText = config.device_allow.join(', ')
-  form.denyText = config.device_deny.join(', ')
   form.mute_minutes = config.mute_minutes
   form.retry_backoff_seconds = config.retry_backoff_seconds
   // 敏感字段永远不回显，保持空白（留空 = 保持原值）
-  form.webhook_url = ''
-  form.webhook_secret = ''
   form.smtp_password = ''
 }
 
@@ -152,48 +133,27 @@ async function loadNotificationConfig(): Promise<void> {
   }
 }
 
-async function loadDeliveries(): Promise<void> {
-  deliveriesLoading.value = true
-  try {
-    deliveries.value = await fetchNotificationDeliveries(deliveryStatus.value || undefined)
-  } catch {
-    deliveries.value = []
-  } finally {
-    deliveriesLoading.value = false
-  }
-}
-
 async function saveNotificationConfig(): Promise<void> {
   notifySaving.value = true
   try {
     const payload: NotificationConfigPatch = {
       enabled: form.enabled,
-      webhook_enabled: form.webhook_enabled,
       webhook_timeout_seconds: form.webhook_timeout_seconds,
       webhook_max_attempts: form.webhook_max_attempts,
-      smtp_enabled: form.smtp_enabled,
       smtp_host: form.smtp_host.trim(),
       smtp_port: form.smtp_port,
       smtp_username: form.smtp_username.trim(),
       smtp_from: form.smtp_from.trim(),
-      smtp_to: form.smtp_to.trim(),
       smtp_starttls: form.smtp_starttls,
       smtp_timeout_seconds: form.smtp_timeout_seconds,
       smtp_max_attempts: form.smtp_max_attempts,
-      levels: form.levels,
-      groups: splitList(form.groupsText),
-      device_allow: splitList(form.allowText),
-      device_deny: splitList(form.denyText),
       mute_minutes: form.mute_minutes,
       retry_backoff_seconds: form.retry_backoff_seconds,
     }
-    if (form.webhook_url.trim()) payload.webhook_url = form.webhook_url.trim()
-    if (form.webhook_secret.trim()) payload.webhook_secret = form.webhook_secret.trim()
     if (form.smtp_password.trim()) payload.smtp_password = form.smtp_password.trim()
 
     applyConfig(await updateNotificationConfig(payload))
-    ElMessage.success('通知配置已保存，下一条告警即刻生效（无需重启）')
-    loadDeliveries()
+    ElMessage.success('通知传输设置已保存，下一条告警即刻生效（无需重启）')
   } catch {
     // 请求层已提示
   } finally {
@@ -201,11 +161,12 @@ async function saveNotificationConfig(): Promise<void> {
   }
 }
 
-async function clearSensitiveConfig(): Promise<void> {
+/** v1.29.0 遗留凭据只用于「没有任何规则」时的兼容回退，可一键清空 */
+async function clearLegacySecrets(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '将清空已保存的 Webhook URL、签名密钥与 SMTP 口令。通道会因此无法投递，确认继续？',
-      '清空敏感配置',
+      '将清空 v1.29.0 遗留的全局 Webhook URL / 签名密钥 / SMTP 口令。规则里的接收人不受影响，确认继续？',
+      '清空遗留凭据',
       { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' },
     )
   } catch {
@@ -216,8 +177,7 @@ async function clearSensitiveConfig(): Promise<void> {
     applyConfig(
       await updateNotificationConfig({ webhook_url: '', webhook_secret: '', smtp_password: '' }),
     )
-    ElMessage.success('敏感配置已清空')
-    loadDeliveries()
+    ElMessage.success('遗留凭据已清空')
   } catch {
     // 请求层已提示
   } finally {
@@ -225,18 +185,177 @@ async function clearSensitiveConfig(): Promise<void> {
   }
 }
 
+// ==================== 通知规则（v1.31.0） ====================
+
+const rules = ref<NotificationRule[]>([])
+const rulesLoading = ref(false)
+const ruleDialogVisible = ref(false)
+const ruleSaving = ref(false)
+const editingRuleId = ref<number | null>(null)
+
+const ruleForm = reactive({
+  name: '',
+  enabled: true,
+  priority: 100,
+  levels: ['critical'] as Array<'warning' | 'critical'>,
+  groupsText: '',
+  allowText: '',
+  denyText: '',
+  webhook_enabled: false,
+  webhook_url: '',
+  webhook_secret: '',
+  smtp_enabled: false,
+  smtp_to: '',
+})
+
+const editingRule = computed(
+  () => rules.value.find((item) => item.id === editingRuleId.value) ?? null,
+)
+
+async function loadRules(): Promise<void> {
+  rulesLoading.value = true
+  try {
+    rules.value = await fetchNotificationRules()
+  } catch {
+    rules.value = []
+  } finally {
+    rulesLoading.value = false
+  }
+}
+
+function openCreateRule(): void {
+  editingRuleId.value = null
+  ruleForm.name = ''
+  ruleForm.enabled = true
+  ruleForm.priority = 100
+  ruleForm.levels = ['critical']
+  ruleForm.groupsText = ''
+  ruleForm.allowText = ''
+  ruleForm.denyText = ''
+  ruleForm.webhook_enabled = false
+  ruleForm.webhook_url = ''
+  ruleForm.webhook_secret = ''
+  ruleForm.smtp_enabled = false
+  ruleForm.smtp_to = ''
+  ruleDialogVisible.value = true
+}
+
+/** 编辑时 URL/密钥留空 = 保持原值，避免把敏感值回显到表单 */
+function openEditRule(rule: NotificationRule): void {
+  editingRuleId.value = rule.id
+  ruleForm.name = rule.name
+  ruleForm.enabled = rule.enabled
+  ruleForm.priority = rule.priority
+  ruleForm.levels = rule.levels.filter(
+    (level): level is 'warning' | 'critical' => level === 'warning' || level === 'critical',
+  )
+  if (ruleForm.levels.length === 0) ruleForm.levels = ['critical']
+  ruleForm.groupsText = rule.groups.join(', ')
+  ruleForm.allowText = rule.device_allow.join(', ')
+  ruleForm.denyText = rule.device_deny.join(', ')
+  ruleForm.webhook_enabled = rule.webhook_enabled
+  ruleForm.webhook_url = ''
+  ruleForm.webhook_secret = ''
+  ruleForm.smtp_enabled = rule.smtp_enabled
+  ruleForm.smtp_to = rule.smtp_to ?? ''
+  ruleDialogVisible.value = true
+}
+
+async function saveRule(): Promise<void> {
+  if (!ruleForm.name.trim()) {
+    ElMessage.warning('请填写规则名称')
+    return
+  }
+  if (!ruleForm.webhook_enabled && !ruleForm.smtp_enabled) {
+    ElMessage.warning('规则至少需要启用一个通道')
+    return
+  }
+  if (
+    ruleForm.webhook_enabled &&
+    !ruleForm.webhook_url.trim() &&
+    !editingRule.value?.webhook_url_configured
+  ) {
+    ElMessage.warning('启用 Webhook 时必须填写 URL')
+    return
+  }
+  if (ruleForm.smtp_enabled && !ruleForm.smtp_to.trim()) {
+    ElMessage.warning('启用 SMTP 时必须填写收件人')
+    return
+  }
+
+  const payload: NotificationRulePayload = {
+    name: ruleForm.name.trim(),
+    enabled: ruleForm.enabled,
+    priority: ruleForm.priority,
+    levels: ruleForm.levels,
+    groups: splitList(ruleForm.groupsText),
+    device_allow: splitList(ruleForm.allowText),
+    device_deny: splitList(ruleForm.denyText),
+    webhook_enabled: ruleForm.webhook_enabled,
+    smtp_enabled: ruleForm.smtp_enabled,
+    smtp_to: ruleForm.smtp_to.trim(),
+  }
+  if (ruleForm.webhook_url.trim()) payload.webhook_url = ruleForm.webhook_url.trim()
+  if (ruleForm.webhook_secret.trim()) payload.webhook_secret = ruleForm.webhook_secret.trim()
+
+  ruleSaving.value = true
+  try {
+    if (editingRuleId.value !== null) {
+      await updateNotificationRule(editingRuleId.value, payload as NotificationRulePatch)
+      ElMessage.success('规则已更新，下一批告警按新优先级与分组路由')
+    } else {
+      await createNotificationRule(payload)
+      ElMessage.success('规则已创建，下一条告警即刻生效')
+    }
+    ruleDialogVisible.value = false
+    await loadRules()
+  } catch {
+    // 请求层已提示
+  } finally {
+    ruleSaving.value = false
+  }
+}
+
+async function removeRule(rule: NotificationRule): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除规则「${rule.name}」？之后匹配不到其他规则的告警将记为 suppressed（不投递）。`,
+      '删除通知规则',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteNotificationRule(rule.id)
+    ElMessage.success('规则已删除')
+    await loadRules()
+  } catch {
+    // 请求层已提示
+  }
+}
+
+// ==================== 测试通知 ====================
+
+const testing = ref(false)
+const testChannel = ref<NotificationTestChannel>('all')
+const testRuleId = ref<number | ''>('')
+const testResults = ref<NotificationTestResult[]>([])
+
 async function runTestNotification(): Promise<void> {
   testing.value = true
   testResults.value = []
   try {
-    testResults.value = await sendTestNotification(testChannel.value)
+    testResults.value = await sendTestNotification(
+      testChannel.value,
+      testRuleId.value === '' ? undefined : Number(testRuleId.value),
+    )
     const failed = testResults.value.filter((item) => item.status !== 'sent')
     if (failed.length === 0) {
       ElMessage.success('测试通知已真实发送，请到接收端确认')
     } else {
       ElMessage.warning(`${failed.length} 个通道发送失败，请查看下方原因`)
     }
-    loadDeliveries()
   } catch {
     // 请求层已提示
   } finally {
@@ -244,32 +363,11 @@ async function runTestNotification(): Promise<void> {
   }
 }
 
-const deliveryStatusOptions: Array<{ label: string; value: NotificationDeliveryStatus }> = [
-  { label: '成功', value: 'sent' },
-  { label: '失败', value: 'failed' },
-  { label: '被抑制', value: 'suppressed' },
-]
-
-function deliveryTagType(status: NotificationDeliveryStatus): 'success' | 'danger' | 'info' {
-  if (status === 'sent') return 'success'
-  if (status === 'failed') return 'danger'
-  return 'info'
-}
-
-function deliveryStatusLabel(status: NotificationDeliveryStatus): string {
-  if (status === 'sent') return '成功'
-  if (status === 'failed') return '失败'
-  return '被抑制'
-}
-
 onMounted(() => {
   loadStatus()
   loadNotificationConfig()
-  loadDeliveries()
-  timer = setInterval(() => {
-    loadStatus()
-    loadDeliveries()
-  }, 10_000)
+  loadRules()
+  timer = setInterval(loadStatus, 10_000)
 })
 
 onBeforeUnmount(() => {
@@ -399,7 +497,7 @@ onBeforeUnmount(() => {
           同设备同指标 {{ status.scheduler.alert_suppress_seconds }} 秒内只入库一次
         </el-descriptions-item>
         <el-descriptions-item label="通知静默窗口">
-          下方「告警通知通道」可配置，抑制只影响发送，不影响告警入库
+          下方「通知规则」按分组配置接收人，抑制只影响发送，不影响告警入库
         </el-descriptions-item>
       </el-descriptions>
     </el-card>
@@ -407,14 +505,14 @@ onBeforeUnmount(() => {
     <el-card v-loading="notifyLoading" shadow="never">
       <div class="section-head">
         <div>
-          <span class="section-title">告警通知通道</span>
+          <span class="section-title">告警通知：传输设置</span>
           <span class="section-desc">
-            配置存库并热读取，保存后下一条告警立即生效；URL / 密钥 / 口令不会回显
+            全局开关 / 超时 / 退避 / SMTP 服务器存库并热读取；接收人在下方「通知规则」中配置
           </span>
         </div>
         <div class="head-actions">
-          <el-button size="small" :disabled="clearSecretsBusy" @click="clearSensitiveConfig">
-            清空敏感配置
+          <el-button size="small" :disabled="clearSecretsBusy" @click="clearLegacySecrets">
+            清空遗留凭据
           </el-button>
           <el-button
             size="small"
@@ -429,88 +527,43 @@ onBeforeUnmount(() => {
 
       <el-alert type="info" :closable="false" show-icon class="notify-hint">
         <template #title>
-          通知是旁路异步投递：发送失败不会影响告警入库与 MQTT 链路；静默窗口内只不发通知，
-          告警仍会进入告警中心并在移动端 App 内可见。
+          通知是旁路异步投递：发送失败不影响告警入库与 MQTT 链路；静默窗口内只不发通知，
+          告警仍会进入告警中心与移动端 App。待重试任务落库，网关重启后会继续投递。
         </template>
       </el-alert>
 
-      <el-form label-width="120px" label-position="left" class="notify-form">
-        <el-divider content-position="left">总开关与触发规则</el-divider>
+      <el-form label-width="130px" label-position="left" class="notify-form">
+        <el-divider content-position="left">总开关与去重</el-divider>
         <el-form-item label="启用通知">
           <el-switch v-model="form.enabled" />
           <span class="form-hint">关闭后所有告警只入库、不发送任何通知</span>
         </el-form-item>
-        <el-form-item label="通知级别">
-          <el-checkbox-group v-model="form.levels">
-            <el-checkbox value="warning">warning（预警）</el-checkbox>
-            <el-checkbox value="critical">critical（严重）</el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-        <el-form-item label="设备分组">
-          <el-input
-            v-model="form.groupsText"
-            placeholder="留空表示全部分组；多个用逗号分隔，如：华东, 华南"
-          />
-        </el-form-item>
-        <el-form-item label="设备白名单">
-          <el-input
-            v-model="form.allowText"
-            placeholder="留空表示不限制；多个设备 ID 用逗号分隔"
-          />
-        </el-form-item>
-        <el-form-item label="设备黑名单">
-          <el-input
-            v-model="form.denyText"
-            placeholder="命中黑名单的设备永不通知；优先级高于白名单"
-          />
-        </el-form-item>
         <el-form-item label="静默窗口">
           <el-input-number v-model="form.mute_minutes" :min="0" :max="1440" />
           <span class="form-hint">
-            分钟；同设备同指标窗口内只通知一次，0 表示不去重
+            分钟；同设备同指标窗口内只通知一次，0 表示不去重（与 v1.29.0 语义一致）
           </span>
         </el-form-item>
+        <el-form-item label="重试退避">
+          <el-input-number v-model="form.retry_backoff_seconds" :min="0" :max="60" :step="0.5" />
+          <span class="form-hint">秒；指数退避 = 基础值 × 2^(第几次-1)，用尽后终态 failed</span>
+        </el-form-item>
 
-        <el-divider content-position="left">Webhook</el-divider>
-        <el-form-item label="启用 Webhook">
-          <el-switch v-model="form.webhook_enabled" />
-          <el-tag v-if="notifyConfig" :type="notifyConfig.webhook_url_configured ? 'success' : 'info'" size="small" class="inline-tag">
-            {{ notifyConfig.webhook_url_configured ? 'URL 已配置' : 'URL 未配置' }}
-          </el-tag>
-          <el-tag v-if="notifyConfig" :type="notifyConfig.webhook_secret_configured ? 'success' : 'info'" size="small" class="inline-tag">
-            {{ notifyConfig.webhook_secret_configured ? '签名密钥已配置' : '未配置签名密钥' }}
-          </el-tag>
-        </el-form-item>
-        <el-form-item label="Webhook URL">
-          <el-input
-            v-model="form.webhook_url"
-            placeholder="https://...（已配置时留空保持不变）"
-            autocomplete="off"
-          />
-        </el-form-item>
-        <el-form-item label="签名密钥">
-          <el-input
-            v-model="form.webhook_secret"
-            type="password"
-            placeholder="用于 X-Vikings-Signature: sha256=...；留空保持不变"
-            autocomplete="new-password"
-            show-password
-          />
-        </el-form-item>
+        <el-divider content-position="left">Webhook 传输</el-divider>
         <el-form-item label="超时 / 重试">
           <el-input-number v-model="form.webhook_timeout_seconds" :min="1" :max="60" />
           <span class="inline-text">秒，最多重试</span>
           <el-input-number v-model="form.webhook_max_attempts" :min="1" :max="10" />
           <span class="inline-text">次</span>
         </el-form-item>
-
-        <el-divider content-position="left">SMTP 邮件</el-divider>
-        <el-form-item label="启用 SMTP">
-          <el-switch v-model="form.smtp_enabled" />
-          <el-tag v-if="notifyConfig" :type="notifyConfig.smtp_password_configured ? 'success' : 'info'" size="small" class="inline-tag">
-            {{ notifyConfig.smtp_password_configured ? '口令已配置' : '口令未配置' }}
-          </el-tag>
+        <el-form-item label="接收端">
+          <span class="form-hint">
+            URL 与签名密钥按规则独立配置（见下方规则表）；升级时 v1.29.0 的全局 Webhook
+            已自动迁移为「默认规则」
+          </span>
         </el-form-item>
+
+        <el-divider content-position="left">SMTP 传输</el-divider>
         <el-form-item label="服务器 / 端口">
           <el-input v-model="form.smtp_host" placeholder="smtp.example.com" class="host-input" />
           <el-input-number v-model="form.smtp_port" :min="1" :max="65535" :controls="false" class="port-input" />
@@ -527,23 +580,15 @@ onBeforeUnmount(() => {
             class="half-input"
           />
         </el-form-item>
-        <el-form-item label="发件人 / 收件人">
+        <el-form-item label="发件人">
           <el-input v-model="form.smtp_from" placeholder="alerts@example.com" class="half-input" />
-          <el-input
-            v-model="form.smtp_to"
-            placeholder="值班邮箱，多个用逗号分隔"
-            class="half-input"
-          />
+          <span class="form-hint">收件人按规则配置，多个用逗号分隔</span>
         </el-form-item>
         <el-form-item label="超时 / 重试">
           <el-input-number v-model="form.smtp_timeout_seconds" :min="1" :max="60" />
           <span class="inline-text">秒，最多重试</span>
           <el-input-number v-model="form.smtp_max_attempts" :min="1" :max="10" />
           <span class="inline-text">次</span>
-        </el-form-item>
-        <el-form-item label="重试退避">
-          <el-input-number v-model="form.retry_backoff_seconds" :min="0" :max="60" :step="0.5" />
-          <span class="form-hint">秒；指数退避 = 基础值 × 2^(第几次-1)</span>
         </el-form-item>
       </el-form>
 
@@ -555,10 +600,13 @@ onBeforeUnmount(() => {
             <el-radio-button value="webhook">Webhook</el-radio-button>
             <el-radio-button value="smtp">SMTP</el-radio-button>
           </el-radio-group>
+          <el-select v-model="testRuleId" size="small" placeholder="默认最高优先级规则" clearable style="width: 200px">
+            <el-option v-for="rule in rules" :key="rule.id" :label="`${rule.name}（P${rule.priority}）`" :value="rule.id" />
+          </el-select>
           <el-button size="small" type="primary" plain :loading="testing" @click="runTestNotification">
             发送测试通知
           </el-button>
-          <span class="form-hint">真实调用通道，忽略规则与静默；结果会写入投递记录</span>
+          <span class="form-hint">真实调用通道，忽略规则匹配与静默；结果会写入投递记录</span>
         </div>
         <div v-if="testResults.length" class="test-results">
           <el-tag
@@ -579,40 +627,154 @@ onBeforeUnmount(() => {
       </div>
     </el-card>
 
-    <el-card v-loading="deliveriesLoading" shadow="never">
+    <el-card v-loading="rulesLoading" shadow="never">
       <div class="section-head">
         <div>
-          <span class="section-title">最近投递记录</span>
-          <span class="section-desc">成功 / 最终失败 / 被静默抑制，每 10 秒自动刷新</span>
+          <span class="section-title">通知规则</span>
+          <span class="section-desc">
+            按 priority 升序（数字越小越优先）、同优先级按创建顺序，取第一条命中的规则；
+            命中后不再尝试后续规则
+          </span>
         </div>
         <div class="head-actions">
-          <el-select v-model="deliveryStatus" size="small" placeholder="全部状态" clearable style="width: 120px" @change="loadDeliveries">
-            <el-option v-for="item in deliveryStatusOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-          <el-button size="small" @click="loadDeliveries">刷新</el-button>
+          <el-button size="small" @click="router.push('/notifications')">查看投递历史</el-button>
+          <el-button size="small" type="primary" @click="openCreateRule">新增规则</el-button>
         </div>
       </div>
-      <el-table :data="deliveries" size="small" empty-text="暂无投递记录">
-        <el-table-column label="时间" width="170">
-          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
-        </el-table-column>
-        <el-table-column prop="device_id" label="设备" min-width="120" />
-        <el-table-column prop="metric" label="指标" width="100" />
-        <el-table-column prop="level" label="级别" width="90" />
-        <el-table-column prop="channel" label="通道" width="90" />
-        <el-table-column label="状态" width="90">
+
+      <el-alert type="warning" :closable="false" show-icon class="notify-hint">
+        <template #title>
+          未匹配任何规则的告警不会投递，记为 suppressed（原因：未匹配任何通知规则）；
+          设备分组变更后下一条告警立即按新分组生效
+        </template>
+      </el-alert>
+
+      <el-table :data="rules" size="small" empty-text="暂无规则：所有告警都不会投递">
+        <el-table-column label="优先级" width="90">
           <template #default="{ row }">
-            <el-tag :type="deliveryTagType(row.status)" size="small">
-              {{ deliveryStatusLabel(row.status) }}
+            <el-tag size="small" type="info">P{{ row.priority }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="name" label="规则名称" min-width="150" />
+        <el-table-column label="级别" width="130">
+          <template #default="{ row }">{{ row.levels.join(' / ') }}</template>
+        </el-table-column>
+        <el-table-column label="分组范围" min-width="120">
+          <template #default="{ row }">{{ row.groups.length ? row.groups.join(', ') : '全部分组' }}</template>
+        </el-table-column>
+        <el-table-column label="设备范围" min-width="150">
+          <template #default="{ row }">
+            <span v-if="row.device_allow.length || row.device_deny.length">
+              白名单 {{ row.device_allow.length }} / 黑名单 {{ row.device_deny.length }}
+            </span>
+            <span v-else class="muted">不限</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="接收人" min-width="190">
+          <template #default="{ row }">
+            <div v-if="row.webhook_enabled" class="channel-line">
+              Webhook
+              <el-tag v-if="row.webhook_url_configured" size="small" type="success">URL 已配置</el-tag>
+              <el-tag v-else size="small" type="danger">URL 未配置</el-tag>
+            </div>
+            <div v-if="row.smtp_enabled" class="channel-line">
+              SMTP：{{ row.smtp_to || '未填收件人' }}
+            </div>
+            <span v-if="!row.webhook_enabled && !row.smtp_enabled" class="muted">未启用通道</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="80">
+          <template #default="{ row }">
+            <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
+              {{ row.enabled ? '启用' : '停用' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="attempts" label="尝试" width="70" />
-        <el-table-column prop="error" label="错误原因" min-width="150">
-          <template #default="{ row }">{{ row.error || '—' }}</template>
+        <el-table-column label="更新时间" width="170">
+          <template #default="{ row }">{{ row.updated_at ? formatDateTime(row.updated_at) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="120" fixed="right">
+          <template #default="{ row }">
+            <el-button link size="small" @click="openEditRule(row)">编辑</el-button>
+            <el-button link size="small" type="danger" @click="removeRule(row)">删除</el-button>
+          </template>
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog
+      v-model="ruleDialogVisible"
+      :title="editingRuleId === null ? '新增通知规则' : '编辑通知规则'"
+      width="620px"
+      destroy-on-close
+    >
+      <el-form label-width="120px" label-position="left">
+        <el-form-item label="规则名称" required>
+          <el-input v-model="ruleForm.name" maxlength="64" placeholder="如：华东值班" />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="ruleForm.enabled" />
+          <span class="form-hint">停用后不参与路由</span>
+        </el-form-item>
+        <el-form-item label="优先级">
+          <el-input-number v-model="ruleForm.priority" :min="1" :max="1000" />
+          <span class="form-hint">数字越小越优先；同一告警只命中第一条</span>
+        </el-form-item>
+        <el-form-item label="级别门槛">
+          <el-checkbox-group v-model="ruleForm.levels">
+            <el-checkbox value="warning">warning（预警）</el-checkbox>
+            <el-checkbox value="critical">critical（严重）</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="分组范围">
+          <el-input v-model="ruleForm.groupsText" placeholder="留空表示全部分组；多个用逗号分隔" />
+        </el-form-item>
+        <el-form-item label="设备白名单">
+          <el-input v-model="ruleForm.allowText" placeholder="留空不限；多个设备 ID 用逗号分隔" />
+        </el-form-item>
+        <el-form-item label="设备黑名单">
+          <el-input v-model="ruleForm.denyText" placeholder="命中黑名单的设备不会命中本规则；优先于白名单" />
+        </el-form-item>
+
+        <el-divider content-position="left">接收人</el-divider>
+        <el-form-item label="Webhook">
+          <el-switch v-model="ruleForm.webhook_enabled" />
+          <el-tag v-if="editingRule?.webhook_url_configured" size="small" type="success" class="inline-tag">
+            URL 已配置
+          </el-tag>
+          <el-tag v-if="editingRule?.webhook_secret_configured" size="small" type="success" class="inline-tag">
+            签名密钥已配置
+          </el-tag>
+        </el-form-item>
+        <el-form-item v-if="ruleForm.webhook_enabled" label="Webhook URL">
+          <el-input
+            v-model="ruleForm.webhook_url"
+            placeholder="https://...（编辑时留空保持原值）"
+            autocomplete="off"
+          />
+        </el-form-item>
+        <el-form-item v-if="ruleForm.webhook_enabled" label="签名密钥">
+          <el-input
+            v-model="ruleForm.webhook_secret"
+            type="password"
+            placeholder="用于 X-Vikings-Signature；编辑时留空保持原值"
+            autocomplete="new-password"
+            show-password
+          />
+        </el-form-item>
+        <el-form-item label="SMTP">
+          <el-switch v-model="ruleForm.smtp_enabled" />
+          <span class="form-hint">SMTP 服务器与发件人沿用上方全局传输设置</span>
+        </el-form-item>
+        <el-form-item v-if="ruleForm.smtp_enabled" label="收件人">
+          <el-input v-model="ruleForm.smtp_to" placeholder="值班邮箱，多个用逗号分隔" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="ruleDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="ruleSaving" @click="saveRule">保存</el-button>
+      </template>
+    </el-dialog>
 
     <el-empty v-if="!loading && !status" description="暂无系统状态数据" :image-size="90" />
   </div>
@@ -751,5 +913,16 @@ onBeforeUnmount(() => {
   margin-top: 10px;
   font-size: 12px;
   color: #94a3b8;
+}
+
+.muted {
+  color: #94a3b8;
+}
+
+.channel-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.8;
 }
 </style>

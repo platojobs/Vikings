@@ -280,13 +280,63 @@ class NotificationConfig(Base):
     updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
 
 
+class NotificationRule(Base):
+    """通知规则（v1.31.0）：一条规则 = 一组接收人 + 级别门槛 + 分组范围。
+
+    路由语义：按 `priority` 升序（数字越小越优先）、同优先级按 `id` 升序取
+    **第一条命中的规则**；命中后不再尝试后续规则，避免同一告警重复打扰。
+    """
+
+    __tablename__ = "notification_rule"
+    __table_args__ = (Index("idx_notify_rule_priority", "priority", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # 数字越小优先级越高；同优先级按 id 升序（先创建者优先）
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+
+    # 触发条件（与 v1.29.0 组合规则一致）：级别、分组白名单、设备白/黑名单
+    levels: Mapped[str] = mapped_column(String(32), nullable=False, default="critical")
+    groups: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    device_allow: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    device_deny: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # 该规则自己的接收人：Webhook URL/密钥、SMTP 收件人（SMTP 服务器沿用全局配置）
+    webhook_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    webhook_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    webhook_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    smtp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    smtp_to: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+
+
 class NotificationDelivery(Base):
-    """通知投递记录：成功/最终失败/被静默抑制，供界面查看与排障。"""
+    """通知投递记录（v1.31.0 起同时是持久化重试队列）。
+
+    - `pending`：已落库、等待投递或等待下一次重试（网关重启后由调度器续投）；
+    - `sent` / `failed`：终态，`failed` 的 `error` 保留最后一次失败原因；
+    - `suppressed`：被静默窗口或规则未命中抑制，不重试。
+
+    去重：每条记录 `id` 即投递唯一键，Webhook 以 `X-Vikings-Delivery-Id` 下发，
+    邮件使用确定性 `Message-ID`，接收端可按该键做幂等。
+    """
 
     __tablename__ = "notification_delivery"
     __table_args__ = (
         Index("idx_notify_delivery_created", "created_at"),
         Index("idx_notify_device_metric_created", "device_id", "metric", "created_at"),
+        # 重试调度器按状态 + 下次尝试时间扫描
+        Index("idx_notify_delivery_status_next", "status", "next_attempt_at"),
+        # 历史页按通道 + 时间筛选
+        Index("idx_notify_delivery_channel_created", "channel", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(
@@ -296,14 +346,29 @@ class NotificationDelivery(Base):
     device_id: Mapped[str] = mapped_column(String(64), nullable=False)
     metric: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     level: Mapped[str] = mapped_column(String(16), nullable=False, default="")
-    # webhook / smtp / mute
+    # webhook / smtp / mute（静默）/ rule（未命中规则）
     channel: Mapped[str] = mapped_column(String(16), nullable=False)
-    # sent / failed / suppressed
+    # pending / sent / failed / suppressed
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # 路由快照：规则与分组在投递发生时记录，规则后来改名/变更不影响历史解释
+    rule_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    rule_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    group_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # 累计投递耗时（毫秒，多次尝试累加），供历史页展示
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 下一次重试时间；终态为 NULL
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
 

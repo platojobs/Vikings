@@ -66,6 +66,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/SystemView.vue'),
     meta: { title: '系统状态' },
   },
+  {
+    // v1.31.0：通知投递历史独立页面（operator 值班排障 + admin）
+    path: '/notifications',
+    name: 'notification-deliveries',
+    component: () => import('@/views/NotificationDeliveriesView.vue'),
+    meta: { title: '通知投递' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
@@ -80,6 +87,10 @@ export function authGuard(to: RouteLocationNormalized): true | RouteLocationRaw 
   }
   // 账号管理与系统状态仅对管理员开放，非管理员直接回到仪表盘
   if ((to.path === '/users' || to.path === '/system') && currentRole() !== 'admin') {
+    return { path: '/dashboard' }
+  }
+  // 投递历史含接收端错误细节：viewer 不可见，operator/admin 可看
+  if (to.path === '/notifications' && currentRole() === 'viewer') {
     return { path: '/dashboard' }
   }
   return true

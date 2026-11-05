@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     command_timeout_seconds: int = 300
     command_sweep_interval_seconds: int = 60
 
+    # 通知重试巡检周期（秒）：持久化队列里到期的 pending 投递由调度器续投
+    notification_retry_interval_seconds: int = 5
+
     # ---- 告警 Webhook 外推（空则关闭）----
     # 产生 critical 告警时向该 URL POST JSON，可用于对接钉钉/飞书/企业微信机器人
     alert_webhook_url: str = ""

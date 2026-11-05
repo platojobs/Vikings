@@ -63,6 +63,20 @@ async def sweep_offline_devices() -> int:
         return count
 
 
+async def retry_notification_deliveries(
+    *, session_factory: Optional[SessionFactoryLike] = None
+) -> int:
+    """通知重试巡检（v1.31.0）：把到期的 pending 投递续投。
+
+    队列即 `notification_delivery` 表；网关重启后本任务在第一轮就会捡起
+    上次未完成的记录，因此「重启」不会丢掉重试。单进程内顺序执行，
+    租约字段 `next_attempt_at` 保证同一记录不会被并发重复发送。
+    """
+    from app.services import notify_service
+
+    return await notify_service.retry_due_deliveries(session_factory)
+
+
 async def sweep_stale_commands(
     *,
     session_factory: Optional[SessionFactoryLike] = None,

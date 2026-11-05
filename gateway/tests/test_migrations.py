@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0006_notifications"
+HEAD = "0007_notification_rules_retry"
 NEW_INDEXES = {
     "idx_alert_status_created",
     "idx_alert_level_created",
@@ -27,6 +27,16 @@ NEW_INDEXES = {
     "idx_audit_operator_created",
 }
 ACK_COLUMNS = {"ack_note", "acked_by", "acked_at"}
+# v1.31.0：规则表、重试队列字段与索引
+DELIVERY_RETRY_COLUMNS = {
+    "rule_id",
+    "rule_name",
+    "group_name",
+    "duration_ms",
+    "next_attempt_at",
+    "finished_at",
+    "updated_at",
+}
 
 
 def _run_alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess:
@@ -70,6 +80,11 @@ def _alert_columns(db_path: Path) -> set[str]:
 def _device_columns(db_path: Path) -> set[str]:
     with sqlite3.connect(db_path) as con:
         return {row[1] for row in con.execute("PRAGMA table_info(device)")}
+
+
+def _delivery_columns(db_path: Path) -> set[str]:
+    with sqlite3.connect(db_path) as con:
+        return {row[1] for row in con.execute("PRAGMA table_info(notification_delivery)")}
 
 
 def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
@@ -121,8 +136,16 @@ def test_upgrade_on_empty_database(tmp_path):
         # v1.29.0 通知配置与投递记录
         "notification_config",
         "notification_delivery",
+        # v1.31.0 多规则路由
+        "notification_rule",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
+    assert {
+        "idx_notify_delivery_status_next",
+        "idx_notify_delivery_channel_created",
+        "idx_notify_rule_priority",
+    } <= _index_names(db_path)
+    assert DELIVERY_RETRY_COLUMNS <= _delivery_columns(db_path)
     assert ACK_COLUMNS <= _alert_columns(db_path)
     assert _alembic_version(db_path) == HEAD
 
@@ -170,27 +193,77 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    down = _run_alembic(db_path, "downgrade", "-1")
+    # v1.31.0 在 v1.29.0 之上加了一步：downgrade 两步回到 0005
+    down = _run_alembic(db_path, "downgrade", "-2")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
     assert "notification_config" not in _table_names(db_path), (
-        "downgrade -1 必须移除通知配置表"
+        "downgrade 必须移除通知配置表"
     )
     assert "notification_delivery" not in _table_names(db_path), (
-        "downgrade -1 必须移除投递记录表"
+        "downgrade 必须移除投递记录表"
+    )
+    assert "notification_rule" not in _table_names(db_path), (
+        "downgrade 必须移除通知规则表"
     )
     assert "mqtt_credential_revoked_at" in _device_columns(db_path), (
-        "downgrade -1 不得影响凭证吊销列"
+        "downgrade 不得影响凭证吊销列"
     )
-    assert "refresh_token" in _table_names(db_path), "downgrade -1 不得影响刷新令牌表"
-    assert ACK_COLUMNS <= _alert_columns(db_path), "downgrade -1 不得影响告警处置列"
+    assert "refresh_token" in _table_names(db_path), "downgrade 不得影响刷新令牌表"
+    assert ACK_COLUMNS <= _alert_columns(db_path), "downgrade 不得影响告警处置列"
 
     up = _run_alembic(db_path, "upgrade", "head")
     assert up.returncode == 0, up.stderr
     assert ACK_COLUMNS <= _alert_columns(db_path)
     assert "refresh_token" in _table_names(db_path)
     assert "notification_config" in _table_names(db_path)
+    assert "notification_rule" in _table_names(db_path)
     assert "mqtt_credential_revoked_at" in _device_columns(db_path)
+    assert _alembic_version(db_path) == HEAD
+
+
+def test_v129_config_and_delivery_preserved_and_default_rule_seeded(tmp_path):
+    """既有 v1.29.0 库：配置与投递历史保留，并回填一条等价默认规则。"""
+    db_path = tmp_path / "v129.db"
+    assert _run_alembic(db_path, "upgrade", "0006_notifications").returncode == 0
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO notification_config "
+            "(id, enabled, webhook_enabled, webhook_url, webhook_secret, smtp_enabled, smtp_to, "
+            " levels, groups, device_allow, device_deny) "
+            "VALUES (1, 1, 1, 'http://127.0.0.1:9000/hook', 'legacy-secret', 1, 'oncall@example.com', "
+            " 'critical', '华东', '', '')"
+        )
+        con.execute(
+            "INSERT INTO notification_delivery "
+            "(alert_id, device_id, metric, level, channel, status, attempts, error) "
+            "VALUES ('alt-legacy', 'dev-legacy', 'voltage', 'critical', 'webhook', 'sent', 1, NULL)"
+        )
+        con.commit()
+
+    up = _run_alembic(db_path, "upgrade", "head")
+    assert up.returncode == 0, up.stderr
+    with sqlite3.connect(db_path) as con:
+        config = con.execute(
+            "select webhook_url, webhook_secret, smtp_to, updated_by from notification_config"
+        ).fetchone()
+        rule = con.execute(
+            "select name, priority, levels, groups, webhook_enabled, webhook_url, smtp_to "
+            "from notification_rule"
+        ).fetchall()
+        delivery = con.execute(
+            "select status, attempts from notification_delivery where alert_id='alt-legacy'"
+        ).fetchone()
+        delivery_columns = {row[1] for row in con.execute("PRAGMA table_info(notification_delivery)")}
+    assert config == ("http://127.0.0.1:9000/hook", "legacy-secret", "oncall@example.com", "system"), (
+        "v1.29.0 配置不得被改写"
+    )
+    assert len(rule) == 1 and rule[0][0].startswith("默认规则"), "应回填一条等价默认规则"
+    assert rule[0][1:5] == (100, "critical", "华东", 1)
+    assert rule[0][5] == "http://127.0.0.1:9000/hook"
+    assert rule[0][6] == "oncall@example.com"
+    assert delivery == ("sent", 1), "投递历史必须保留"
+    assert DELIVERY_RETRY_COLUMNS <= delivery_columns
     assert _alembic_version(db_path) == HEAD
 
 

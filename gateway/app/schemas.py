@@ -501,6 +501,63 @@ class NotificationConfigOut(BaseModel):
     updated_by: str = "system"
 
 
+class NotificationRuleCreate(BaseModel):
+    """新建通知规则（v1.31.0）。
+
+    `priority` 数字越小越优先；同一告警只命中第一条匹配规则。
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    enabled: bool = True
+    priority: int = Field(default=100, ge=1, le=1000)
+    levels: List[Literal["warning", "critical"]] = Field(default_factory=lambda: ["critical"])
+    groups: List[str] = Field(default_factory=list)
+    device_allow: List[str] = Field(default_factory=list)
+    device_deny: List[str] = Field(default_factory=list)
+    webhook_enabled: bool = False
+    webhook_url: Optional[str] = Field(default=None, max_length=1024)
+    webhook_secret: Optional[str] = Field(default=None, max_length=128)
+    smtp_enabled: bool = False
+    smtp_to: Optional[str] = Field(default=None, max_length=1024)
+
+
+class NotificationRuleUpdate(BaseModel):
+    """更新规则：未传字段保持不变；敏感字段传空串表示清空。"""
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    enabled: Optional[bool] = None
+    priority: Optional[int] = Field(default=None, ge=1, le=1000)
+    levels: Optional[List[Literal["warning", "critical"]]] = None
+    groups: Optional[List[str]] = None
+    device_allow: Optional[List[str]] = None
+    device_deny: Optional[List[str]] = None
+    webhook_enabled: Optional[bool] = None
+    webhook_url: Optional[str] = Field(default=None, max_length=1024)
+    webhook_secret: Optional[str] = Field(default=None, max_length=128)
+    smtp_enabled: Optional[bool] = None
+    smtp_to: Optional[str] = Field(default=None, max_length=1024)
+
+
+class NotificationRuleOut(BaseModel):
+    """规则对外视图：Webhook URL / 密钥只返回「是否已配置」；收件人沿用 v1.29 口径可见。"""
+
+    id: int
+    name: str
+    enabled: bool
+    priority: int
+    levels: List[str]
+    groups: List[str]
+    device_allow: List[str]
+    device_deny: List[str]
+    webhook_enabled: bool
+    webhook_url_configured: bool
+    webhook_secret_configured: bool
+    smtp_enabled: bool
+    smtp_to: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    updated_by: str = "system"
+
+
 class NotificationDeliveryOut(BaseModel):
     id: int
     alert_id: str
@@ -511,13 +568,32 @@ class NotificationDeliveryOut(BaseModel):
     status: str
     attempts: int
     error: Optional[str] = None
+    # v1.31.0：路由快照与重试/耗时信息
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    group_name: Optional[str] = None
+    duration_ms: int = 0
+    next_attempt_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
 
+class NotificationDeliveryPageOut(BaseModel):
+    """投递历史分页：与服务端同一套筛选语义，total 供前端分页器使用。"""
+
+    items: List[NotificationDeliveryOut]
+    total: int
+    page: int
+    page_size: int
+
+
 class NotificationTestRequest(BaseModel):
     channel: Literal["webhook", "smtp", "all"] = "all"
+    # 指定规则可测试该规则的接收人；不传则用优先级最高且已配置该通道的规则
+    rule_id: Optional[int] = None
 
 
 class NotificationTestResult(BaseModel):

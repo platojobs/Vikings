@@ -20,6 +20,8 @@ const username = computed(() => getStoredUser()?.username ?? 'admin')
 /** 角色随 /api/auth/me 刷新，用于菜单显示（仅管理员可见账号管理） */
 const role = ref(getStoredUser()?.role ?? '')
 const isAdmin = computed(() => role.value === 'admin')
+/** v1.31.0：投递历史对值班 operator 与 admin 开放 */
+const canViewNotifications = computed(() => role.value === 'admin' || role.value === 'operator')
 
 const mqttConnected = ref(false)
 let offStatus: (() => void) | null = null
@@ -95,6 +97,7 @@ async function handleLogout(): Promise<void> {
           <el-menu-item index="/audit">审计日志</el-menu-item>
           <el-menu-item v-if="isAdmin" index="/users">账号管理</el-menu-item>
           <el-menu-item index="/ota">OTA 管理</el-menu-item>
+          <el-menu-item v-if="canViewNotifications" index="/notifications">通知投递</el-menu-item>
           <el-menu-item v-if="isAdmin" index="/system">系统状态</el-menu-item>
         </el-menu>
 

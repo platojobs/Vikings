@@ -479,7 +479,7 @@ v1.21.0 之前已确认的历史行**不做臆测回填**：无法得知真实�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） |
+| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） / `notify.rule_create` / `notify.rule_update` / `notify.rule_delete`（v1.31.0） |
 
 ### 3.6 告警通知通道（v1.29.0）
 
@@ -555,6 +555,70 @@ X-Vikings-Signature: sha256=<hex> # 配置了 webhook_secret 时
 
 **安全**：GET 不回显 URL / 密钥 / 口令；PATCH 审计只记录变更字段名；
 界面仅显示「已配置 / 未配置」。Webhook URL 与签名密钥、SMTP 口令不得出现在日志。
+
+### 3.6.1 多规则路由、持久化重试与投递历史（v1.31.0）
+
+**规则模型**：一份配置下可挂多条 `notification_rule`，每条规则独立决定接收人与匹配范围。
+`notification_config` 保留总开关、静默窗口、退避基数与全局通道凭据（SMTP 服务器/口令等）；
+规则只覆盖「发给谁」与「哪些告警」，避免每条规则重复存 SMTP 口令。
+
+| 端点 | 权限 | 说明 |
+| --- | --- | --- |
+| GET `/api/system/notifications/rules` | admin | 按 `priority ASC, id ASC` 返回；敏感字段只返回 `*_configured` |
+| POST `/api/system/notifications/rules` | admin | 创建规则；名称必填、`priority` 1–1000、每通道至少一个接收人；审计 `notify.rule_create` |
+| PATCH `/api/system/notifications/rules/{id}` | admin | 部分更新；审计只写 `fields`（字段名），不写 URL/密钥/收件人值 |
+| DELETE `/api/system/notifications/rules/{id}` | admin | 删除；审计 `notify.rule_delete`（ID + 名称） |
+| POST `/api/system/notifications/test` | operator / admin | 可带 `rule_id` 指定规则；不带则用最高优先级可用规则；**忽略匹配与静默** |
+| GET `/api/system/notifications/deliveries` | operator / admin | 投递历史；viewer 403（见下） |
+
+**规则字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `name` | str | 规则名（必填，界面展示） |
+| `enabled` | bool | 停用后不参与裁决 |
+| `priority` | int | **数字越小越优先**（1–1000），同值按 `id ASC` |
+| `levels` / `groups` | list | 级别门槛；分组范围（空 = 全部分组） |
+| `device_allow` / `device_deny` | list | 设备白/黑名单，`deny` 优先 |
+| `webhook_enabled` / `webhook_url` / `webhook_secret` | bool / str / str | 本规则的 Webhook 接收人与 HMAC 密钥（URL/密钥不回显） |
+| `smtp_enabled` / `smtp_to` | bool / str | 本规则的邮件接收人（逗号分隔；服务器与口令沿用全局配置） |
+
+**优先级裁决**：按 `priority` 升序取**第一条**「已启用且同时满足级别、分组、设备白黑名单」的规则，
+命中即用该规则的接收人；**不会**把多条规则叠加群发。规则按优先级在界面表格中自上而下展示，
+同优先级按 ID 升序，便于值班预期一致。没有任何规则命中时**不投递**，写
+`notification_delivery(status=suppressed, channel=rule, error="未匹配任何通知规则")`——
+这样可以回答「这条告警为什么没发出去」，也避免全局兜底把未分类设备误发给默认值班人。
+`notification_rule` 表为空（例如 v1.29.0 配置被手工清空）时运行期回退为 v1.29.0 的单配置行为。
+
+**分组即时生效**：规则每次派发时按设备当前 `group_name` 判定，不做缓存；
+设备改分组后，下一条告警立即按新分组命中规则（无需重启网关或重存规则）。
+
+**持久化重试**：派发时先落 `notification_delivery(status=pending, next_attempt_at=...)`，
+再由后台调度器（默认 5 秒一轮）原子领取到期行续投；网关重启后从表恢复。
+第 `n` 次失败后下次时间 = `updated_at + retry_backoff_seconds × 2^(n-1)`，
+达到通道 `max_attempts` 后置 `failed`、`next_attempt_at=NULL`，`error` 为脱敏原因。
+`duration_ms` 为各次尝试耗时累计，`finished_at` 为终态时间。
+**去重键**：每次投递的 `notification_delivery.id` 通过 `X-Vikings-Delivery-Id`
+（Webhook）与确定性 `Message-ID`（SMTP）发给接收端；语义为 **at-least-once**，
+接收端应按该 ID 幂等去重。网关侧以「租约 + 状态机」避免同一行被并发重复发送，
+但进程在 HTTP 请求发出后、结果写回前崩溃时，重启后仍可能重发同一条（见运维 13.7）。
+
+**投递历史端点**：
+
+| Query | 说明 |
+| --- | --- |
+| `page` / `page_size` | 默认 1 / 20，`page_size ≤ 100`；返回 `{items, total, page, page_size}` |
+| `status` | `pending` / `sent` / `failed` / `suppressed` |
+| `channel` | `webhook` / `smtp` / `mute`（静默）/ `rule`（未匹配规则） |
+| `device_id` | 精确匹配 |
+| `start` / `end` | 按 `created_at` 过滤（ISO 时间，含边界） |
+
+筛选与分页全部在服务端完成，Web 端不做二次过滤；排序固定 `created_at DESC, id DESC`。
+历史页同时展示 `attempts`、`duration_ms`、`error`、`next_attempt_at`、规则名与分组。
+
+**权限**：投递历史对 `operator` 与 `admin` 开放；`viewer` 返回 403。理由：`error` 会暴露
+接收端基础设施线索（状态码、SMTP 异常类型、出网情况），属于运维信息；但值班人员
+（operator）需要在不进系统设置的情况下确认「告警到底发没发出去」，因此不收紧到 admin。
 
 ### 3.7 指令 / OTA
 
@@ -1036,14 +1100,34 @@ JWT/管理员口令/SQLite 时，网关启动直接失败。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| id | bigserial PK | 自增 |
+| id | bigserial PK | 自增；同时作为投递去重键下发接收端 |
 | alert_id | varchar(64) | 关联告警 ID（测试通知为 `test-*`） |
 | device_id / metric / level | varchar | 规则与排障维度 |
-| channel | varchar(16) | `webhook` / `smtp` / `mute` |
-| status | varchar(16) | `sent` / `failed` / `suppressed` |
+| rule_id / rule_name / group_name | int / varchar | 命中的规则与告警时设备分组（v1.31.0） |
+| channel | varchar(16) | `webhook` / `smtp` / `mute`（静默）/ `rule`（未匹配规则，v1.31.0） |
+| status | varchar(16) | `pending`（待续投，v1.31.0）/ `sent` / `failed` / `suppressed` |
 | attempts | int | 实际尝试次数 |
 | error | varchar(255) | 脱敏后的失败原因；成功为 NULL |
-| created_at | timestamptz | 投递时间，索引 `(created_at)` 与 `(device_id, metric, created_at)` |
+| duration_ms | int | 各次尝试累计耗时（v1.31.0） |
+| next_attempt_at | timestamptz | 下次重试时间；终态或 `sent` 为 NULL（v1.31.0） |
+| finished_at | timestamptz | 进入终态的时间（v1.31.0） |
+| created_at / updated_at | timestamptz | 创建与最近一次尝试时间；索引 `(created_at)`、`(device_id, metric, created_at)`、`(status, next_attempt_at)`、`(channel, created_at)` |
+
+#### `notification_rule`（v1.31.0）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | serial PK | 自增 |
+| name | varchar(64) | 规则名（界面展示、投递记录冗余） |
+| enabled | boolean | 是否参与裁决 |
+| priority | int | 越小越优先；同值按 `id ASC` |
+| levels / groups / device_allow / device_deny | varchar(255) | 同 `notification_config` 的逗号分隔语义；空 = 不限制 |
+| webhook_enabled / webhook_url / webhook_secret | bool / varchar(512) / varchar(128) | 规则级 Webhook 接收人 |
+| smtp_enabled / smtp_to | bool / varchar(255) | 规则级收件人；服务器/口令沿用 `notification_config` |
+| created_at / updated_at / updated_by | timestamptz / timestamptz / varchar(64) | 时间戳与最后操作人 |
+
+迁移 `0007` 从既有 `notification_config` 回填一条 `priority=100` 的默认规则，
+保证 v1.29.0 升级后行为不变；`downgrade` 删除规则表与 v1.31.0 新增列，不删除既有配置与投递行。
 
 ---
 

@@ -550,9 +550,11 @@ export interface NotificationTestResult {
   error: string | null
 }
 
-export type NotificationDeliveryStatus = 'sent' | 'failed' | 'suppressed'
+/** v1.31.0：pending 为已落库、等待首投或重试的中间态 */
+export type NotificationDeliveryStatus = 'pending' | 'sent' | 'failed' | 'suppressed'
+export type NotificationDeliveryChannel = 'webhook' | 'smtp' | 'mute' | 'rule'
 
-/** 投递记录：成功 / 最终失败 / 被静默抑制 */
+/** 投递记录：规则/分组快照 + 尝试次数 + 累计耗时 + 失败原因 */
 export interface NotificationDelivery {
   id: number
   alert_id: string
@@ -563,8 +565,60 @@ export interface NotificationDelivery {
   status: NotificationDeliveryStatus
   attempts: number
   error: string | null
+  rule_id: number | null
+  rule_name: string | null
+  group_name: string | null
+  duration_ms: number
+  next_attempt_at: string | null
+  finished_at: string | null
   created_at: string
+  updated_at: string | null
 }
+
+/** 投递历史分页：total 由服务端统计，前端只按同一套筛选参数请求 */
+export interface NotificationDeliveryPage {
+  items: NotificationDelivery[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** 通知规则：priority 越小越优先，同一告警只命中第一条匹配规则 */
+export interface NotificationRule {
+  id: number
+  name: string
+  enabled: boolean
+  priority: number
+  levels: string[]
+  groups: string[]
+  device_allow: string[]
+  device_deny: string[]
+  webhook_enabled: boolean
+  webhook_url_configured: boolean
+  webhook_secret_configured: boolean
+  smtp_enabled: boolean
+  smtp_to: string | null
+  updated_at: string | null
+  updated_by: string
+}
+
+export interface NotificationRulePayload {
+  name: string
+  enabled: boolean
+  priority: number
+  levels: Array<'warning' | 'critical'>
+  groups: string[]
+  device_allow: string[]
+  device_deny: string[]
+  webhook_enabled: boolean
+  webhook_url?: string
+  webhook_secret?: string
+  smtp_enabled: boolean
+  smtp_to?: string | null
+}
+
+/** 更新规则：敏感字段不传 = 保持原值，空串 = 清空 */
+export type NotificationRulePatch = Partial<NotificationRulePayload>
 
 // ==================== MQTT 报文（camelCase） ====================
 
