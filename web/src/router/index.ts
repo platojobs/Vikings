@@ -25,6 +25,13 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '实时仪表盘' },
   },
   {
+    // v1.32.0：电池健康与续航看板（只读，所有角色可见）
+    path: '/battery-health',
+    name: 'battery-health',
+    component: () => import('@/views/BatteryHealthView.vue'),
+    meta: { title: '电池续航' },
+  },
+  {
     path: '/devices',
     name: 'devices',
     component: () => import('@/views/DevicesView.vue'),

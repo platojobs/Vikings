@@ -91,6 +91,7 @@ async function handleLogout(): Promise<void> {
           router
         >
           <el-menu-item index="/dashboard">实时仪表盘</el-menu-item>
+          <el-menu-item index="/battery-health">电池续航</el-menu-item>
           <el-menu-item index="/devices">设备管理</el-menu-item>
           <el-menu-item index="/history">历史查询</el-menu-item>
           <el-menu-item index="/alerts">告警中心</el-menu-item>

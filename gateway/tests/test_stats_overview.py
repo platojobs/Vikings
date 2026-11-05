@@ -160,7 +160,9 @@ def test_overview_marks_trend_incomplete_when_less_than_24h(tmp_path):
             now = datetime.now(timezone.utc)
             async with factory() as session:
                 session.add(_device("dev-0001", "online", True, now))
-                session.add(_record("dev-0001", 1, now - timedelta(minutes=10)))
+                # 用当前时刻而不是 now-10min：跨整点时前者仍落在当前小时桶，
+                # 避免测试在每小时前 10 分钟因分桶边界而失败（与业务逻辑无关）
+                session.add(_record("dev-0001", 1, now))
                 await session.commit()
 
             response = await client.get("/api/stats/overview", headers=_headers())

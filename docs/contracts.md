@@ -723,6 +723,40 @@ X-Vikings-Signature: sha256=<hex> # 配置了 webhook_secret 时
 
 空桶返回 0（真实零值，不是缺失点）；`trend` 恒为 24 个元素。只读接口，viewer / operator / admin 均可访问。
 
+#### 3.8.2 电池健康与续航（v1.32.0）
+
+| 方法 | 路径 | 参数 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/stats/battery-health` | `group?`（≤64 字符）、`days`（1–30，默认 7）、`limit`（1–100，默认 20） | 跨设备的电量风险分层、衰减趋势、分组汇总与续航风险清单 |
+
+响应字段（`data`）：
+
+| 字段 | 类型 | 说明 / 口径 |
+| --- | --- | --- |
+| `device_total` / `battery_known` | int | 筛选范围内设备数 / 窗口内有上报的设备数 |
+| `critical` / `warning` / `healthy` / `unknown` | int | 风险分层计数，四者之和 = `device_total` |
+| `avg_battery` | float? | 窗口内最新电量的简单平均；无数据为 `null` |
+| `warning_percent` / `critical_percent` | int | 分层阈值随响应返回（当前 30 / 15），前端不硬编码 |
+| `window_days` / `window_start` | int / datetime | 统计窗口（UTC 自然日，含当天）与起点 |
+| `trend` | `[{day_start, avg_battery, samples}]` | 每个有数据的 UTC 自然日的机队平均电量；`samples` 为参与计算的设备数 |
+| `groups` | `[{group_name, total, critical, warning, healthy, unknown, avg_battery}]` | 按设备分组汇总，`group_name` 升序 |
+| `watchlist` | `[{device_id, name, group_name, status, battery, voltage, last_report_at, drain_per_day, days_to_critical, risk, open_alert_count}]` | 仅含 `critical` / `warning`，排序：风险等级 → 预计天数升序 → 电量升序 → `device_id`；最多 `limit` 台 |
+| `watchlist_total` | int | 风险设备总数（不受 `limit` 截断影响） |
+
+口径与判定：
+
+- **数据来源只有 `sensor_record`**：最新电量/电压/上报时间取窗口内该设备最后一条记录；
+  窗口内没有任何记录的设备记为 `unknown`，**不插值、不补假值**；
+- **衰减速度**：对设备每日平均电量按天做最小二乘拟合，输出 `drain_per_day`（百分点/天，正值为掉电）；
+  日斜率小于 0.01 或电量回升时输出 `null`（稳定/在充电）；
+- **预计到严重阈值**：`days_to_critical = (最新电量 - 15) / drain_per_day`，电量已 ≤15% 时为 `0`；
+  无法估算时为 `null`；
+- **风险分层**（任一条件命中即升级）：
+  `critical` = 电量 ≤ 15% 或预计 ≤ 7 天；`warning` = 电量 ≤ 30% 或预计 ≤ 30 天；其余为 `healthy`；
+- 分组筛选按 `device.group_name` 精确匹配，分组变更后下一次请求立即按新分组统计；
+- **只读端点，不写审计、不推进任何状态机**；viewer / operator / admin 均可访问，
+  参数越界返回 422。
+
 **请求追踪（v1.20.0）**：所有 HTTP 响应都带 `X-Request-Id`；若请求方传入合法的
 `X-Request-Id`（`[A-Za-z0-9._-]`，≤64 字符）则沿用，否则生成 32 位十六进制 ID。
 错误响应体在原有 `{code, message, data}` 基础上新增 `requestId`：

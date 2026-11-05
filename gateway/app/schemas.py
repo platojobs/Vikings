@@ -437,6 +437,72 @@ class AbnormalDeviceOut(BaseModel):
     reason: str
 
 
+class BatteryTrendPointOut(BaseModel):
+    """电池健康看板：某一天的整机队平均电量（真实数据，无上报的日期不返回）。"""
+
+    day_start: datetime
+    avg_battery: float
+    samples: int
+
+
+class BatteryRiskDeviceOut(BaseModel):
+    """电池健康看板：单台设备的续航画像。
+
+    `battery` / `voltage` / `last_report_at` 取窗口内最新一条上报；
+    `drain_per_day` 为窗口内日平均电量的最小二乘斜率（百分点/天，仅正衰减时给出）；
+    `days_to_critical` = 最新电量到严重阈值（15%）按当前衰减速度的预计天数。
+    """
+
+    device_id: str
+    name: str
+    group_name: str
+    status: str
+    battery: Optional[int] = None
+    voltage: Optional[float] = None
+    last_report_at: Optional[datetime] = None
+    drain_per_day: Optional[float] = None
+    days_to_critical: Optional[float] = None
+    risk: Literal["critical", "warning", "healthy", "unknown"]
+    open_alert_count: int = 0
+
+
+class BatteryGroupSummaryOut(BaseModel):
+    """电池健康看板：按设备分组汇总的风险分层。"""
+
+    group_name: str
+    total: int
+    critical: int
+    warning: int
+    healthy: int
+    unknown: int
+    avg_battery: Optional[float] = None
+
+
+class BatteryHealthOut(BaseModel):
+    """电池健康与续航看板（v1.32.0）。
+
+    口径均为真实上报数据：窗口内无任何记录的设备记为 `unknown`，不做臆测补值。
+    """
+
+    device_total: int
+    battery_known: int
+    critical: int
+    warning: int
+    healthy: int
+    unknown: int
+    avg_battery: Optional[float] = None
+    # 分层阈值随响应返回，前端只展示不自行硬编码
+    warning_percent: int
+    critical_percent: int
+    window_days: int
+    window_start: datetime
+    trend: List[BatteryTrendPointOut] = Field(default_factory=list)
+    groups: List[BatteryGroupSummaryOut] = Field(default_factory=list)
+    watchlist: List[BatteryRiskDeviceOut] = Field(default_factory=list)
+    # 处于 critical + warning 的设备总数（watchlist 只返回前 limit 台）
+    watchlist_total: int = 0
+
+
 class NotificationConfigUpdate(BaseModel):
     """通知配置更新（v1.29.0）：未传字段保持不变。
 

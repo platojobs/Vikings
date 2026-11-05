@@ -434,6 +434,67 @@ export interface StatsOverview {
   alert_open: number
 }
 
+// ==================== 电池健康与续航（v1.32.0） ====================
+
+export type BatteryRisk = 'critical' | 'warning' | 'healthy' | 'unknown'
+
+export interface BatteryTrendPoint {
+  day_start: string
+  avg_battery: number
+  samples: number
+}
+
+export interface BatteryRiskDevice {
+  device_id: string
+  name: string
+  group_name: string
+  status: DeviceStatus
+  battery: number | null
+  voltage: number | null
+  last_report_at: string | null
+  /** 百分点/天；稳定或回升时为 null */
+  drain_per_day: number | null
+  /** 到严重阈值（15%）的预计天数；无法估算时为 null */
+  days_to_critical: number | null
+  risk: BatteryRisk
+  open_alert_count: number
+}
+
+export interface BatteryGroupSummary {
+  group_name: string
+  total: number
+  critical: number
+  warning: number
+  healthy: number
+  unknown: number
+  avg_battery: number | null
+}
+
+/** GET /api/stats/battery-health */
+export interface BatteryHealth {
+  device_total: number
+  battery_known: number
+  critical: number
+  warning: number
+  healthy: number
+  unknown: number
+  avg_battery: number | null
+  warning_percent: number
+  critical_percent: number
+  window_days: number
+  window_start: string
+  trend: BatteryTrendPoint[]
+  groups: BatteryGroupSummary[]
+  watchlist: BatteryRiskDevice[]
+  watchlist_total: number
+}
+
+export interface BatteryHealthQuery {
+  group?: string
+  days?: number
+  limit?: number
+}
+
 // ==================== 系统状态 ====================
 
 /** GET /api/system/status 的分段结构，全部为 REST snake_case */
