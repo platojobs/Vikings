@@ -18,6 +18,7 @@ import {
   fetchAlertSummary,
   handoverAlerts,
 } from '@/api/alerts'
+import { fetchDeviceTags } from '@/api/devices'
 import { exportAlerts, formatBytes } from '@/api/exports'
 import { subscribe } from '@/services/mqtt'
 import { canOperate } from '@/utils/permissions'
@@ -34,6 +35,7 @@ import type {
   AlertLevel,
   AlertMatchedRule,
   AlertSummary,
+  DeviceTagStat,
   SlaState,
   SystemAlertMessage,
 } from '@/types'
@@ -60,12 +62,26 @@ const query = reactive<{
   status: 'open' | 'acked' | ''
   sla: SlaState | ''
   deviceId: string
+  /** v1.35.0：标签多选，多个标签为「或」 */
+  tags: string[]
 }>({
   level: '',
   status: '',
   sla: '',
   deviceId: '',
+  tags: [],
 })
+
+/** 标签筛选选项（含设备数），登录即可读 */
+const tagStats = ref<DeviceTagStat[]>([])
+
+async function loadTagStats(): Promise<void> {
+  try {
+    tagStats.value = await fetchDeviceTags()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  }
+}
 /** 时间范围筛选（v1.30.0）：与导出共用，null 表示不限时间 */
 const range = ref<[Date, Date] | null>(null)
 
@@ -114,6 +130,8 @@ async function loadAlerts(): Promise<void> {
       status: query.status || undefined,
       sla: query.sla || undefined,
       deviceId: query.deviceId.trim() || undefined,
+      // 不选标签时传 undefined，请求与升级前完全一致
+      tag: query.tags.length ? query.tags : undefined,
       start: start ? start.getTime() : undefined,
       end: end ? end.getTime() : undefined,
       page: page.value,
@@ -153,6 +171,7 @@ function handleReset(): void {
   query.status = ''
   query.sla = ''
   query.deviceId = ''
+  query.tags = []
   range.value = null
   page.value = 1
   loadAlerts()
@@ -280,6 +299,7 @@ async function handleExport(): Promise<void> {
         deviceId: query.deviceId.trim() || undefined,
         level: query.level || undefined,
         status: query.status || undefined,
+        tag: query.tags.length ? query.tags : undefined,
         start: start ? start.getTime() : undefined,
         end: end ? end.getTime() : undefined,
       },
@@ -417,6 +437,7 @@ function ruleExplain(row: AlertItem): string {
 onMounted(() => {
   loadSummary()
   loadAlerts()
+  loadTagStats()
 })
 
 onUnmounted(() => {
@@ -477,6 +498,23 @@ onUnmounted(() => {
           clearable
           @keyup.enter="handleSearch"
         />
+        <el-select
+          v-model="query.tags"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          clearable
+          placeholder="全部标签"
+          class="tag-select"
+          data-test="alert-tag-filter"
+        >
+          <el-option
+            v-for="item in tagStats"
+            :key="item.tag"
+            :label="`${item.tag}（${item.device_count}）`"
+            :value="item.tag"
+          />
+        </el-select>
         <el-date-picker
           v-model="range"
           class="range-picker"
@@ -774,6 +812,10 @@ onUnmounted(() => {
 }
 
 .device-input {
+  width: 200px;
+}
+
+.tag-select {
   width: 200px;
 }
 

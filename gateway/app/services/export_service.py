@@ -12,12 +12,13 @@ import csv
 import io
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, DeviceAlert, SensorRecord
+from app.services import tag_service
 
 # 每批 2000 行：单批内存可控，又能把数据库往返次数压到 100 次/20 万行
 BATCH_SIZE = 2000
@@ -96,12 +97,17 @@ def _records_filter(
     group_name: Optional[str],
     start: Optional[datetime],
     end: Optional[datetime],
+    tags: Optional[Sequence[str]] = None,
 ):
     conditions = []
     if device_id:
         conditions.append(SensorRecord.device_id == device_id)
     if group_name:
         conditions.append(Device.group_name == group_name)
+    if tags:
+        conditions.append(
+            SensorRecord.device_id.in_(tag_service.device_ids_with_tags(tags))
+        )
     if start:
         conditions.append(SensorRecord.ts >= start)
     if end:
@@ -116,12 +122,17 @@ def _alerts_filter(
     status: Optional[str],
     start: Optional[datetime],
     end: Optional[datetime],
+    tags: Optional[Sequence[str]] = None,
 ):
     conditions = []
     if device_id:
         conditions.append(DeviceAlert.device_id == device_id)
     if group_name:
         conditions.append(Device.group_name == group_name)
+    if tags:
+        conditions.append(
+            DeviceAlert.device_id.in_(tag_service.device_ids_with_tags(tags))
+        )
     if level:
         conditions.append(DeviceAlert.level == level)
     if status:
@@ -139,9 +150,10 @@ async def count_records(
     group_name: Optional[str],
     start: Optional[datetime],
     end: Optional[datetime],
+    tags: Optional[Sequence[str]] = None,
 ) -> int:
     stmt = select(func.count(SensorRecord.id)).select_from(SensorRecord)
-    conditions = _records_filter(device_id, group_name, start, end)
+    conditions = _records_filter(device_id, group_name, start, end, tags)
     if group_name:
         stmt = stmt.join(Device, Device.device_id == SensorRecord.device_id)
     if conditions:
@@ -157,9 +169,10 @@ async def count_alerts(
     status: Optional[str],
     start: Optional[datetime],
     end: Optional[datetime],
+    tags: Optional[Sequence[str]] = None,
 ) -> int:
     stmt = select(func.count(DeviceAlert.id)).select_from(DeviceAlert)
-    conditions = _alerts_filter(device_id, group_name, level, status, start, end)
+    conditions = _alerts_filter(device_id, group_name, level, status, start, end, tags)
     if group_name:
         stmt = stmt.join(Device, Device.device_id == DeviceAlert.device_id)
     if conditions:
@@ -174,6 +187,7 @@ async def stream_records(
     start: Optional[datetime],
     end: Optional[datetime],
     state: Dict[str, int],
+    tags: Optional[Sequence[str]] = None,
 ) -> AsyncIterator[str]:
     """按时间正序 keyset 分批导出；state["rows"] 记录实际写出行数。"""
     buffer = io.StringIO()
@@ -184,7 +198,7 @@ async def stream_records(
     buffer.seek(0)
     buffer.truncate(0)
 
-    base_conditions = _records_filter(device_id, group_name, start, end)
+    base_conditions = _records_filter(device_id, group_name, start, end, tags)
     last_ts: Optional[datetime] = None
     last_id: Optional[int] = None
     exported = 0
@@ -257,6 +271,7 @@ async def stream_alerts(
     start: Optional[datetime],
     end: Optional[datetime],
     state: Dict[str, int],
+    tags: Optional[Sequence[str]] = None,
 ) -> AsyncIterator[str]:
     """按创建时间正序 keyset 分批导出；state["rows"] 记录实际写出行数。"""
     buffer = io.StringIO()
@@ -267,7 +282,7 @@ async def stream_alerts(
     buffer.seek(0)
     buffer.truncate(0)
 
-    base_conditions = _alerts_filter(device_id, group_name, level, status, start, end)
+    base_conditions = _alerts_filter(device_id, group_name, level, status, start, end, tags)
     last_created: Optional[datetime] = None
     last_id: Optional[int] = None
     exported = 0

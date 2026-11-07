@@ -12,7 +12,7 @@
 import asyncio
 import logging
 import time
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -96,6 +96,9 @@ def _audited_stream(
 async def export_records(
     deviceId: Optional[str] = Query(default=None, max_length=64),
     group: Optional[str] = Query(default=None, max_length=64, description="设备分组"),
+    tag: Optional[List[str]] = Query(
+        default=None, max_length=32, description="设备标签，可重复；多个标签为「或」"
+    ),
     start: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     end: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     user: dict = Depends(require_role(ROLE_OPERATOR)),
@@ -105,7 +108,9 @@ async def export_records(
     settings = get_settings()
 
     async with SessionFactory() as session:
-        total = await export_service.count_records(session, deviceId, group, start_dt, end_dt)
+        total = await export_service.count_records(
+            session, deviceId, group, start_dt, end_dt, tag
+        )
     if total > settings.export_max_rows:
         raise HTTPException(
             status_code=422,
@@ -121,6 +126,7 @@ async def export_records(
     filters = {
         "deviceId": deviceId,
         "group": group,
+        "tag": tag,
         "start": start_dt.isoformat() if start_dt else None,
         "end": end_dt.isoformat() if end_dt else None,
         "maxRows": settings.export_max_rows,
@@ -129,7 +135,7 @@ async def export_records(
     async def inner() -> AsyncIterator[str]:
         async with SessionFactory() as session:
             async for chunk in export_service.stream_records(
-                session, deviceId, group, start_dt, end_dt, state
+                session, deviceId, group, start_dt, end_dt, state, tag
             ):
                 yield chunk
 
@@ -157,6 +163,9 @@ async def export_alerts(
     group: Optional[str] = Query(default=None, max_length=64, description="设备分组"),
     level: Optional[str] = Query(default=None, pattern=ALERT_LEVEL_PATTERN),
     status: Optional[str] = Query(default=None, pattern=ALERT_STATUS_PATTERN),
+    tag: Optional[List[str]] = Query(
+        default=None, max_length=32, description="设备标签，可重复；多个标签为「或」"
+    ),
     start: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     end: Optional[str] = Query(default=None, description="ISO8601 或毫秒时间戳"),
     user: dict = Depends(require_role(ROLE_OPERATOR)),
@@ -167,7 +176,7 @@ async def export_alerts(
 
     async with SessionFactory() as session:
         total = await export_service.count_alerts(
-            session, deviceId, group, level, status, start_dt, end_dt
+            session, deviceId, group, level, status, start_dt, end_dt, tag
         )
     if total > settings.export_max_rows:
         raise HTTPException(
@@ -186,6 +195,7 @@ async def export_alerts(
         "group": group,
         "level": level,
         "status": status,
+        "tag": tag,
         "start": start_dt.isoformat() if start_dt else None,
         "end": end_dt.isoformat() if end_dt else None,
         "maxRows": settings.export_max_rows,
@@ -194,7 +204,7 @@ async def export_alerts(
     async def inner() -> AsyncIterator[str]:
         async with SessionFactory() as session:
             async for chunk in export_service.stream_alerts(
-                session, deviceId, group, level, status, start_dt, end_dt, state
+                session, deviceId, group, level, status, start_dt, end_dt, state, tag
             ):
                 yield chunk
 

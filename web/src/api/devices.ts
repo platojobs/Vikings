@@ -15,6 +15,8 @@ import type {
   DeviceGroupStat,
   DeviceListQuery,
   DeviceRecordsQuery,
+  DeviceTagBatchResult,
+  DeviceTagStat,
   DeviceUpdateBody,
   MqttCredentialResult,
   MqttCredentialRevokeResult,
@@ -28,9 +30,31 @@ export function fetchDevices(query: DeviceListQuery = {}): Promise<PageResult<De
       status: query.status,
       keyword: query.keyword,
       group: query.group,
+      // v1.35.0：多个标签按重复参数下发（tag=a&tag=b），服务端按「或」匹配
+      tag: query.tag,
       page: query.page,
       pageSize: query.pageSize,
     },
+  })
+}
+
+/** v1.35.0 标签列表（含每个标签下的设备数），登录即可读 */
+export function fetchDeviceTags(): Promise<DeviceTagStat[]> {
+  return request<DeviceTagStat[]>('/api/devices/tags')
+}
+
+/**
+ * v1.35.0 批量打标签/移除标签（仅 admin）。
+ * 返回逐设备结果：updated / unchanged / not_found / over_limit，调用方必须逐类展示。
+ */
+export function batchUpdateDeviceTags(body: {
+  device_ids: string[]
+  add?: string[]
+  remove?: string[]
+}): Promise<DeviceTagBatchResult> {
+  return request<DeviceTagBatchResult>('/api/devices/tags/batch', {
+    method: 'POST',
+    body,
   })
 }
 

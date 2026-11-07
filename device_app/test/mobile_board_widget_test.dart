@@ -178,6 +178,7 @@ class _FakeApiClient extends ApiClient {
   String? lastKeyword;
   String? lastStatus;
   String? lastGroup;
+  List<String>? lastTags;
   bool lastHasAlert = false;
   int alertFetchCalls = 0;
   int recordFetchCalls = 0;
@@ -202,6 +203,7 @@ class _FakeApiClient extends ApiClient {
     String? status,
     String? keyword,
     String? group,
+    List<String>? tags,
     bool hasAlert = false,
     bool withAlertCount = false,
   }) async {
@@ -210,6 +212,7 @@ class _FakeApiClient extends ApiClient {
     lastKeyword = keyword;
     lastStatus = status;
     lastGroup = group;
+    lastTags = tags;
     lastHasAlert = hasAlert;
     final error = fetchError;
     if (error != null) {
@@ -236,6 +239,12 @@ class _FakeApiClient extends ApiClient {
     if (group != null && group.isNotEmpty) {
       filtered = filtered
           .where((item) => _groupNameOf(item) == group)
+          .toList(growable: false);
+    }
+    if (tags != null && tags.isNotEmpty) {
+      // 网关语义：多个标签之间为「或」
+      filtered = filtered
+          .where((item) => item.tags.any(tags.contains))
           .toList(growable: false);
     }
     if (hasAlert) {
@@ -288,6 +297,21 @@ class _FakeApiClient extends ApiClient {
     if (index >= 0) {
       devices[index] = devices[index].copyWith(groupName: groupName);
     }
+  }
+
+  @override
+  Future<List<DeviceTagStat>> fetchDeviceTags({required String token}) async {
+    final counts = <String, int>{};
+    for (final device in devices) {
+      for (final tag in device.tags) {
+        counts[tag] = (counts[tag] ?? 0) + 1;
+      }
+    }
+    final stats = counts.entries
+        .map((entry) => DeviceTagStat(tag: entry.key, deviceCount: entry.value))
+        .toList(growable: false);
+    stats.sort((a, b) => a.tag.compareTo(b.tag));
+    return stats;
   }
 
   @override
@@ -1518,6 +1542,65 @@ void main() {
     expect(api.credentialRevokeCalls, 1);
     expect(find.text('已吊销'), findsOneWidget);
     expect(find.byKey(const Key('credential-revoked-tip')), findsOneWidget);
+  });
+
+  testWidgets('标签筛选与关键词/状态组合生效并重置分页', (tester) async {
+    final devices = List<DeviceSummary>.generate(25, (index) {
+      final id = 'dev-${index.toString().padLeft(2, '0')}';
+      return DeviceSummary(
+        deviceId: id,
+        name: '设备 $id',
+        model: 'Battery-Sensor',
+        firmwareVersion: '1.0.0',
+        groupName: '冷库组',
+        status: index == 1 ? 'offline' : 'online',
+        tags: index <= 2 ? const <String>['冷库'] : const <String>['常温'],
+      );
+    });
+    final api = _FakeApiClient(devices: devices);
+    await _pumpBoard(tester, api: api, session: _adminSession);
+    await tester.pumpAndSettle();
+
+    // 标签 chips 来自 GET /api/devices/tags，带设备数
+    expect(find.widgetWithText(ChoiceChip, '冷库（3）'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, '常温（22）'), findsOneWidget);
+
+    // 先翻到第 2 页，验证切换标签会重置回第 1 页
+    for (var i = 0; i < 12 && api.lastPage == 1; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+    expect(api.lastPage, 2);
+
+    await tester.drag(find.byType(ListView).first, const Offset(0, 3000));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ChoiceChip, '冷库（3）'));
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+    expect(api.lastTags, const <String>['冷库']);
+    expect(find.text('设备 dev-00'), findsOneWidget);
+    expect(find.text('设备 dev-03'), findsNothing);
+    expect(find.text('筛选结果：3 台 / 全部 25 台'), findsOneWidget);
+
+    // 与关键词组合：标签 + 关键词同时作为服务端参数
+    await tester.enterText(find.byType(TextField), 'dev-01');
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+    expect(api.lastPage, 1);
+    expect(api.lastTags, const <String>['冷库']);
+    expect(api.lastKeyword, 'dev-01');
+    expect(find.text('设备 dev-01'), findsOneWidget);
+    expect(find.text('设备 dev-00'), findsNothing);
+
+    // 再叠加状态筛选：标签 + 关键词 + 状态三者同时生效
+    await tester.tap(find.widgetWithText(ChoiceChip, '离线'));
+    await tester.pumpAndSettle();
+    expect(api.lastStatus, 'offline');
+    expect(api.lastTags, const <String>['冷库']);
+    expect(api.lastKeyword, 'dev-01');
+    expect(find.text('设备 dev-01'), findsOneWidget);
+    expect(find.text('筛选结果：1 台 / 全部 25 台'), findsOneWidget);
   });
 }
 

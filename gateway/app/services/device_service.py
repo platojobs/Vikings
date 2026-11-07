@@ -5,7 +5,7 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, DeviceAlert, SensorRecord
 from app.schemas import DeviceStatusMessage, SensorReportMessage
+from app.services import tag_service
 from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE, TOPIC_SYSTEM_GROUP
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ async def list_devices(
     page_size: int,
     group_name: Optional[str] = None,
     has_alert: bool = False,
+    tags: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Device], int]:
     stmt = select(Device)
     count_stmt = select(func.count()).select_from(Device)
@@ -133,6 +135,11 @@ async def list_devices(
         cond = Device.device_id.ilike(like) | Device.name.ilike(like)
         stmt = stmt.where(cond)
         count_stmt = count_stmt.where(cond)
+    if tags:
+        # v1.35.0：多个标签之间为「或」，与 keyword/status/group 组合生效
+        tag_device_ids = tag_service.device_ids_with_tags(tags)
+        stmt = stmt.where(Device.device_id.in_(tag_device_ids))
+        count_stmt = count_stmt.where(Device.device_id.in_(tag_device_ids))
 
     stmt = stmt.order_by(Device.last_report_at.desc().nullslast(), Device.device_id)
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
@@ -277,6 +284,7 @@ async def delete_device(session: AsyncSession, device_id: str) -> Tuple[bool, st
     if record_count > 0:
         return False, f"设备存在 {record_count} 条历史数据，请先清理后再删除"
 
+    await tag_service.delete_device_tags(session, device_id)
     await session.delete(device)
     await session.flush()
     return True, ""

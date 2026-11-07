@@ -410,6 +410,8 @@ def test_export_audit_records_metadata_only(tmp_path):
             "group": None,
             "level": "critical",
             "status": "open",
+            # v1.35.0 新增标签筛选；不传标签时审计记录为 null，行为与升级前一致
+            "tag": None,
             "start": "2026-11-01T00:00:00+00:00",
             "end": "2026-11-05T00:00:00+00:00",
             "maxRows": 200000,

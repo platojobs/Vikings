@@ -129,6 +129,7 @@ class DeviceSummary {
     this.mqttCredentialRevokedAt,
     this.mqttCredentialStatus = 'missing',
     this.mqttCredentialFingerprintPrefix,
+    this.tags = const <String>[],
   });
 
   final String deviceId;
@@ -156,6 +157,9 @@ class DeviceSummary {
   final String mqttCredentialStatus;
   final String? mqttCredentialFingerprintPrefix;
 
+  /// v1.35.0 设备标签（多值，服务端以数组返回，不是逗号拼接字符串）。
+  final List<String> tags;
+
   bool get online => status == 'online';
   bool get credentialIssued => mqttCredentialStatus != 'missing';
   bool get credentialRevoked => mqttCredentialStatus == 'revoked';
@@ -169,6 +173,7 @@ class DeviceSummary {
     DateTime? mqttCredentialRevokedAt,
     String? mqttCredentialStatus,
     String? mqttCredentialFingerprintPrefix,
+    List<String>? tags,
   }) => DeviceSummary(
     deviceId: deviceId,
     name: name,
@@ -189,6 +194,7 @@ class DeviceSummary {
     mqttCredentialStatus: mqttCredentialStatus ?? this.mqttCredentialStatus,
     mqttCredentialFingerprintPrefix:
         mqttCredentialFingerprintPrefix ?? this.mqttCredentialFingerprintPrefix,
+    tags: tags ?? this.tags,
   );
 
   factory DeviceSummary.fromJson(Map<String, dynamic> json) => DeviceSummary(
@@ -209,6 +215,25 @@ class DeviceSummary {
     mqttCredentialStatus: _asString(json['mqtt_credential_status'], 'missing'),
     mqttCredentialFingerprintPrefix:
         json['mqtt_credential_fingerprint_prefix']?.toString(),
+    tags: (json['tags'] is List)
+        ? (json['tags'] as List)
+              .whereType<Object>()
+              .map((item) => item.toString())
+              .toList(growable: false)
+        : const <String>[],
+  );
+}
+
+/// `GET /api/devices/tags`：标签及其设备数。
+class DeviceTagStat {
+  const DeviceTagStat({required this.tag, required this.deviceCount});
+
+  final String tag;
+  final int deviceCount;
+
+  factory DeviceTagStat.fromJson(Map<String, dynamic> json) => DeviceTagStat(
+    tag: _asString(json['tag']),
+    deviceCount: _asInt(json['device_count']),
   );
 }
 

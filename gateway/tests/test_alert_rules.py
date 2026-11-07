@@ -245,7 +245,12 @@ def test_permissions_and_validation(tmp_path):
         assert audit.detail["fields"] == [
             "level", "metric", "name", "op", "scope_type", "threshold",
         ]
-        assert "3.35" not in json.dumps(audit.detail), "审计不得记录阈值等具体值"
+        # v1.35.0：规则变更历史需要看到前后值，因此 create 审计记录 changes；
+        # 规则字段不含密钥，敏感词仍不得出现。
+        assert audit.detail["changes"]["threshold"]["to"] == 3.35
+        serialized = json.dumps(audit.detail)
+        for secret in ("password", "token", "secret", "Authorization"):
+            assert secret not in serialized, f"审计不得记录敏感内容：{secret}"
 
     _run(tmp_path, scenario)
 

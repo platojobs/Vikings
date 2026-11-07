@@ -3,6 +3,7 @@ import { request } from '@/api/http'
 import type {
   AlertRule,
   AlertRuleCreateBody,
+  AlertRuleHistoryEntry,
   AlertRuleUpdateBody,
   ThresholdsUpdateBody,
   ThresholdsUpdateResult,
@@ -32,6 +33,16 @@ export function setAlertRuleEnabled(id: number, enabled: boolean): Promise<Alert
 /** 删除规则（仅 admin） */
 export function deleteAlertRule(id: number): Promise<{ deleted: number }> {
   return request<{ deleted: number }>(`/api/rules/${id}`, { method: 'DELETE' })
+}
+
+/** v1.35.0：规则变更历史，直接复用既有审计日志，不另建记录 */
+export function fetchAlertRuleHistory(
+  id: number,
+  limit = 50,
+): Promise<AlertRuleHistoryEntry[]> {
+  return request<AlertRuleHistoryEntry[]>(`/api/rules/${id}/history`, {
+    params: { limit },
+  })
 }
 
 /** 把默认规则阈值回滚到出厂/环境变量值（仅 admin） */

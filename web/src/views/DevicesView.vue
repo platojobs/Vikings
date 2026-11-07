@@ -7,6 +7,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  batchUpdateDeviceTags,
   bulkCreateDevices,
   createDevice,
   deleteDevice,
@@ -15,6 +16,7 @@ import {
   fetchDeviceGroups,
   fetchDeviceRecords,
   fetchDevices,
+  fetchDeviceTags,
   issueDeviceCredential,
   revokeDeviceCredential,
   sendBulkCommand,
@@ -50,13 +52,24 @@ import type {
   DeviceDetail,
   DeviceGroupStat,
   DeviceStatus,
+  DeviceTagBatchItem,
+  DeviceTagBatchResult,
+  DeviceTagStat,
   SensorRecord,
 } from '@/types'
+import { TAG_MAX_LENGTH, TAG_MAX_PER_DEVICE } from '@/types'
 
-const query = reactive<{ status: DeviceStatus | ''; keyword: string; group: string }>({
+const query = reactive<{
+  status: DeviceStatus | ''
+  keyword: string
+  group: string
+  /** v1.35.0：标签多选，多个标签为「或」 */
+  tags: string[]
+}>({
   status: '',
   keyword: '',
   group: '',
+  tags: [],
 })
 
 const devices = ref<Device[]>([])
@@ -120,6 +133,8 @@ async function loadDevices(): Promise<void> {
       status: query.status || undefined,
       keyword: query.keyword.trim() || undefined,
       group: query.group || undefined,
+      // 不选标签时传 undefined，请求与升级前完全一致
+      tag: query.tags.length ? query.tags : undefined,
       page: page.value,
       pageSize: pageSize.value,
     })
@@ -142,6 +157,7 @@ function handleReset(): void {
   query.status = ''
   query.keyword = ''
   query.group = ''
+  query.tags = []
   page.value = 1
   loadDevices()
 }
@@ -164,6 +180,124 @@ async function loadGroups(): Promise<void> {
   } catch {
     // 错误提示已由 HTTP 层统一处理
   }
+}
+
+// ==================== 设备标签（v1.35.0） ====================
+
+/** 标签列表带设备数，既用于筛选下拉，也用于批量移除的候选 */
+const tagStats = ref<DeviceTagStat[]>([])
+
+async function loadTagStats(): Promise<void> {
+  try {
+    tagStats.value = await fetchDeviceTags()
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  }
+}
+
+const tagDialogVisible = ref(false)
+const tagDialogTargets = ref<Device[]>([])
+/** 待添加标签（用户输入，提交时服务端还会做格式与上限校验） */
+const tagDialogAdd = ref<string[]>([])
+const tagDialogRemove = ref<string[]>([])
+const tagDialogSaving = ref(false)
+const tagDialogResult = ref<DeviceTagBatchResult | null>(null)
+
+/** 移除候选只来自目标设备当前持有的标签，避免让用户误以为能移除不存在的标签 */
+const tagDialogRemoveOptions = computed(() => {
+  const set = new Set<string>()
+  tagDialogTargets.value.forEach((device) => {
+    ;(device.tags ?? []).forEach((tag) => set.add(tag))
+  })
+  return Array.from(set).sort()
+})
+
+const tagDialogTitle = computed(() => {
+  const count = tagDialogTargets.value.length
+  return count === 1
+    ? `设备标签 · ${tagDialogTargets.value[0]?.device_id}`
+    : `批量标签 · 已选 ${count} 台`
+})
+
+function openTagDialog(rows: Device[]): void {
+  if (!isAdminOnly.value) return
+  if (rows.length === 0) {
+    ElMessage.warning('请先勾选需要打标签的设备')
+    return
+  }
+  tagDialogTargets.value = rows
+  tagDialogAdd.value = []
+  tagDialogRemove.value = []
+  tagDialogResult.value = null
+  tagDialogVisible.value = true
+}
+
+function openBatchTag(): void {
+  openTagDialog(selectedDevices.value)
+}
+
+function openSingleTag(row: Device): void {
+  openTagDialog([row])
+}
+
+/** 提交前本地只做空白清洗；格式/上限以服务端 400 文案为准，避免前后端规则漂移 */
+function normalizeTagInput(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
+}
+
+async function submitTagDialog(): Promise<void> {
+  const add = normalizeTagInput(tagDialogAdd.value)
+  const remove = normalizeTagInput(tagDialogRemove.value)
+  if (add.length === 0 && remove.length === 0) {
+    ElMessage.warning('请至少填写要添加或移除的标签')
+    return
+  }
+  const tooLong = add.find((tag) => tag.length > TAG_MAX_LENGTH)
+  if (tooLong) {
+    ElMessage.warning(`标签「${tooLong}」超过 ${TAG_MAX_LENGTH} 个字符`)
+    return
+  }
+
+  tagDialogSaving.value = true
+  try {
+    const result = await batchUpdateDeviceTags({
+      device_ids: tagDialogTargets.value.map((device) => device.device_id),
+      add: add.length ? add : undefined,
+      remove: remove.length ? remove : undefined,
+    })
+    tagDialogResult.value = result
+    const failed = result.not_found + result.over_limit
+    if (failed === 0) {
+      ElMessage.success(`标签更新完成：${result.updated} 台已更新，${result.unchanged} 台无变化`)
+    } else {
+      ElMessage.warning(
+        `标签更新部分完成：${result.updated} 台已更新，${failed} 台未更新（见下方逐台结果）`,
+      )
+    }
+    await Promise.all([loadDevices(), loadTagStats()])
+  } catch {
+    // 错误提示已由 HTTP 层统一处理（400 含可读校验原因）
+  } finally {
+    tagDialogSaving.value = false
+  }
+}
+
+const TAG_STATUS_LABELS: Record<DeviceTagBatchItem['status'], string> = {
+  updated: '已更新',
+  unchanged: '无变化',
+  not_found: '设备不存在',
+  over_limit: '超标签上限',
+}
+
+function tagStatusLabel(status: DeviceTagBatchItem['status']): string {
+  return TAG_STATUS_LABELS[status] ?? status
+}
+
+function tagStatusType(status: DeviceTagBatchItem['status']): 'success' | 'info' | 'warning' | 'danger' {
+  if (status === 'updated') return 'success'
+  if (status === 'unchanged') return 'info'
+  if (status === 'over_limit') return 'warning'
+  return 'danger'
 }
 
 const formVisible = ref(false)
@@ -262,6 +396,7 @@ async function handleDeleteDevice(row: Device): Promise<void> {
     total.value -= 1
     ElMessage.success('设备已删除')
     loadGroups()
+    loadTagStats()
   } catch {
     // 错误提示已由 HTTP 层统一处理（存在历史数据时返回 409）
   }
@@ -688,6 +823,7 @@ function exportCsv(): void {
 onMounted(() => {
   loadDevices()
   loadGroups()
+  loadTagStats()
 })
 
 // ==================== 实时状态刷新 ====================
@@ -764,6 +900,23 @@ onUnmounted(() => {
             :value="item.group_name"
           />
         </el-select>
+        <el-select
+          v-model="query.tags"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          clearable
+          placeholder="全部标签"
+          class="tag-select"
+          data-test="device-tag-filter"
+        >
+          <el-option
+            v-for="item in tagStats"
+            :key="item.tag"
+            :label="`${item.tag}（${item.device_count}）`"
+            :value="item.tag"
+          />
+        </el-select>
         <el-input
           v-model="query.keyword"
           class="keyword-input"
@@ -781,6 +934,9 @@ onUnmounted(() => {
           </el-button>
           <el-button plain :disabled="selectedCount === 0" @click="goBatchOta">
             批量 OTA{{ selectedCount ? `（${selectedCount}）` : '' }}
+          </el-button>
+          <el-button v-if="isAdminOnly" plain :disabled="selectedCount === 0" @click="openBatchTag">
+            批量标签{{ selectedCount ? `（${selectedCount}）` : '' }}
           </el-button>
           <el-button plain @click="openBulkImport">批量导入</el-button>
           <el-button type="primary" @click="openCreateDevice">新建设备</el-button>
@@ -812,6 +968,22 @@ onUnmounted(() => {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="标签" min-width="180">
+          <template #default="{ row }">
+            <div v-if="row.tags?.length" class="tag-cell">
+              <el-tag
+                v-for="tag in row.tags"
+                :key="tag"
+                size="small"
+                effect="plain"
+                type="success"
+              >
+                {{ tag }}
+              </el-tag>
+            </div>
+            <span v-else class="tag-empty">—</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="firmware_version" label="固件版本" width="110" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
@@ -823,11 +995,14 @@ onUnmounted(() => {
             {{ formatDateTime(row.last_report_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="190">
+        <el-table-column label="操作" width="250">
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openDevice(row)">详情</el-button>
             <el-button v-if="canWrite" link type="primary" @click.stop="openEditDevice(row)">
               编辑
+            </el-button>
+            <el-button v-if="isAdminOnly" link type="primary" @click.stop="openSingleTag(row)">
+              标签
             </el-button>
             <el-button
               v-if="isAdminOnly"
@@ -1328,6 +1503,106 @@ onUnmounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- v1.35.0 标签编辑：单个与批量复用同一弹窗；结果逐台展示部分失败 -->
+    <el-dialog v-model="tagDialogVisible" :title="tagDialogTitle" width="760px" destroy-on-close>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="tag-dialog-tip"
+        :title="`标签用于设备筛选、告警筛选、导出与告警规则范围；单个标签最长 ${TAG_MAX_LENGTH} 字符，单台设备最多 ${TAG_MAX_PER_DEVICE} 个`"
+      />
+      <el-form label-width="90px" label-position="left" :disabled="tagDialogSaving">
+        <el-form-item label="添加标签">
+          <el-select
+            v-model="tagDialogAdd"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="false"
+            placeholder="输入后回车创建，如 华东 / 冷库 / 关键设备"
+            class="tag-input"
+            data-test="tag-add-select"
+          >
+            <el-option v-for="item in tagStats" :key="item.tag" :label="item.tag" :value="item.tag" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="移除标签">
+          <el-select
+            v-model="tagDialogRemove"
+            multiple
+            filterable
+            clearable
+            placeholder="仅列出所选设备当前持有的标签"
+            class="tag-input"
+            data-test="tag-remove-select"
+          >
+            <el-option
+              v-for="tag in tagDialogRemoveOptions"
+              :key="tag"
+              :label="tag"
+              :value="tag"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+
+      <template v-if="tagDialogResult">
+        <el-alert
+          :type="tagDialogResult.not_found + tagDialogResult.over_limit ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+          class="tag-result-summary"
+          data-test="tag-batch-summary"
+          :title="`已更新 ${tagDialogResult.updated} 台 · 无变化 ${tagDialogResult.unchanged} 台 · 不存在 ${tagDialogResult.not_found} 台 · 超上限 ${tagDialogResult.over_limit} 台`"
+        />
+        <el-table :data="tagDialogResult.results" size="small" row-key="device_id" max-height="280">
+          <el-table-column prop="device_id" label="设备 ID" min-width="140" />
+          <el-table-column label="结果" width="110">
+            <template #default="{ row }">
+              <el-tag :type="tagStatusType(row.status)" size="small">
+                {{ tagStatusLabel(row.status) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="新增" min-width="110">
+            <template #default="{ row }">
+              <span v-if="row.added.length">{{ row.added.join('、') }}</span>
+              <span v-else class="tag-empty">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="移除" min-width="110">
+            <template #default="{ row }">
+              <span v-if="row.removed.length">{{ row.removed.join('、') }}</span>
+              <span v-else class="tag-empty">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="tag_count" label="标签数" width="80" />
+          <el-table-column label="原因" min-width="180">
+            <template #default="{ row }">
+              <span v-if="row.error" class="tag-error">{{ row.error }}</span>
+              <span v-else class="tag-empty">—</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+
+      <template #footer>
+        <el-button @click="tagDialogVisible = false">
+          {{ tagDialogResult ? '关闭' : '取消' }}
+        </el-button>
+        <el-button
+          v-if="!tagDialogResult"
+          type="primary"
+          :loading="tagDialogSaving"
+          @click="submitTagDialog"
+        >
+          保存标签（{{ tagDialogTargets.length }} 台）
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -1345,6 +1620,37 @@ onUnmounted(() => {
 
 .group-select {
   width: 160px;
+}
+
+.tag-select {
+  width: 200px;
+}
+
+.tag-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tag-empty {
+  color: #cbd5e1;
+}
+
+.tag-error {
+  color: #dc2626;
+  font-size: 12px;
+}
+
+.tag-dialog-tip {
+  margin-bottom: 12px;
+}
+
+.tag-input {
+  width: 100%;
+}
+
+.tag-result-summary {
+  margin-bottom: 10px;
 }
 
 .filter-spacer {

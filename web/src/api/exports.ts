@@ -20,7 +20,8 @@ export interface ExportResult {
 }
 
 interface ExportParams {
-  [key: string]: string | number | undefined
+  /** v1.35.0：数组按重复参数序列化（tag=a&tag=b） */
+  [key: string]: string | number | string[] | undefined
 }
 
 class ExportError extends Error {
@@ -159,6 +160,7 @@ export function formatBytes(bytes: number): string {
 export function exportRecords(params: {
   deviceId?: string
   group?: string
+  tag?: string[]
   start?: number
   end?: number
 }, onProgress?: (progress: ExportProgress) => void): Promise<ExportResult> {
@@ -169,6 +171,7 @@ export function exportRecords(params: {
 export function exportAlerts(params: {
   deviceId?: string
   group?: string
+  tag?: string[]
   level?: string
   status?: string
   start?: number

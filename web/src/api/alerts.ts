@@ -18,6 +18,8 @@ export function fetchAlerts(query: AlertListQuery = {}): Promise<PageResult<Aler
       level: query.level,
       status: query.status,
       sla: query.sla,
+      // v1.35.0：多个标签按重复参数下发，服务端按「或」匹配
+      tag: query.tag,
       start: query.start,
       end: query.end,
       page: query.page,

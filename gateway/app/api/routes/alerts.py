@@ -49,6 +49,9 @@ async def list_alerts(
     level: Optional[str] = Query(default=None, pattern=ALERT_LEVEL_PATTERN),
     status: Optional[str] = Query(default=None, pattern="^(open|acked)$"),
     sla: Optional[str] = Query(default=None, pattern=ALERT_SLA_PATTERN, description="SLA 状态筛选"),
+    tag: Optional[list[str]] = Query(
+        default=None, max_length=32, description="设备标签，可重复；多个标签为「或」（v1.35.0）"
+    ),
     start: Optional[str] = Query(default=None, description="创建时间下限，ISO8601 或毫秒"),
     end: Optional[str] = Query(default=None, description="创建时间上限，ISO8601 或毫秒"),
     page: int = Query(default=1, ge=1),
@@ -66,7 +69,7 @@ async def list_alerts(
     now = datetime.now(timezone.utc)
     rows, total = await alert_service.list_alerts(
         session, deviceId, level, status, page, pageSize,
-        start=start_dt, end=end_dt, sla_state=sla, now=now,
+        start=start_dt, end=end_dt, sla_state=sla, now=now, tags=tag,
     )
     config = await sla_service.get_or_create_config(session)
     # 先完成 ORM → 响应转换再提交：commit 会让实例过期，异步会话不能惰性加载

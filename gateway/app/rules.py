@@ -267,14 +267,33 @@ def _rule_identity(rule: Dict) -> str:
     return f"id:{rule['id']}"
 
 
-def _in_scope(rule: Dict, device_id: Optional[str], group_name: Optional[str]) -> bool:
+def _rule_scope_values(rule: Dict) -> List[str]:
+    """规则多值范围；v1.34.0 单值规则回退到 scope_value。"""
+    values = list(rule.get("scope_values") or [])
+    if not values and rule.get("scope_value"):
+        values = [rule["scope_value"]]
+    return values
+
+
+def _in_scope(
+    rule: Dict,
+    device_id: Optional[str],
+    group_name: Optional[str],
+    tag_names: Optional[Sequence[str]] = None,
+) -> bool:
+    """范围匹配：同一规则内多个值之间为「或」，任一命中即生效（v1.35.0）。"""
     scope_type = rule.get("scope_type") or "global"
     if scope_type == "global":
         return True
+    values = _rule_scope_values(rule)
+    if not values:
+        return False
     if scope_type == "group":
-        return bool(group_name) and rule.get("scope_value") == group_name
+        return bool(group_name) and group_name in values
     if scope_type == "device":
-        return bool(device_id) and rule.get("scope_value") == device_id
+        return bool(device_id) and device_id in values
+    if scope_type == "tag":
+        return bool(tag_names) and any(tag in values for tag in tag_names)
     return False
 
 
@@ -313,13 +332,15 @@ def evaluate(
     report,
     device_id: Optional[str] = None,
     group_name: Optional[str] = None,
+    tag_names: Optional[Sequence[str]] = None,
 ) -> List[Dict]:
     """对一条上报执行规则判定，返回命中的告警列表（每指标最多一条）。
 
     参数：
     - `report`：含 voltage/temperature/humidity/rssi 字段的上报对象；
-    - `device_id` / `group_name`：用于「指定设备 / 指定分组」范围匹配；缺省时
-      仅 global 规则生效（纯函数测试无需构造设备）。
+    - `device_id` / `group_name` / `tag_names`：用于「指定设备 / 分组 / 标签」
+      范围匹配；缺省时仅 global 规则生效（纯函数测试无需构造设备）。
+    - 规则内多个范围值为「或」；同一指标多条规则命中仍取最高级别。
     """
     device = device_id or getattr(report, "device_id", None)
     hits: Dict[str, Dict] = {}
@@ -334,7 +355,7 @@ def evaluate(
 
         rule_key = _rule_identity(rule)
         counter_key = (device or "", rule_key)
-        scoped = _in_scope(rule, device, group_name)
+        scoped = _in_scope(rule, device, group_name, tag_names)
         triggered = scoped and _triggered(rule, value)
 
         if not triggered:

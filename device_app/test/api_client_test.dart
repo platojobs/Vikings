@@ -345,6 +345,58 @@ void main() {
     });
   });
 
+  test('v1.35.0 标签筛选按重复参数下发，并解析标签统计', () async {
+    late http.Request deviceRequest;
+    late http.Request alertRequest;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        switch (request.url.path) {
+          case '/api/devices':
+            deviceRequest = request;
+            return _jsonResponse(
+              _ok(<String, dynamic>{
+                'items': <dynamic>[],
+                'total': 0,
+                'page': 1,
+                'page_size': 20,
+              }),
+            );
+          case '/api/alerts':
+            alertRequest = request;
+            return _jsonResponse(
+              _ok(<String, dynamic>{
+                'items': <dynamic>[],
+                'total': 0,
+                'page': 1,
+                'page_size': 20,
+              }),
+            );
+          default:
+            return _jsonResponse(
+              _ok(<dynamic>[
+                <String, dynamic>{'tag': '冷库', 'device_count': 3},
+              ]),
+            );
+        }
+      }),
+    );
+
+    await client.fetchDevices(
+      token: 'token',
+      tags: const <String>['冷库', '常温'],
+    );
+    // Uri.replace 把 List<String> 展开为重复参数，后端 Optional[List[str]] 才能收到多值
+    expect(deviceRequest.url.queryParametersAll['tag'], <String>['冷库', '常温']);
+
+    await client.fetchAlerts(token: 'token', tags: const <String>['冷库']);
+    expect(alertRequest.url.queryParametersAll['tag'], <String>['冷库']);
+
+    final tags = await client.fetchDeviceTags(token: 'token');
+    expect(tags.single.tag, '冷库');
+    expect(tags.single.deviceCount, 3);
+  });
+
   test('deviceIds 为空时跳过最新值请求', () async {
     var calls = 0;
     final client = ApiClient(

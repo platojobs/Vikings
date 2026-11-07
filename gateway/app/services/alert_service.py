@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.models import DeviceAlert
 from app.rules import evaluate
 from app.schemas import SensorReportMessage
-from app.services import sla_service
+from app.services import sla_service, tag_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -49,8 +49,12 @@ async def handle_report_alerts(
 
     v1.34.0：判定读取 alert_rule 规则缓存（支持分组/设备范围），命中结果带
     matched_rule 快照并原样返回给 MQTT；规则变更无需重启即生效。
+    v1.35.0：判定额外读取设备标签，支持「指定标签」范围（规则内多值取或）。
     """
-    hits = evaluate(report, device_id=report.device_id, group_name=group_name)
+    tag_names = await tag_service.device_tags(session, report.device_id)
+    hits = evaluate(
+        report, device_id=report.device_id, group_name=group_name, tag_names=tag_names
+    )
     if not hits:
         return []
 
@@ -135,6 +139,7 @@ async def list_alerts(
     end: Optional[datetime] = None,
     sla_state: Optional[str] = None,
     now: Optional[datetime] = None,
+    tags: Optional[List[str]] = None,
 ) -> Tuple[List[DeviceAlert], int]:
     """按创建时间倒序分页；`start` / `end` 为 created_at 闭区间（v1.30.0）。
 
@@ -165,6 +170,11 @@ async def list_alerts(
         ):
             stmt = stmt.where(condition)
             count_stmt = count_stmt.where(condition)
+    # v1.35.0：按设备标签筛选（多个标签为「或」），与其它条件组合生效
+    if tags:
+        tag_device_ids = tag_service.device_ids_with_tags(tags)
+        stmt = stmt.where(DeviceAlert.device_id.in_(tag_device_ids))
+        count_stmt = count_stmt.where(DeviceAlert.device_id.in_(tag_device_ids))
 
     stmt = stmt.order_by(DeviceAlert.created_at.desc())
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)

@@ -109,6 +109,7 @@ class ApiClient {
     String? status,
     String? keyword,
     String? group,
+    List<String>? tags,
     bool hasAlert = false,
     bool withAlertCount = false,
   }) async {
@@ -116,12 +117,14 @@ class ApiClient {
       'GET',
       '/api/devices',
       token: token,
-      query: <String, String>{
+      query: <String, dynamic>{
         'page': '$page',
         'pageSize': '$pageSize',
         if (status != null && status.isNotEmpty) 'status': status,
         if (keyword != null && keyword.isNotEmpty) 'keyword': keyword,
         if (group != null && group.isNotEmpty) 'group': group,
+        // v1.35.0：重复参数 tag=a&tag=b，服务端按「或」匹配
+        if (tags != null && tags.isNotEmpty) 'tag': tags,
         if (hasAlert) 'hasAlert': 'true',
         if (withAlertCount) 'withAlertCount': 'true',
       },
@@ -168,6 +171,12 @@ class ApiClient {
   Future<List<DeviceGroup>> fetchGroups({required String token}) async {
     final data = await _send('GET', '/api/devices/groups', token: token);
     return _mapList(data, DeviceGroup.fromJson);
+  }
+
+  /// v1.35.0 标签列表（含每个标签下的设备数），用于看板与告警中心的标签筛选。
+  Future<List<DeviceTagStat>> fetchDeviceTags({required String token}) async {
+    final data = await _send('GET', '/api/devices/tags', token: token);
+    return _mapList(data, DeviceTagStat.fromJson);
   }
 
   /// 每设备最新一条上报。
@@ -247,17 +256,20 @@ class ApiClient {
     String? deviceId,
     String? level,
     String? status,
+    List<String>? tags,
   }) async {
     final data = await _send(
       'GET',
       '/api/alerts',
       token: token,
-      query: <String, String>{
+      query: <String, dynamic>{
         'page': '$page',
         'pageSize': '$pageSize',
         if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
         if (level != null && level.isNotEmpty) 'level': level,
         if (status != null && status.isNotEmpty) 'status': status,
+        // v1.35.0：重复参数 tag=a&tag=b，与页面筛选组合生效
+        if (tags != null && tags.isNotEmpty) 'tag': tags,
       },
     );
     if (data is! Map<String, dynamic>) {
@@ -361,7 +373,8 @@ class ApiClient {
     String path, {
     String? token,
     Map<String, dynamic>? body,
-    Map<String, String>? query,
+    // 值可为 String 或 List<String>；Uri.replace 会把列表展开为重复查询参数
+    Map<String, dynamic>? query,
     bool allowRefresh = true,
   }) async {
     final uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);

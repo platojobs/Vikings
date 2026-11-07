@@ -39,6 +39,8 @@ ACTION_USER_UPDATE = "user.update"
 ACTION_USER_DELETE = "user.delete"
 ACTION_DEVICE_CREATE = "device.create"
 ACTION_DEVICE_UPDATE = "device.update"
+# v1.35.0：批量打标签/移除标签（只记标签名与逐设备结果，设备标签本身不含敏感信息）
+ACTION_DEVICE_TAGS = "device.tags_update"
 ACTION_DEVICE_DELETE = "device.delete"
 ACTION_DEVICE_BULK = "device.bulk_create"
 ACTION_DEVICE_CREDENTIAL = "device.credential_issue"

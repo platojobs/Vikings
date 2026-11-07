@@ -18,7 +18,8 @@ const API_BASE = (
   (import.meta.env.PROD ? '' : 'http://127.0.0.1:8000')
 ).replace(/\/+$/, '')
 
-type QueryValue = string | number | boolean | null | undefined
+// 数组按重复参数序列化（tag=a&tag=b），与后端 Optional[List[str]] 对齐
+type QueryValue = string | number | boolean | null | undefined | Array<string | number>
 
 export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
@@ -51,6 +52,13 @@ export function buildApiUrl(path: string, params?: Record<string, QueryValue>): 
   if (params) {
     for (const [key, value] of Object.entries(params)) {
       if (value === undefined || value === null || value === '') continue
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (item === undefined || item === null || item === '') continue
+          url.searchParams.append(key, String(item))
+        }
+        continue
+      }
       url.searchParams.set(key, String(value))
     }
   }

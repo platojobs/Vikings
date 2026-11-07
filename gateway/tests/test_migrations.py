@@ -19,7 +19,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0009_alert_rules"
+HEAD = "0010_device_tags"
 # v1.34.0 规则表与命中规则快照列
 ALERT_RULE_INDEXES = {"idx_alert_rule_metric", "idx_alert_rule_scope"}
 MATCHED_RULE_COLUMN = {"matched_rule"}
@@ -242,10 +242,11 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    # 从 0009 连降四步（0009 → 0008 → 0007 → 0006 → 0005）验证往返
-    down = _run_alembic(db_path, "downgrade", "-4")
+    # 从 0010 连降五步（0010 → 0009 → 0008 → 0007 → 0006 → 0005）验证往返
+    down = _run_alembic(db_path, "downgrade", "-5")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
+    assert "device_tag" not in _table_names(db_path), "downgrade 必须移除设备标签表"
     assert "alert_rule" not in _table_names(db_path), "downgrade 必须移除告警规则表"
     assert not (MATCHED_RULE_COLUMN & _alert_columns(db_path)), "downgrade 必须移除 matched_rule 列"
     assert "notification_config" not in _table_names(db_path), (
@@ -273,6 +274,7 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     assert "notification_config" in _table_names(db_path)
     assert "notification_rule" in _table_names(db_path)
     assert "alert_rule" in _table_names(db_path)
+    assert "device_tag" in _table_names(db_path)
     with sqlite3.connect(db_path) as con:
         assert con.execute("select count(*) from alert_rule").fetchone()[0] == 10, (
             "downgrade 再 upgrade 应重新补齐默认规则"

@@ -119,6 +119,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   String _groupFilter = '';
   List<DeviceGroup> _groups = const <DeviceGroup>[];
 
+  /// v1.35.0 标签筛选：空字符串表示全部标签；与关键词/状态/分组组合生效。
+  String _tagFilter = '';
+  List<DeviceTagStat> _tags = const <DeviceTagStat>[];
+
   /// 服务端分页状态：只加载当前页，滚动到底追加下一页，不再受首屏 100 台上限约束。
   final ScrollController _scrollController = ScrollController();
   final GlobalKey _deviceFooterKey = GlobalKey();
@@ -679,6 +683,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         status: _requestStatus,
         keyword: _keyword,
         group: _groupFilter.isEmpty ? null : _groupFilter,
+        tags: _tagFilter.isEmpty ? null : <String>[_tagFilter],
         hasAlert: _statusFilter == _BoardStatusFilter.alert,
         withAlertCount: true,
       );
@@ -697,6 +702,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         ),
         client.fetchStatsOverview(token: session.token),
         client.fetchGroups(token: session.token),
+        client.fetchDeviceTags(token: session.token),
       ]);
       if (!mounted || requestId != _requestSeq) {
         return;
@@ -713,6 +719,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         _alertTotal = alertPage.total;
         _stats = results[2] as StatsOverview;
         _groups = results[3] as List<DeviceGroup>;
+        _tags = results[4] as List<DeviceTagStat>;
         // REST 快照比本地实时状态更新，清空后再由新事件补齐
         _liveStatus.clear();
         _error = null;
@@ -752,6 +759,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         status: _requestStatus,
         keyword: _keyword,
         group: _groupFilter.isEmpty ? null : _groupFilter,
+        tags: _tagFilter.isEmpty ? null : <String>[_tagFilter],
         hasAlert: _statusFilter == _BoardStatusFilter.alert,
         withAlertCount: true,
       );
@@ -1117,6 +1125,15 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     unawaited(_loadData(silent: true));
   }
 
+  /// v1.35.0 切换标签：与关键词/状态/分组组合生效，并重置到第 1 页。
+  void _onTagChanged(String tag) {
+    if (_tagFilter == tag) {
+      return;
+    }
+    setState(() => _tagFilter = tag);
+    unawaited(_loadData(silent: true));
+  }
+
   /// 空分组名统一显示为「未分组」，与网关的分组概览口径一致。
   String _deviceGroupName(DeviceSummary device) {
     final name = device.groupName.trim();
@@ -1151,7 +1168,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   bool get _filterActive =>
       _keyword.isNotEmpty ||
       _statusFilter != _BoardStatusFilter.all ||
-      _groupFilter.isNotEmpty;
+      _groupFilter.isNotEmpty ||
+      _tagFilter.isNotEmpty;
 
   SensorReading? _readingFor(String deviceId) {
     for (final reading in _readings) {
@@ -1535,6 +1553,36 @@ class _MobileBoardPageState extends State<MobileBoardPage>
             ],
           ),
         ),
+        if (_tags.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(right: 8, top: 8),
+                  child: Text(
+                    '标签：',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ),
+                ChoiceChip(
+                  label: const Text('全部标签'),
+                  selected: _tagFilter.isEmpty,
+                  onSelected: (_) => _onTagChanged(''),
+                ),
+                for (final tag in _tags) ...[
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: Text('${tag.tag}（${tag.deviceCount}）'),
+                    selected: _tagFilter == tag.tag,
+                    onSelected: (_) => _onTagChanged(tag.tag),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -1569,6 +1617,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           Text(
             '当前筛选：${_statusFilter.label}'
             '${_groupFilter.isEmpty ? '' : ' · 分组「$_groupFilter」'}'
+            '${_tagFilter.isEmpty ? '' : ' · 标签「$_tagFilter」'}'
             '${_keyword.isEmpty ? '' : ' · 关键词「$_keyword」'}；'
             '可清空关键词或切回「全部」。上方汇总卡仍为全部 ${_stats.deviceTotal} 台设备。',
             style: const TextStyle(fontSize: 12, color: Colors.black54),

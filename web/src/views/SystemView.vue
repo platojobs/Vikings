@@ -32,6 +32,7 @@ import {
 import {
   createAlertRule,
   deleteAlertRule,
+  fetchAlertRuleHistory,
   fetchAlertRules,
   restoreDefaultAlertRules,
   setAlertRuleEnabled,
@@ -42,6 +43,7 @@ import type {
   AlertMetric,
   AlertRule,
   AlertRuleCreateBody,
+  AlertRuleHistoryEntry,
   AlertRuleScope,
   NotificationConfig,
   NotificationConfigPatch,
@@ -460,7 +462,7 @@ const alertRuleForm = reactive({
   threshold: 3.4,
   level: 'warning' as 'warning' | 'critical',
   scope_type: 'global' as AlertRuleScope,
-  scope_value: '',
+  scope_values: [] as string[],
   enabled: true,
   consecutive_count: 1,
   priority: 100,
@@ -483,10 +485,24 @@ function ruleConditionText(rule: AlertRule): string {
   return `${opLabel(rule.op)} ${rule.threshold}${meta.unit}`
 }
 
+function ruleScopeValues(rule: AlertRule): string[] {
+  if (rule.scope_values?.length) return rule.scope_values
+  return rule.scope_value ? [rule.scope_value] : []
+}
+
 function scopeText(rule: AlertRule): string {
-  if (rule.scope_type === 'group') return `分组：${rule.scope_value}`
-  if (rule.scope_type === 'device') return `设备：${rule.scope_value}`
-  return '全局'
+  if (rule.scope_type === 'global') return '全局'
+  const values = ruleScopeValues(rule)
+  const label =
+    rule.scope_type === 'group' ? '分组' : rule.scope_type === 'device' ? '设备' : '标签'
+  return `${label}：${values.length ? values.join('、') : '（未配置）'}`
+}
+
+/** 范围多值之间为「或」；规则之间仍是「或」，同指标命中取最高级别 */
+function scopePlaceholder(): string {
+  if (alertRuleForm.scope_type === 'group') return '输入分组名后回车，可填多个'
+  if (alertRuleForm.scope_type === 'device') return '输入设备 ID 后回车，可填多个'
+  return '输入标签后回车，可填多个'
 }
 
 /** 换指标时同步比较方向与阈值范围，避免把电压阈值带到湿度规则上 */
@@ -515,7 +531,7 @@ function openCreateAlertRule(): void {
   alertRuleForm.threshold = 3.4
   alertRuleForm.level = 'warning'
   alertRuleForm.scope_type = 'global'
-  alertRuleForm.scope_value = ''
+  alertRuleForm.scope_values = []
   alertRuleForm.enabled = true
   alertRuleForm.consecutive_count = 1
   alertRuleForm.priority = 100
@@ -530,7 +546,7 @@ function openEditAlertRule(rule: AlertRule): void {
   alertRuleForm.threshold = rule.threshold
   alertRuleForm.level = rule.level
   alertRuleForm.scope_type = rule.scope_type
-  alertRuleForm.scope_value = rule.scope_value ?? ''
+  alertRuleForm.scope_values = ruleScopeValues(rule)
   alertRuleForm.enabled = rule.enabled
   alertRuleForm.consecutive_count = rule.consecutive_count
   alertRuleForm.priority = rule.priority
@@ -542,11 +558,15 @@ async function saveAlertRule(): Promise<void> {
     ElMessage.warning('请填写规则名称')
     return
   }
-  if (alertRuleForm.scope_type !== 'global' && !alertRuleForm.scope_value.trim()) {
-    ElMessage.warning('选择「指定分组 / 指定设备」时必须填写具体名称或设备 ID')
+  const scopeValues = Array.from(
+    new Set(alertRuleForm.scope_values.map((value) => value.trim()).filter(Boolean)),
+  )
+  if (alertRuleForm.scope_type !== 'global' && scopeValues.length === 0) {
+    ElMessage.warning('选择「指定分组 / 指定设备 / 指定标签」时必须至少填写一个值')
     return
   }
 
+  // scope_values 是权威输入；scope_value 只镜像首值，供旧客户端与 downgrade 读取
   const payload: AlertRuleCreateBody = {
     name: alertRuleForm.name.trim(),
     metric: alertRuleForm.metric,
@@ -554,7 +574,8 @@ async function saveAlertRule(): Promise<void> {
     threshold: alertRuleForm.threshold,
     level: alertRuleForm.level,
     scope_type: alertRuleForm.scope_type,
-    scope_value: alertRuleForm.scope_type === 'global' ? null : alertRuleForm.scope_value.trim(),
+    scope_value: alertRuleForm.scope_type === 'global' ? null : scopeValues[0],
+    scope_values: alertRuleForm.scope_type === 'global' ? null : scopeValues,
     enabled: alertRuleForm.enabled,
     consecutive_count: alertRuleForm.consecutive_count,
     priority: alertRuleForm.priority,
@@ -634,6 +655,66 @@ async function restoreAlertRules(): Promise<void> {
   } catch {
     // 请求层已提示
   }
+}
+
+// ==================== 规则变更历史（v1.35.0） ====================
+
+/** 历史直接读既有 audit_log（target_type=alert_rule），不另建平行记录 */
+const historyVisible = ref(false)
+const historyLoading = ref(false)
+const historyRule = ref<AlertRule | null>(null)
+const historyEntries = ref<AlertRuleHistoryEntry[]>([])
+
+async function openAlertRuleHistory(rule: AlertRule): Promise<void> {
+  historyRule.value = rule
+  historyEntries.value = []
+  historyVisible.value = true
+  historyLoading.value = true
+  try {
+    historyEntries.value = await fetchAlertRuleHistory(rule.id)
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+const CHANGE_FIELD_LABELS: Record<string, string> = {
+  name: '名称',
+  metric: '指标',
+  op: '比较方向',
+  threshold: '阈值',
+  level: '级别',
+  enabled: '启用状态',
+  consecutive_count: '连续次数',
+  priority: '优先级',
+  scope_type: '范围类型',
+  scope_value: '范围值',
+  scope_values: '范围值',
+  deleted: '删除快照',
+  restored_from: '恢复前阈值',
+  restored_to: '恢复后阈值',
+}
+
+/** 数值统一转文本；数组用顿号拼接，布尔按启用/停用展示 */
+function formatChangeValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '空'
+  if (Array.isArray(value)) return value.length ? value.join('、') : '空'
+  if (typeof value === 'boolean') return value ? '启用' : '停用'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
+function changeRows(entry: AlertRuleHistoryEntry): Array<{
+  field: string
+  from: string
+  to: string
+}> {
+  return Object.entries(entry.changes ?? {}).map(([field, change]) => ({
+    field: CHANGE_FIELD_LABELS[field] ?? field,
+    from: formatChangeValue(change?.from),
+    to: formatChangeValue(change?.to),
+  }))
 }
 
 onMounted(() => {
@@ -843,8 +924,9 @@ onBeforeUnmount(() => {
         <div>
           <span class="section-title">告警规则</span>
           <span class="section-desc">
-            按「指标 + 比较方向 + 阈值 + 级别 + 生效范围」判定；同一指标多条命中取最高级别
-            （critical 优先），同级按优先级数字小的优先，每指标只产一条告警；保存后下一次上报即时生效
+            按「指标 + 比较方向 + 阈值 + 级别 + 生效范围」判定；范围可填多个分组/设备/标签，
+            同一条规则内多个值之间为「或」；同一指标多条命中取最高级别（critical 优先），
+            同级按优先级数字小的优先，每指标只产一条告警；保存后下一次上报即时生效
           </span>
         </div>
         <div class="head-actions">
@@ -902,12 +984,13 @@ onBeforeUnmount(() => {
             {{ row.updated_by }} · {{ row.updated_at ? formatDateTime(row.updated_at) : '—' }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
             <el-button link size="small" @click="openEditAlertRule(row)">编辑</el-button>
             <el-button link size="small" @click="toggleAlertRule(row)">
               {{ row.enabled ? '停用' : '启用' }}
             </el-button>
+            <el-button link size="small" @click="openAlertRuleHistory(row)">历史</el-button>
             <el-button link size="small" type="danger" @click="removeAlertRule(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -1114,6 +1197,48 @@ onBeforeUnmount(() => {
       </el-table>
     </el-card>
 
+    <!-- v1.35.0 规则变更历史：数据直接来自审计日志，展示字段前后值 -->
+    <el-drawer
+      v-model="historyVisible"
+      :title="historyRule ? `变更历史 · ${historyRule.name}` : '变更历史'"
+      size="640px"
+      destroy-on-close
+    >
+      <div v-loading="historyLoading" class="rule-history-body" data-test="rule-history">
+        <el-empty
+          v-if="!historyLoading && historyEntries.length === 0"
+          description="暂无变更记录；规则创建、编辑、启停与删除都会写入审计"
+          :image-size="70"
+        />
+        <el-timeline v-else>
+          <el-timeline-item
+            v-for="entry in historyEntries"
+            :key="entry.id"
+            :timestamp="formatDateTime(entry.created_at)"
+            placement="top"
+          >
+            <el-card shadow="never" class="history-card">
+              <div class="history-head">
+                <el-tag size="small" type="info">{{ entry.action }}</el-tag>
+                <span class="history-operator">{{ entry.operator }}</span>
+              </div>
+              <div v-if="changeRows(entry).length" class="history-changes">
+                <div v-for="change in changeRows(entry)" :key="change.field" class="history-change">
+                  <span class="history-field">{{ change.field }}</span>
+                  <span class="history-from">{{ change.from }}</span>
+                  <span class="history-arrow">→</span>
+                  <span class="history-to">{{ change.to }}</span>
+                </div>
+              </div>
+              <div v-else class="history-hint">
+                该操作无字段级前后值（如恢复默认阈值的汇总记录）
+              </div>
+            </el-card>
+          </el-timeline-item>
+        </el-timeline>
+      </div>
+    </el-drawer>
+
     <el-dialog
       v-model="ruleEditorVisible"
       :title="editingAlertRuleId === null ? '新增告警规则' : '编辑告警规则'"
@@ -1162,21 +1287,28 @@ onBeforeUnmount(() => {
             <el-radio-button value="global">全局</el-radio-button>
             <el-radio-button value="group">指定分组</el-radio-button>
             <el-radio-button value="device">指定设备</el-radio-button>
+            <el-radio-button value="tag">指定标签</el-radio-button>
           </el-radio-group>
         </el-form-item>
         <el-form-item
           v-if="alertRuleForm.scope_type !== 'global'"
-          :label="alertRuleForm.scope_type === 'group' ? '分组名称' : '设备 ID'"
+          label="范围值"
           required
         >
-          <el-input
-            v-model="alertRuleForm.scope_value"
-            :placeholder="
-              alertRuleForm.scope_type === 'group'
-                ? '与设备分组完全一致，如：华东'
-                : '设备 ID，如：VG-100-001'
-            "
+          <el-select
+            v-model="alertRuleForm.scope_values"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="false"
+            :placeholder="scopePlaceholder()"
+            style="width: 100%"
+            data-test="rule-scope-values"
           />
+          <span class="form-hint">
+            可填多个值；同一规则内多个值之间为「或」（命中任一即适用）
+          </span>
         </el-form-item>
         <el-form-item label="连续次数">
           <el-input-number v-model="alertRuleForm.consecutive_count" :min="1" :max="20" />
@@ -1278,6 +1410,64 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.rule-history-body {
+  min-height: 240px;
+}
+
+.history-card {
+  border: 1px solid #e2e8f0;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.history-operator {
+  font-size: 13px;
+  color: #475569;
+}
+
+.history-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-change {
+  font-size: 12px;
+  color: #475569;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.history-field {
+  min-width: 70px;
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.history-from {
+  color: #94a3b8;
+}
+
+.history-arrow {
+  color: #94a3b8;
+}
+
+.history-to {
+  color: #0f172a;
+}
+
+.history-hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
 .section-head {
   display: flex;
   align-items: center;

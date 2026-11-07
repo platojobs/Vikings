@@ -5,7 +5,7 @@ OTA 链路支撑两张表：device_command / ota_task
 """
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     JSON,
@@ -80,6 +80,30 @@ class Device(Base):
         if not self.mqtt_credential_fingerprint:
             return None
         return self.mqtt_credential_fingerprint[:8]
+
+
+class DeviceTag(Base):
+    """设备标签关联表（v1.35.0）：一台设备多个标签，一标签多设备。
+
+    选择关联表而非 JSON 数组列：SQLite（测试）与 PostgreSQL（生产）行为一致，
+    `(device_id, tag)` 复合主键强制唯一，`tag` 索引支持按标签筛选与标签计数；
+    JSON 数组在 SQLite 上无法建索引，成员查询只能全表扫描且无法用主键约束重复。
+    """
+
+    __tablename__ = "device_tag"
+    __table_args__ = (
+        # 按标签反查设备（列表/告警/导出筛选的主路径）
+        Index("idx_device_tag_tag", "tag", "device_id"),
+    )
+
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tag: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_by: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="system", server_default="system"
+    )
 
 
 class SensorRecord(Base):
@@ -233,9 +257,12 @@ class AlertRule(Base):
     threshold: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     # 仅 warning / critical（沿用 v1.21.0 收窄后的级别口径）
     level: Mapped[str] = mapped_column(String(16), nullable=False)
-    # global / group / device
+    # global / group / device / tag（v1.35.0 增加 tag）
     scope_type: Mapped[str] = mapped_column(String(16), nullable=False, default="global")
+    # v1.34.0 单值范围：保留以兼容旧客户端与 downgrade；多值规则存首个值
     scope_value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # v1.35.0 多值范围：global 为 None，其余为字符串数组（值之间为「或」）
+    scope_values: Mapped[Optional[List[str]]] = mapped_column(JSONPayload, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # 连续 N 次越限才触发（1 表示首次越限即触发，与 v1.33.0 行为一致）
     consecutive_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")

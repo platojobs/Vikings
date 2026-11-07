@@ -325,8 +325,10 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`group`、`hasAlert`、`withAlertCount`、`page`、`pageSize` |
+| GET | `/api/devices` | 列表，Query：`status`(online/offline)、`keyword`、`group`、`tag`（v1.35.0，可重复）、`hasAlert`、`withAlertCount`、`page`、`pageSize` |
 | GET | `/api/devices/groups` | 分组概览：每组 `total` / `online` / `offline` |
+| GET | `/api/devices/tags` | v1.35.0：标签列表与设备数 `[{tag, device_count}]`，登录可读 |
+| POST | `/api/devices/tags/batch` | v1.35.0：批量打/移除标签（仅 admin），入参 `{device_ids, add?, remove?}`，逐设备返回结果 |
 | POST | `/api/devices` | 手工注册设备，入参 `device_id`（3~64 位字母数字 _-）、`name`、`model`、`firmware_version`、`group_name`；重复 ID 返回 409 |
 | POST | `/api/devices/bulk` | 批量注册，单次最多 200 台，返回 `{created, skipped}`，重复 ID 跳过 |
 | POST | `/api/devices/{deviceId}/mqtt-credential` | 签发/轮换设备 MQTT 凭证：首次签发 operator+admin，轮换已有有效凭证仅 admin（v1.26.0 收紧） |
@@ -343,7 +345,7 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 `deviceIds` 为逗号分隔的设备 ID（单次最多 200 个，自动去重），只返回这些设备的最新值；
 传空串返回空数组，便于看板按已加载页分批取值，不再全量拉取。
 
-`/api/devices` 的 `status` / `keyword` / `group` / `page` / `pageSize` 同样为可选参数，
+`/api/devices` 的 `status` / `keyword` / `group` / `tag` / `page` / `pageSize` 同样为可选参数，
 不传时默认第一页 20 台、不加过滤。v1.11.0 新增两个可选参数，默认关闭、不影响既有调用方：
 
 | 参数 | 取值 | 说明 |
@@ -352,7 +354,8 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 | `withAlertCount` | `true` / `false`（默认） | 每个设备条目额外返回 `open_alert_count`（未处理告警数，无告警为 0）；不传时该字段为 `null`，既有字段语义不变 |
 
 设备条目（`DeviceOut`）字段：`device_id`、`name`、`model`、`firmware_version`、`group_name`、
-`status`、`last_report_at`、`last_online_at`、`open_alert_count`（可选，仅 `withAlertCount=true` 时填充）。
+`status`、`last_report_at`、`last_online_at`、`tags`（v1.35.0，字符串数组，无标签为 `[]`）、
+`open_alert_count`（可选，仅 `withAlertCount=true` 时填充）。
 v1.26.0 起额外返回凭证元数据：`mqtt_username`、`mqtt_credential_version`、
 `mqtt_credential_issued_at`、`mqtt_credential_rotated_at`、`mqtt_credential_revoked_at`、
 `mqtt_credential_status`（`missing` / `active` / `revoked`）、
@@ -361,6 +364,39 @@ v1.26.0 起额外返回凭证元数据：`mqtt_username`、`mqtt_credential_vers
 v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹配 `group_name` 为空串或字面「未分组」的设备；
 `GET /api/devices/groups` 也把空分组名与「未分组」合并为同一个 `未分组` 桶（`total` / `online` / `offline` 累加）。
 不传 `group` 时行为不变；普通组名筛选语义不变。
+
+**设备标签筛选（v1.35.0）**：`tag` 是可重复查询参数（`?tag=冷库&tag=关键`），多个标签之间为
+**「或」**：设备持有其中任意一个标签即命中。`tag` 与 `status` / `keyword` / `group` / `hasAlert`
+同时存在时为**「且」**组合（标签是设备集合过滤，其余条件继续叠加）。不传 `tag` 时生成与升级前
+完全相同的 SQL（有回归测试断言），列表总数与顺序均不变。
+
+**标签模型与约束（v1.35.0）**：设备标签用独立关联表 `device_tag`，不是把逗号塞进
+`device.group_name` 或设备表某字段：
+
+| 约束 | 值 | 说明 |
+| --- | --- | --- |
+| 存储结构 | `device_tag(device_id, tag, created_at, created_by)` | 复合主键 `(device_id, tag)` 在数据库层强制唯一；同一设备同一标签不会重复 |
+| 索引 | `(tag, device_id)` | 按标签筛选设备走索引；按设备取标签走主键前缀 |
+| 单标签长度 | 32 | 超出返回 400，文案指出具体标签 |
+| 单设备标签数 | 16 | 超出时该设备整台跳过并标记 `over_limit`，不会「加一半」 |
+| 单次请求设备数 | 200 | 与批量注册口径一致 |
+| 单次请求标签数 | 50 | 防止一次写爆 |
+| 字符集 | `A-Za-z0-9_-` 与中文 | 空、纯空白、超长、非法字符均返回 400 可读原因 |
+
+选择关联表而不是数组列的理由：SQLite（测试）与 PostgreSQL（生产）都能用同一套 SQL 与索引；
+数组列在 SQLite 只能存 JSON 文本、无法建普通索引，且重复标签无法在数据库层约束。
+关联表的代价是打标签需要多一次插入/删除，但设备量级与标签数量都有限，可接受。
+
+**批量打标签 `POST /api/devices/tags/batch`（仅 admin）**：
+
+- 入参：`{"device_ids": ["VG-...", ...], "add": ["冷库"], "remove": ["旧标签"]}`，
+  `add` / `remove` 至少一个非空；同一标签同时出现在两者时以 `remove` 后 `add` 的顺序执行为「净增」。
+- 逐设备返回 `status`：`updated`（有实际增删）、`unchanged`（标签已存在/本就没有可移除标签）、
+  `not_found`（设备不存在）、`over_limit`（执行后标签数会超过 16，整台跳过）。
+- 响应同时给出汇总数 `updated` / `unchanged` / `not_found` / `over_limit` / `added` / `removed`，
+  调用方必须逐类展示；**不会**因为个别失败而整体失败或静默返回 200 成功。
+- 写操作审计 `device.tags_update`，记录设备数与标签集合，不记录设备口令等敏感字段。
+- `GET /api/devices/tags` 登录即可读，返回每个标签下的设备数，按设备数倒序；用于 Web/移动端筛选。
 
 写操作权限：注册 / 批量注册 / 编辑 / **首次签发**设备凭证为 operator+admin；
 **轮换已有有效凭证**与**吊销凭证**仅 admin（会造成设备断线，v1.26.0 起收紧）；删除为 admin。
@@ -432,7 +468,7 @@ v1.14.0 起 `PATCH /api/devices/{deviceId}` 是 Web 后台改分组的唯一入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`sla`（v1.33.0：met/late/pending/overdue/unknown）、`start`/`end`（v1.30.0，`created_at` 闭区间）、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
+| GET | `/api/alerts` | 列表，Query：`deviceId`、`level`(warning/critical)、`status`(open/acked)、`sla`（v1.33.0：met/late/pending/overdue/unknown）、`tag`（v1.35.0，可重复，或语义）、`start`/`end`（v1.30.0，`created_at` 闭区间）、`page`(≥1)、`pageSize`(1~200)；`total` 为过滤后总数 |
 | POST | `/api/alerts/bulk-ack` | 批量确认（v1.15.0 新增，v1.21.0 支持备注），见 3.3.1 |
 | POST | `/api/alerts/{alertId}/ack` | 单条告警确认（v1.21.0 支持备注，v1.33.0 返回 SLA 状态），见 3.3.2 |
 | GET | `/api/alerts/summary` | 告警统计：`{open, critical_open, today, overdue_open}`（v1.33.0 增 `overdue_open`） |
@@ -567,9 +603,10 @@ Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正�
 
 `alert.handover` 的 `handover` 块：`{fromUser, to, operator, count, windowStart, windowEnd, note, message}`。
 
-### 3.4 告警规则（v1.34.0）与旧阈值接口兼容
+### 3.4 告警规则（v1.34.0 起；v1.35.0 扩展多值范围与标签）与旧阈值接口兼容
 
 规则 = 指标 + 比较方向 + 阈值 + 级别 + 生效范围 + 启用状态 + 连续次数 + 优先级。
+v1.35.0 起「生效范围」支持标签，且分组/设备/标签都可以填**多个值**。
 级别仍只有 `warning` / `critical`（沿用 v1.21.0 收窄口径）。
 
 | 方法 | 路径 | 权限 | 说明 |
@@ -579,6 +616,7 @@ Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正�
 | PUT | `/api/rules/{ruleId}` | admin | 修改规则；只传需要变更的字段 |
 | PATCH | `/api/rules/{ruleId}/enabled` | admin | 启停，入参 `{enabled: bool}`；审计 `alert_rule.enable/disable` |
 | DELETE | `/api/rules/{ruleId}` | admin | 删除规则（不可恢复；需保留判定依据时优先停用） |
+| GET | `/api/rules/{ruleId}/history` | 登录可读 | v1.35.0：变更历史（直接读 `audit_log`），Query `limit`(默认 50)，返回 `[{id, action, operator, created_at, fields, changes}]` |
 | POST | `/api/rules/restore-defaults` | admin | 默认规则阈值回滚到环境变量/出厂值，自定义规则不动 |
 | GET | `/api/rules/thresholds` | 登录可读 | **v1.33.0 兼容**：由默认规则推导的分组视图，每项 `{value, source}` |
 | PUT | `/api/rules/thresholds` | admin | **v1.33.0 兼容**：只传待改键；同步写 `rule_config` 与默认规则 |
@@ -592,13 +630,30 @@ Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正�
 | `op` | `lt` / `gt` | `lt`=低于阈值触发，`gt`=高于阈值触发；等于阈值**不**触发（与 v1.33.0 一致） |
 | `threshold` | number | 阈值；范围 voltage 2~4.5、temperature -40~85、humidity 0~100、rssi -150~0 |
 | `level` | `warning` / `critical` | 级别 |
-| `scope_type` | `global` / `group` / `device` | 生效范围 |
-| `scope_value` | string \| null | 分组名或设备 ID；`global` 时强制为 null，其余必填 |
+| `scope_type` | `global` / `group` / `device` / `tag` | 生效范围；v1.35.0 增 `tag` |
+| `scope_value` | string \| null | 兼容字段，保存范围**首个值**；`global` 时强制为 null，其余必填 |
+| `scope_values` | string[] \| null | v1.35.0 多值范围；`global` 为 null，其余至少 1 个、最多 50 个 |
 | `enabled` | bool | 停用后不参与判定，历史告警与统计不变 |
 | `consecutive_count` | int 1~20 | 连续 N 次上报越限才触发；1 = 首次越限即触发 |
 | `priority` | int 1~1000 | 同指标同级别多条命中时数字小者优先 |
 | `is_default` | bool | 是否 v1.33.0 默认阈值的种子规则 |
 | `updated_by` / `updated_at` | string / ISO8601 | 最近修改人与时间 |
+
+**范围匹配语义（v1.35.0，必须记住两组「或」）**
+
+1. **组内是「或」**：同一条规则内配置的多个分组/设备/标签之间为「或」。例如
+   `scope_type=tag, scope_values=["冷库","关键"]` 表示设备持有「冷库」**或**「关键」任一标签即适用；
+   不会要求同时持有两个标签。
+2. **组间也是「或」**：同一指标的多条规则分别命中时，最终取最高级别（见下方裁决口径）。
+3. **不同维度不混填**：一条规则的 `scope_values` 只能属于同一种 `scope_type`；
+   分组、设备、标签混选会返回 400。需要「分组 A **且** 标签 B」时，当前版本不提供交集规则，
+   请用更具体的分组名/设备 ID 或拆成多条规则，避免语义歧义。
+4. 选择组内「或」而不是「且」的理由：标签是并列管理维度（如「冷库」「关键」），
+   若按交集，多标签规则会趋近空集且界面无法解释「为什么没命中」；「或」与既有
+   `hasAlert`/多值筛选的用户预期一致，也便于用单台设备真实上报验证。
+5. 兼容：升级迁移 `0010_device_tags` 会把老规则的 `scope_value` 回填为
+   `scope_values=[scope_value]`；匹配时优先读数组、数组为空再回退单值。已有单值规则与
+   无标签设备的行为完全不变，downgrade 后 `scope_value` 仍是原值，可继续使用。
 
 **方向与级别校验**：`voltage`/`rssi` 只允许 `lt`，`humidity` 只允许 `gt`，`temperature` 两者皆可；
 同指标、同方向、同范围下 critical 必须比 warning 更严格（lt：critical < warning；gt：critical > warning），
@@ -617,20 +672,27 @@ Webhook 以 JSON POST 发送；SMTP 主题含「超时升级 第N/M次」，正�
 **运行时生效**：规则全量缓存在网关进程内，每次上报读缓存；管理端写入后 write-through
 重载缓存，无需重启。代价是单实例部署前提（多实例需各自刷新），MQTT 热路径不查库。
 
-**审计**：`alert_rule.create/update/enable/disable/delete/restore_defaults`；
-`detail` 只记录 `name`、`rule_id` 与**变更字段名**，不记录阈值等具体数值。
+**审计与变更历史（v1.35.0 起记录前后值）**：
+`alert_rule.create/update/enable/disable/delete/restore_defaults` 的 `detail` 保留
+`name`、`rule_id` 与 `changed_fields`，并新增 `changes: {字段: {from, to}}`，用于
+Web「规则变更历史」抽屉展示「何时、谁、改了哪些字段、前后值」。规则字段本身不含
+MQTT 口令/密钥，因此阈值、范围、级别、启用状态可以记录前后值；审计不写入任何设备凭证。
+历史接口 `GET /api/rules/{ruleId}/history` 直接过滤 `audit_log.target_type='alert_rule'`，
+不新建平行记录表。删除规则时 `changes.deleted.from` 保存删除前快照、`to=null`，
+便于事后解释「这条规则原本限制什么」。
 
 **向后兼容**：升级时把 v1.33.0 的 10 个硬编码阈值（`rule_config` 在线覆盖优先，否则环境变量默认）
 写成 `is_default=true` 的默认规则，范围 global、连续次数 1；因此同一份数据升级前后告警结果一致
 （证据见 `gateway/tests/test_alert_rules.py::test_upgrade_behavior_matches_v133_samples` 与
 `scripts/verify_alert_rules_v134.py`）。旧 `/api/rules/thresholds` 保存时同步写默认规则，
-重启后不回退。
+重启后不回退。v1.35.0 的迁移 `0010_device_tags` 只新增 `device_tag` 表与
+`alert_rule.scope_values` 列，并回填 `[scope_value]`；不改变任何既有规则的阈值与裁决结果。
 
 ### 3.5 审计日志
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） / `notify.rule_create` / `notify.rule_update` / `notify.rule_delete`（v1.31.0） / `alert_rule.create/update/enable/disable/delete/restore_defaults`（v1.34.0） |
+| GET | `/api/audit-logs` | 分页查询，Query：`operator`、`action`、`page`、`pageSize`；动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` / `threshold.update` / `notify.config_update`（v1.29.0） / `notify.rule_create` / `notify.rule_update` / `notify.rule_delete`（v1.31.0） / `alert_rule.create/update/enable/disable/delete/restore_defaults`（v1.34.0） / `device.tags_update`（v1.35.0） |
 
 ### 3.6 告警通知通道（v1.29.0）
 
@@ -939,11 +1001,12 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 用途 | 接口 | 参数 / 说明 |
 | --- | --- | --- |
 | 登录 | `POST /api/auth/login` | `{username, password}` → `data: {token, refresh_token, token_type, expires_in, user}` |
-| 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `group` / `hasAlert` / `withAlertCount=true` |
+| 设备列表 | `GET /api/devices` | `page` / `pageSize=20` / `status` / `keyword` / `group` / `tag`（v1.35.0，可重复） / `hasAlert` / `withAlertCount=true` |
 | 分组概览 | `GET /api/devices/groups` | 分组 chips 数据源；空分组与「未分组」合并 |
+| 标签列表 | `GET /api/devices/tags` | v1.35.0 标签 chips 数据源，含 `device_count` |
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
 | 单设备历史上报 | `GET /api/devices/{id}/records` | 详情页分页：`limit=11&offset=<已取条数>`，多取 1 条用于判断是否还有更早数据，展示 10 条/页（v1.13.0） |
-| 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数 |
+| 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数；v1.35.0 起可叠加 `tag`（可重复，或语义） |
 | 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
 | 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
 
@@ -1007,6 +1070,7 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | 设备首屏 | `GET /api/devices?page=1&pageSize=20&withAlertCount=true`，按 `page * pageSize < total` 判断是否还有下一页 |
 | 滚动加载 | 设备区页脚进入视口即请求下一页并原样追加；加载中展示「加载中…」，`已加载条数 == total` 时展示「没有更多了」 |
 | 搜索/状态筛选 | `keyword` / `status` 作为请求参数下发，300ms 防抖后重置 `page=1`，避免把旧页拼进新筛选 |
+| 标签筛选 | v1.35.0：`tag` 与 `keyword` / `status` / `group` / `hasAlert` 同时下发（「且」组合），切换标签立即重置 `page=1`；不选标签时不带该参数，行为与升级前一致 |
 | 有告警筛选 | `hasAlert=true`（数据库层聚合 `status='open'`）+ `withAlertCount=true`；卡片角标显示 `open_alert_count`，与筛选结果同源，不再依赖告警列表前 50 条 |
 | 告警分页 | `GET /api/alerts?status=open&page=N&pageSize=20`；标题「未处理告警（N）」使用服务端 `total`，列表按页追加 |
 | 汇总卡 | `GET /api/stats/overview` 的 `device_total` / `device_online` / `alert_open`，与分页口径解耦，不会因只看第 1 页而失真 |
@@ -1081,12 +1145,14 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 
 | 方法 | 路径 | Query |
 | --- | --- | --- |
-| GET | `/api/exports/records` | `deviceId`、`group`、`start`、`end` |
-| GET | `/api/exports/alerts` | `deviceId`、`group`、`level`(warning/critical)、`status`(open/acked)、`start`、`end` |
+| GET | `/api/exports/records` | `deviceId`、`group`、`tag`（v1.35.0，可重复，或语义）、`start`、`end` |
+| GET | `/api/exports/alerts` | `deviceId`、`group`、`tag`（v1.35.0，可重复，或语义）、`level`(warning/critical)、`status`(open/acked)、`start`、`end` |
 
 - `start` / `end` 为闭区间，接受 ISO8601 或毫秒时间戳；结束早于开始返回 400。
 - 告警级别沿用 v1.21.0 收窄后的 `warning|critical`，传其他值由 FastAPI 返回 422。
 - `group` 精确匹配 `Device.group_name`；设备不存在或未分组时该行不会因分组筛选被返回。
+- `tag` 可重复（`?tag=冷库&tag=关键`），多个标签为「或」：设备持有任一标签即导出该设备的记录/告警；
+  与 `deviceId` / `group` / `level` / `status` / 时间范围同时存在时为「且」。不传 `tag` 时导出范围与升级前一致。
 - 未传时间范围时导出全部可用数据，文件名用 `all` 标记（不会伪造一个看起来像区间的范围）。
 
 **流式与上限**

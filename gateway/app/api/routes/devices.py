@@ -18,6 +18,9 @@ from app.schemas import (
     DeviceDetailOut,
     DeviceGroupOut,
     DeviceOut,
+    DeviceTagBatchRequest,
+    DeviceTagBatchResult,
+    DeviceTagOut,
     DeviceUpdateRequest,
     MqttCredentialOut,
     MqttCredentialRevokeOut,
@@ -32,6 +35,7 @@ from app.services import (
     command_service,
     device_service,
     mqtt_credential_service,
+    tag_service,
 )
 
 router = APIRouter(prefix="/api", tags=["devices"])
@@ -42,6 +46,9 @@ async def list_devices(
     status: Optional[str] = Query(default=None, pattern="^(online|offline)$"),
     keyword: Optional[str] = Query(default=None, max_length=64),
     group: Optional[str] = Query(default=None, max_length=64),
+    tag: Optional[list[str]] = Query(
+        default=None, max_length=32, description="设备标签，可重复；多个标签为「或」（v1.35.0）"
+    ),
     hasAlert: bool = Query(default=False, description="仅返回存在未处理告警的设备"),
     withAlertCount: bool = Query(default=False, description="返回每设备未处理告警数"),
     page: int = Query(default=1, ge=1),
@@ -55,16 +62,18 @@ async def list_devices(
     告警计数在数据库层按设备聚合，不受 `/api/alerts` 的 pageSize 截断影响。
     """
     items, total = await device_service.list_devices(
-        session, status, keyword, page, pageSize, group, has_alert=hasAlert
+        session, status, keyword, page, pageSize, group, has_alert=hasAlert, tags=tag
     )
     counts = {}
     if withAlertCount:
         counts = await alert_service.open_alert_counts_by_device(
             session, [item.device_id for item in items]
         )
+    tag_map = await tag_service.tags_for_devices(session, [item.device_id for item in items])
     out_items = []
     for item in items:
         out = DeviceOut.model_validate(item)
+        out.tags = tag_map.get(item.device_id, [])
         if withAlertCount:
             out.open_alert_count = counts.get(item.device_id, 0)
         out_items.append(out)
@@ -86,6 +95,54 @@ async def list_device_groups(
     """分组概览：默认分组也会统计，前端用于下拉筛选与数量提示。"""
     groups = await device_service.list_groups(session)
     return ApiResponse(data=[DeviceGroupOut(**item) for item in groups])
+
+
+@router.get("/devices/tags", response_model=ApiResponse[list[DeviceTagOut]])
+async def list_device_tags(
+    session: AsyncSession = Depends(get_session),
+    _: dict = Depends(require_user),
+):
+    """标签列表（含每个标签下的设备数），供设备/告警筛选与规则范围下拉使用。"""
+    return ApiResponse(data=[DeviceTagOut(**item) for item in await tag_service.list_tags(session)])
+
+
+@router.post("/devices/tags/batch", response_model=ApiResponse[DeviceTagBatchResult])
+async def batch_update_device_tags(
+    body: DeviceTagBatchRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_ADMIN)),
+):
+    """批量打标签 / 移除标签（仅 admin）。
+
+    权限取舍：标签直接决定告警规则命中范围与导出范围，属于跨团队口径变更，
+    因此写操作只给 admin；operator / viewer 只读。
+    逐设备返回真实状态（not_found / over_limit / unchanged / updated），不静默成功。
+    """
+    try:
+        result = await tag_service.batch_update(
+            session, body.device_ids, body.add, body.remove, user.get("sub", "system")
+        )
+    except tag_service.TagValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await audit_service.log(
+        session,
+        operator=user.get("sub", "system"),
+        action=audit_service.ACTION_DEVICE_TAGS,
+        target_type="device_tag",
+        target_id="batch",
+        detail={
+            "deviceCount": len(body.device_ids),
+            "addedTags": sorted(set(body.add)),
+            "removedTags": sorted(set(body.remove)),
+            "updated": result["updated"],
+            "unchanged": result["unchanged"],
+            "notFound": result["not_found"],
+            "overLimit": result["over_limit"],
+        },
+    )
+    await session.commit()
+    return ApiResponse(data=DeviceTagBatchResult(**result))
 
 
 @router.post("/devices", response_model=ApiResponse[DeviceOut])
@@ -338,6 +395,7 @@ async def device_detail(
 
     latest = await device_service.latest_record(session, device_id)
     detail = DeviceDetailOut.model_validate(device)
+    detail.tags = await tag_service.device_tags(session, device_id)
     detail.latest = SensorRecordOut.model_validate(latest) if latest else None
     return ApiResponse(data=detail)
 

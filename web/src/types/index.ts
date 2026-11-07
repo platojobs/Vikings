@@ -104,6 +104,8 @@ export interface Device {
   mqtt_credential_revoked_at?: string | null
   mqtt_credential_status?: MqttCredentialStatus
   mqtt_credential_fingerprint_prefix?: string | null
+  /** v1.35.0 设备标签（多值，按字母序）；不是逗号拼接的字符串 */
+  tags?: string[]
 }
 
 /** 签发/轮换结果：password 只出现这一次 */
@@ -151,6 +153,8 @@ export interface DeviceListQuery {
   status?: DeviceStatus
   keyword?: string
   group?: string
+  /** v1.35.0：设备标签，多个标签为「或」 */
+  tag?: string[]
   page?: number
   pageSize?: number
 }
@@ -294,6 +298,8 @@ export interface AlertListQuery {
   status?: 'open' | 'acked'
   /** v1.33.0：SLA 状态筛选（已超时 = overdue） */
   sla?: SlaState
+  /** v1.35.0：设备标签，多个标签为「或」 */
+  tag?: string[]
   /** 创建时间下限/上限（毫秒时间戳），v1.30.0 与导出口径一致 */
   start?: number
   end?: number
@@ -313,7 +319,8 @@ export interface AlertSummary {
 // ==================== 告警规则（v1.34.0） ====================
 
 export type AlertMetric = 'voltage' | 'temperature' | 'humidity' | 'rssi'
-export type AlertRuleScope = 'global' | 'group' | 'device'
+/** v1.35.0：tag = 指定标签；规则内多个值之间为「或」 */
+export type AlertRuleScope = 'global' | 'group' | 'device' | 'tag'
 
 /** GET /api/rules 列表项；阈值单位为指标本身单位（V / ℃ / % / dBm） */
 export interface AlertRule {
@@ -324,7 +331,10 @@ export interface AlertRule {
   threshold: number
   level: AlertLevel
   scope_type: AlertRuleScope
+  /** v1.34.0 单值字段：兼容旧客户端，多值规则存首个值 */
   scope_value: string | null
+  /** v1.35.0 多值范围；值之间为「或」；global 规则为 null */
+  scope_values?: string[] | null
   enabled: boolean
   consecutive_count: number
   priority: number
@@ -342,6 +352,8 @@ export interface AlertRuleCreateBody {
   level: AlertLevel
   scope_type: AlertRuleScope
   scope_value?: string | null
+  /** v1.35.0：多值范围，传数组时以数组为准 */
+  scope_values?: string[] | null
   enabled?: boolean
   consecutive_count?: number
   priority?: number
@@ -349,6 +361,46 @@ export interface AlertRuleCreateBody {
 
 /** PUT /api/rules/{id} 入参：只传需要修改的字段 */
 export type AlertRuleUpdateBody = Partial<AlertRuleCreateBody>
+
+/** 规则变更历史（GET /api/rules/{id}/history，数据直接来自审计） */
+export interface AlertRuleHistoryEntry {
+  id: number
+  action: string
+  operator: string
+  created_at: string
+  fields: string[]
+  /** 逐字段前后值 */
+  changes: Record<string, { from: unknown; to: unknown }>
+}
+
+/** 标签列表项（GET /api/devices/tags） */
+export interface DeviceTagStat {
+  tag: string
+  device_count: number
+}
+
+/** 批量打标签/移除标签的逐设备结果 */
+export interface DeviceTagBatchItem {
+  device_id: string
+  status: 'updated' | 'unchanged' | 'not_found' | 'over_limit'
+  added: string[]
+  removed: string[]
+  tag_count: number
+  error: string | null
+}
+
+export interface DeviceTagBatchResult {
+  results: DeviceTagBatchItem[]
+  updated: number
+  unchanged: number
+  not_found: number
+  over_limit: number
+  added: number
+  removed: number
+}
+
+export const TAG_MAX_LENGTH = 32
+export const TAG_MAX_PER_DEVICE = 16
 
 // ==================== 阈值在线配置（v1.33.0 兼容） ====================
 
@@ -404,6 +456,7 @@ export type AuditAction =
   | 'alert_rule.disable'
   | 'alert_rule.delete'
   | 'alert_rule.restore_defaults'
+  | 'device.tags_update'
 
 export interface AuditLog {
   id: number

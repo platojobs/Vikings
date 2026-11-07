@@ -107,6 +107,7 @@ class _FakeApiClient extends ApiClient {
   String? lastLevel;
   String? lastStatus;
   String? lastDeviceId;
+  List<String>? lastTags;
   String? lastDeviceKeyword;
   int? lastDevicePage;
   int? lastDevicePageSize;
@@ -122,13 +123,24 @@ class _FakeApiClient extends ApiClient {
     String? deviceId,
     String? level,
     String? status,
+    List<String>? tags,
   }) async {
     alertFetchCalls += 1;
     lastPage = page;
     lastLevel = level;
     lastStatus = status;
     lastDeviceId = deviceId;
+    lastTags = tags;
     var filtered = alerts;
+    if (tags != null && tags.isNotEmpty) {
+      final taggedIds = devices
+          .where((device) => device.tags.any(tags.contains))
+          .map((device) => device.deviceId)
+          .toSet();
+      filtered = filtered
+          .where((item) => taggedIds.contains(item.deviceId))
+          .toList();
+    }
     if (level != null && level.isNotEmpty) {
       filtered = filtered.where((item) => item.level == level).toList();
     }
@@ -235,6 +247,7 @@ class _FakeApiClient extends ApiClient {
     String? status,
     String? keyword,
     String? group,
+    List<String>? tags,
     bool hasAlert = false,
     bool withAlertCount = false,
   }) async {
@@ -272,6 +285,21 @@ class _FakeApiClient extends ApiClient {
   @override
   Future<List<DeviceGroup>> fetchGroups({required String token}) async =>
       const <DeviceGroup>[];
+
+  @override
+  Future<List<DeviceTagStat>> fetchDeviceTags({required String token}) async {
+    final counts = <String, int>{};
+    for (final device in devices) {
+      for (final tag in device.tags) {
+        counts[tag] = (counts[tag] ?? 0) + 1;
+      }
+    }
+    final stats = counts.entries
+        .map((entry) => DeviceTagStat(tag: entry.key, deviceCount: entry.value))
+        .toList(growable: false);
+    stats.sort((a, b) => a.tag.compareTo(b.tag));
+    return stats;
+  }
 
   @override
   Future<List<SensorReading>> fetchLatestReadings({
@@ -362,6 +390,7 @@ Future<void> _pumpAlertCenter(
 
 Finder _levelChip(String level) => find.byKey(ValueKey('level-$level'));
 Finder _statusChip(String status) => find.byKey(ValueKey('status-$status'));
+Finder _tagChip(String tag) => find.byKey(ValueKey('tag-$tag'));
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -396,6 +425,61 @@ void main() {
     expect(api.lastStatus, 'acked');
     expect(find.byKey(const ValueKey('alert-row-alt-c2')), findsOneWidget);
     expect(find.byKey(const ValueKey('alert-row-alt-c1')), findsNothing);
+  });
+
+  testWidgets('标签筛选与级别/状态组合生效并重置分页', (tester) async {
+    const taggedA = DeviceSummary(
+      deviceId: 'dev-0001',
+      name: '一号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '默认分组',
+      status: 'online',
+      tags: <String>['关键'],
+    );
+    const taggedB = DeviceSummary(
+      deviceId: 'dev-0002',
+      name: '二号机',
+      model: 'Battery-Sensor',
+      firmwareVersion: '1.0.0',
+      groupName: '默认分组',
+      status: 'online',
+      tags: <String>['普通'],
+    );
+    final api = _FakeApiClient(
+      alerts: <AlertItem>[
+        _alert('alt-t1', 'critical', 'open'),
+        _alert('alt-t2', 'warning', 'open', deviceId: 'dev-0002'),
+      ],
+      devices: const <DeviceSummary>[taggedA, taggedB],
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    // 标签 chips 来自 GET /api/devices/tags
+    expect(find.widgetWithText(ChoiceChip, '关键（1）'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, '普通（1）'), findsOneWidget);
+
+    await tester.tap(_tagChip('关键'));
+    await tester.pumpAndSettle();
+    expect(api.lastPage, 1);
+    expect(api.lastTags, const <String>['关键']);
+    expect(find.byKey(const ValueKey('alert-row-alt-t1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-t2')), findsNothing);
+
+    // 叠加状态筛选：标签 + 状态同时下发
+    await tester.tap(_statusChip('acked'));
+    await tester.pumpAndSettle();
+    expect(api.lastStatus, 'acked');
+    expect(api.lastTags, const <String>['关键']);
+    expect(find.byKey(const ValueKey('alert-row-alt-t1')), findsNothing);
+
+    // 再叠加级别筛选：标签 + 状态 + 级别三者同时生效
+    await tester.tap(_levelChip('critical'));
+    await tester.pumpAndSettle();
+    expect(api.lastLevel, 'critical');
+    expect(api.lastStatus, 'acked');
+    expect(api.lastTags, const <String>['关键']);
   });
 
   testWidgets('滚动分页：第一页 20 条，滑到底追加第二页并展示没有更多', (tester) async {

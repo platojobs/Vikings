@@ -155,8 +155,45 @@ class DeviceOut(BaseModel):
     mqtt_credential_status: str = "missing"
     # 指纹短前缀（8 位），只用于人工对账，不回传完整指纹
     mqtt_credential_fingerprint_prefix: Optional[str] = None
+    # v1.35.0 设备标签（多值，按字母序）；列表接口批量填充，默认空数组保持旧结构
+    tags: List[str] = []
 
     model_config = {"from_attributes": True}
+
+
+class DeviceTagOut(BaseModel):
+    """标签列表项：标签名与持有该标签的设备数（v1.35.0）。"""
+
+    tag: str
+    device_count: int
+
+
+class DeviceTagBatchRequest(BaseModel):
+    """批量打标签/移除标签：逐设备返回真实状态，不静默成功。"""
+
+    device_ids: List[str] = Field(min_length=1, max_length=200)
+    add: List[str] = Field(default_factory=list, max_length=50)
+    remove: List[str] = Field(default_factory=list, max_length=50)
+
+
+class DeviceTagBatchItem(BaseModel):
+    device_id: str
+    # updated / unchanged / not_found / over_limit
+    status: str
+    added: List[str] = []
+    removed: List[str] = []
+    tag_count: int = 0
+    error: Optional[str] = None
+
+
+class DeviceTagBatchResult(BaseModel):
+    results: List[DeviceTagBatchItem]
+    updated: int
+    unchanged: int
+    not_found: int
+    over_limit: int
+    added: int
+    removed: int
 
 
 class MqttCredentialOut(BaseModel):
@@ -774,8 +811,10 @@ class AlertRuleCreate(BaseModel):
     op: Literal["lt", "gt"]
     threshold: float
     level: Literal["warning", "critical"]
-    scope_type: Literal["global", "group", "device"] = "global"
+    scope_type: Literal["global", "group", "device", "tag"] = "global"
     scope_value: Optional[str] = Field(default=None, max_length=64)
+    # v1.35.0 多值范围（值之间为「或」）；与 scope_value 二选一，传数组时优先
+    scope_values: Optional[List[str]] = Field(default=None, max_length=50)
     enabled: bool = True
     consecutive_count: int = Field(default=1, ge=1, le=20)
     priority: int = Field(default=100, ge=1, le=1000)
@@ -789,9 +828,10 @@ class AlertRuleUpdate(BaseModel):
     op: Optional[Literal["lt", "gt"]] = None
     threshold: Optional[float] = None
     level: Optional[Literal["warning", "critical"]] = None
-    scope_type: Optional[Literal["global", "group", "device"]] = None
+    scope_type: Optional[Literal["global", "group", "device", "tag"]] = None
     # 显式传空串表示把范围改回全局；null 表示保持原值（与通知规则的「未传不变」一致）
     scope_value: Optional[str] = Field(default=None, max_length=64)
+    scope_values: Optional[List[str]] = Field(default=None, max_length=50)
     enabled: Optional[bool] = None
     consecutive_count: Optional[int] = Field(default=None, ge=1, le=20)
     priority: Optional[int] = Field(default=None, ge=1, le=1000)
@@ -812,6 +852,8 @@ class AlertRuleOut(BaseModel):
     level: str
     scope_type: str
     scope_value: Optional[str] = None
+    # 多值范围：旧客户端读 scope_value，新客户端优先读 scope_values
+    scope_values: Optional[List[str]] = None
     enabled: bool
     consecutive_count: int
     priority: int
@@ -821,6 +863,21 @@ class AlertRuleOut(BaseModel):
     # 前端展示「最近修改人/时间」时无需再查审计
 
     model_config = {"from_attributes": True}
+
+
+class AlertRuleHistoryEntry(BaseModel):
+    """规则变更历史：直接读既有审计，不新造平行记录（v1.35.0）。
+
+    `changes` 为逐字段前后值，规则字段本身不含密钥，可安全展示；
+    敏感内容（口令/令牌）不会进入规则审计。
+    """
+
+    id: int
+    action: str
+    operator: str
+    created_at: datetime
+    fields: List[str] = []
+    changes: Dict[str, Dict[str, Any]] = {}
 
 
 class ThresholdsUpdateRequest(BaseModel):

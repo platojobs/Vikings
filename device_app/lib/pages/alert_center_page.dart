@@ -92,6 +92,9 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   String _level = '';
   String _status = 'open';
   String _deviceId = '';
+  /// v1.35.0 标签筛选：空串代表全部标签，与级别/状态/设备组合生效。
+  String _tag = '';
+  List<DeviceTagStat> _tags = const <DeviceTagStat>[];
 
   /// P2-3（v1.25.0）：设备筛选改为输入关键词远程查询，首屏不再拉 200 台。
   static const int _deviceSearchPageSize = 20;
@@ -309,6 +312,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         level: _level,
         status: _status,
         deviceId: _deviceId,
+        tags: _tag.isEmpty ? null : <String>[_tag],
       );
       AlertSummary summary = AlertSummary.empty;
       try {
@@ -318,10 +322,17 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       }
       // 仅为告警行展示名称补一次首屏缓存；设备筛选已改为远程搜索，不再拉 200 台。
       await _ensureDeviceNameCache(client, session.token, page.items);
+      List<DeviceTagStat> tags = _tags;
+      try {
+        tags = await client.fetchDeviceTags(token: session.token);
+      } on ApiException catch (_) {
+        // 标签列表失败不影响告警列表，沿用上一次可用选项
+      }
       if (!mounted || requestId != _requestSeq) {
         return;
       }
       setState(() {
+        _tags = tags;
         _alerts = page.items;
         _page = page.page <= 0 ? 1 : page.page;
         _total = page.total;
@@ -381,6 +392,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         level: _level,
         status: _status,
         deviceId: _deviceId,
+        tags: _tag.isEmpty ? null : <String>[_tag],
       );
       if (!mounted || requestId != _requestSeq) {
         return;
@@ -648,6 +660,22 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     unawaited(_reload());
   }
 
+  /// v1.35.0 标签筛选：与级别/状态/设备组合生效，重置到第 1 页。
+  void _applyTag(String tag) {
+    if (_tag == tag) {
+      return;
+    }
+    setState(() {
+      _tag = tag;
+      _selected.clear();
+      _requestSeq += 1;
+      _alerts = const <AlertItem>[];
+      _loading = false;
+      _loadingMore = false;
+    });
+    unawaited(_reload());
+  }
+
   // ---------------- 实时链路 ----------------
 
   void _syncRealtimeLifecycle() {
@@ -816,6 +844,11 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       return false;
     }
     if (_deviceId.isNotEmpty && alert.deviceId != _deviceId) {
+      return false;
+    }
+    // 标签归属不在告警载荷里，实时新增无法本地判定；为避免误插入（假阳性），
+    // 标签筛选生效时实时告警只累加角标，列表以服务端筛选结果为准。
+    if (_tag.isNotEmpty) {
       return false;
     }
     return true;
@@ -1048,6 +1081,23 @@ class _AlertCenterPageState extends State<AlertCenterPage>
               ],
             ),
           ),
+          if (_tags.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  _tagChip('全部标签', ''),
+                  ..._tags.map(
+                    (tag) => _tagChip(
+                      '${tag.tag}（${tag.deviceCount}）',
+                      tag.tag,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
             child: Column(
@@ -1255,6 +1305,18 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         label: Text(label),
         selected: _status == value,
         onSelected: (_) => _applyStatus(value),
+      ),
+    );
+  }
+
+  Widget _tagChip(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: ChoiceChip(
+        key: ValueKey('tag-${value.isEmpty ? 'all' : value}'),
+        label: Text(label),
+        selected: _tag == value,
+        onSelected: (_) => _applyTag(value),
       ),
     );
   }
