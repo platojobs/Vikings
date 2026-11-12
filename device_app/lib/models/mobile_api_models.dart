@@ -186,7 +186,8 @@ class DeviceSummary {
     openAlertCount: openAlertCount ?? this.openAlertCount,
     mqttUsername: mqttUsername,
     mqttCredentialVersion: mqttCredentialVersion ?? this.mqttCredentialVersion,
-    mqttCredentialIssuedAt: mqttCredentialIssuedAt ?? this.mqttCredentialIssuedAt,
+    mqttCredentialIssuedAt:
+        mqttCredentialIssuedAt ?? this.mqttCredentialIssuedAt,
     mqttCredentialRotatedAt:
         mqttCredentialRotatedAt ?? this.mqttCredentialRotatedAt,
     mqttCredentialRevokedAt:
@@ -213,8 +214,8 @@ class DeviceSummary {
     mqttCredentialRotatedAt: _asTime(json['mqtt_credential_rotated_at']),
     mqttCredentialRevokedAt: _asTime(json['mqtt_credential_revoked_at']),
     mqttCredentialStatus: _asString(json['mqtt_credential_status'], 'missing'),
-    mqttCredentialFingerprintPrefix:
-        json['mqtt_credential_fingerprint_prefix']?.toString(),
+    mqttCredentialFingerprintPrefix: json['mqtt_credential_fingerprint_prefix']
+        ?.toString(),
     tags: (json['tags'] is List)
         ? (json['tags'] as List)
               .whereType<Object>()
@@ -234,6 +235,61 @@ class DeviceTagStat {
   factory DeviceTagStat.fromJson(Map<String, dynamic> json) => DeviceTagStat(
     tag: _asString(json['tag']),
     deviceCount: _asInt(json['device_count']),
+  );
+}
+
+/// `GET /api/devices/{id}/shadow`：期望状态、设备上报与服务端派生的同步差异。
+class DeviceShadow {
+  const DeviceShadow({
+    required this.deviceId,
+    this.desired = const <String, dynamic>{},
+    this.reported = const <String, dynamic>{},
+    this.version = 0,
+    this.reportedVersion = 0,
+    this.syncStatus = 'empty',
+    this.diffKeys = const <String>[],
+    this.pendingDesired = const <String, dynamic>{},
+    this.desiredUpdatedAt,
+    this.desiredUpdatedBy,
+    this.reportedUpdatedAt,
+  });
+
+  final String deviceId;
+  final Map<String, dynamic> desired;
+  final Map<String, dynamic> reported;
+  final int version;
+  final int reportedVersion;
+
+  /// empty / synced / pending / offline_pending，由网关统一计算。
+  final String syncStatus;
+  final List<String> diffKeys;
+  final Map<String, dynamic> pendingDesired;
+  final DateTime? desiredUpdatedAt;
+  final String? desiredUpdatedBy;
+  final DateTime? reportedUpdatedAt;
+
+  static Map<String, dynamic> _stateFrom(Object? value) => value is Map
+      ? Map<String, dynamic>.unmodifiable(
+          value.map((key, item) => MapEntry(key.toString(), item)),
+        )
+      : const <String, dynamic>{};
+
+  factory DeviceShadow.fromJson(Map<String, dynamic> json) => DeviceShadow(
+    deviceId: _asString(json['device_id']),
+    desired: _stateFrom(json['desired']),
+    reported: _stateFrom(json['reported']),
+    version: _asInt(json['version']),
+    reportedVersion: _asInt(json['reported_version']),
+    syncStatus: _asString(json['sync_status'], 'empty'),
+    diffKeys: (json['diff_keys'] is List)
+        ? (json['diff_keys'] as List)
+              .map((item) => item.toString())
+              .toList(growable: false)
+        : const <String>[],
+    pendingDesired: _stateFrom(json['pending_desired']),
+    desiredUpdatedAt: _asTime(json['desired_updated_at']),
+    desiredUpdatedBy: _asNullableString(json['desired_updated_by']),
+    reportedUpdatedAt: _asTime(json['reported_updated_at']),
   );
 }
 

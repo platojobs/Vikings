@@ -144,7 +144,9 @@ class _FakeApiClient extends ApiClient {
     List<AlertItem>? alerts,
     List<SensorReading>? records,
     this.stats,
-  }) : devices = List<DeviceSummary>.of(devices ?? const <DeviceSummary>[_device]),
+  }) : devices = List<DeviceSummary>.of(
+         devices ?? const <DeviceSummary>[_device],
+       ),
        readings = readings ?? const <SensorReading>[_reading],
        alerts = alerts ?? const <AlertItem>[_openAlert],
        records = records ?? const <SensorReading>[],
@@ -269,19 +271,22 @@ class _FakeApiClient extends ApiClient {
             start + pageSize > total ? total : start + pageSize,
           );
     final stamped = withAlertCount
-        ? items.map((item) {
-            final count = alerts
-                .where(
-                  (alert) =>
-                      alert.status == 'open' && alert.deviceId == item.deviceId,
-                )
-                .length;
-            return item.copyWith(
-              openAlertCount: item.openAlertCount > count
-                  ? item.openAlertCount
-                  : count,
-            );
-          }).toList(growable: false)
+        ? items
+              .map((item) {
+                final count = alerts
+                    .where(
+                      (alert) =>
+                          alert.status == 'open' &&
+                          alert.deviceId == item.deviceId,
+                    )
+                    .length;
+                return item.copyWith(
+                  openAlertCount: item.openAlertCount > count
+                      ? item.openAlertCount
+                      : count,
+                );
+              })
+              .toList(growable: false)
         : items;
     return DevicePage(
       items: stamped,
@@ -362,8 +367,16 @@ class _FakeApiClient extends ApiClient {
     final start = (page - 1) * pageSize;
     final items = start >= total
         ? const <AlertItem>[]
-        : open.sublist(start, start + pageSize > total ? total : start + pageSize);
-    return AlertPage(items: items, total: total, page: page, pageSize: pageSize);
+        : open.sublist(
+            start,
+            start + pageSize > total ? total : start + pageSize,
+          );
+    return AlertPage(
+      items: items,
+      total: total,
+      page: page,
+      pageSize: pageSize,
+    );
   }
 
   String _groupNameOf(DeviceSummary device) {
@@ -381,6 +394,21 @@ class _FakeApiClient extends ApiClient {
         reportToday: 0,
         alertOpen: alerts.where((item) => item.status == 'open').length,
       );
+
+  @override
+  Future<DeviceShadow> fetchDeviceShadow({
+    required String token,
+    required String deviceId,
+  }) async => const DeviceShadow(
+    deviceId: 'dev-0001',
+    desired: <String, dynamic>{'report_interval': 30, 'led': true},
+    reported: <String, dynamic>{'report_interval': 10, 'led': true},
+    version: 7,
+    reportedVersion: 6,
+    syncStatus: 'pending',
+    diffKeys: <String>['report_interval'],
+    pendingDesired: <String, dynamic>{'report_interval': 30},
+  );
 
   @override
   Future<List<CommandItem>> fetchCommands({
@@ -1058,11 +1086,7 @@ void main() {
 
     // 筛选生效时收到上下线事件，列表按实时状态立即更新
     realtime.emit(
-      const StatusEvent(
-        deviceId: 'dev-0001',
-        status: 'offline',
-        reason: 'lwt',
-      ),
+      const StatusEvent(deviceId: 'dev-0001', status: 'offline', reason: 'lwt'),
     );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 20));
@@ -1131,7 +1155,9 @@ void main() {
       groupName: '仓储组',
       status: 'online',
     );
-    final api = _FakeApiClient(devices: const [production, production2, warehouse]);
+    final api = _FakeApiClient(
+      devices: const [production, production2, warehouse],
+    );
     await _pumpBoard(tester, api: api, session: _adminSession);
     await tester.pumpAndSettle();
 
@@ -1380,6 +1406,28 @@ void main() {
     expect(find.textContaining('dev-0001 · 巡检组'), findsOneWidget);
   });
 
+  testWidgets('设备详情：影子展示期望、上报、版本与待同步差异', (tester) async {
+    final api = _FakeApiClient();
+    await _pumpBoard(tester, api: api, session: _viewerSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-shadow-key-report_interval')),
+    );
+
+    expect(find.byKey(const Key('device-shadow-section')), findsOneWidget);
+    expect(find.text('设备影子'), findsOneWidget);
+    expect(find.text('待同步'), findsWidgets);
+    expect(find.text('期望版本 v7 · 设备已应用 v6'), findsOneWidget);
+    expect(find.text('差异 1 项'), findsOneWidget);
+    expect(find.text('report_interval'), findsOneWidget);
+    expect(find.text('期望：30'), findsOneWidget);
+    expect(find.text('上报：10'), findsOneWidget);
+    expect(find.text('只读视图；期望状态请在 Web 管理端修改。'), findsOneWidget);
+    expect(find.text('保存期望'), findsNothing);
+  });
+
   testWidgets('设备详情：未签发凭证时明确提示并提供签发入口', (tester) async {
     final api = _FakeApiClient();
     await _pumpBoard(tester, api: api, session: _adminSession);
@@ -1421,7 +1469,10 @@ void main() {
     expect(api.lastCredentialOperation, 'issue');
 
     // 一次性口令可见，复制入口存在
-    expect(find.byKey(const Key('one-time-credential-password')), findsOneWidget);
+    expect(
+      find.byKey(const Key('one-time-credential-password')),
+      findsOneWidget,
+    );
     expect(find.text(api.credentialPassword), findsOneWidget);
     expect(find.text('复制口令'), findsOneWidget);
 
@@ -1603,4 +1654,3 @@ void main() {
     expect(find.text('筛选结果：1 台 / 全部 25 台'), findsOneWidget);
   });
 }
-

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Device, DeviceAlert, SensorRecord
 from app.schemas import DeviceStatusMessage, SensorReportMessage
-from app.services import tag_service
+from app.services import tag_service, shadow_service
 from app.topics import DEVICE_STATUS_OFFLINE, DEVICE_STATUS_ONLINE, TOPIC_SYSTEM_GROUP
 
 logger = logging.getLogger(__name__)
@@ -285,6 +285,7 @@ async def delete_device(session: AsyncSession, device_id: str) -> Tuple[bool, st
         return False, f"设备存在 {record_count} 条历史数据，请先清理后再删除"
 
     await tag_service.delete_device_tags(session, device_id)
+    await shadow_service.delete_device_shadow(session, device_id)
     await session.delete(device)
     await session.flush()
     return True, ""

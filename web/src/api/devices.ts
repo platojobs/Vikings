@@ -15,6 +15,9 @@ import type {
   DeviceGroupStat,
   DeviceListQuery,
   DeviceRecordsQuery,
+  DeviceShadow,
+  DeviceShadowBatchResult,
+  DeviceShadowValue,
   DeviceTagBatchResult,
   DeviceTagStat,
   DeviceUpdateBody,
@@ -174,5 +177,45 @@ export function sendBulkCommand(
   return request<CommandBulkResult>('/api/devices/commands/bulk', {
     method: 'POST',
     body: { device_ids: deviceIds, type, payload, request_id: requestId },
+  })
+}
+
+// ==================== 设备影子（v1.36.0） ====================
+
+export function fetchDeviceShadow(deviceId: string): Promise<DeviceShadow> {
+  return request<DeviceShadow>(`/api/devices/${encodeURIComponent(deviceId)}/shadow`)
+}
+
+/** merge 语义写入期望状态；值为 null 表示删除该键 */
+export function updateDeviceShadowDesired(
+  deviceId: string,
+  patch: Record<string, DeviceShadowValue>,
+): Promise<DeviceShadow> {
+  return request<DeviceShadow>(`/api/devices/${encodeURIComponent(deviceId)}/shadow/desired`, {
+    method: 'PUT',
+    body: { patch },
+  })
+}
+
+export function clearDeviceShadowDesiredKeys(
+  deviceId: string,
+  keys: string[],
+): Promise<DeviceShadow> {
+  return request<DeviceShadow>(`/api/devices/${encodeURIComponent(deviceId)}/shadow/desired`, {
+    method: 'DELETE',
+    params: { keys },
+  })
+}
+
+/** 批量设置期望：显式设备、标签与分组同时提供时由服务端取交集 */
+export function batchUpdateShadowDesired(body: {
+  device_ids?: string[]
+  tags?: string[]
+  group?: string
+  patch: Record<string, DeviceShadowValue>
+}): Promise<DeviceShadowBatchResult> {
+  return request<DeviceShadowBatchResult>('/api/devices/shadow/desired/batch', {
+    method: 'POST',
+    body,
   })
 }

@@ -162,8 +162,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     );
     _createApiClient =
         widget.apiClientFactory ??
-        (String baseUrl) =>
-            ApiClient(baseUrl: baseUrl, refresher: _refresher);
+        (String baseUrl) => ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
         widget.realtimeServiceFactory ??
         (String url) => BoardRealtimeService(
@@ -405,9 +404,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           _devices = _devices
               .map(
                 (device) => device.deviceId == alert.deviceId
-                    ? device.copyWith(
-                        openAlertCount: device.openAlertCount + 1,
-                      )
+                    ? device.copyWith(openAlertCount: device.openAlertCount + 1)
                     : device,
               )
               .toList(growable: false);
@@ -691,10 +688,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           .map((device) => device.deviceId)
           .toList(growable: false);
       final results = await Future.wait<Object>([
-        client.fetchLatestReadings(
-          token: session.token,
-          deviceIds: deviceIds,
-        ),
+        client.fetchLatestReadings(token: session.token, deviceIds: deviceIds),
         client.fetchOpenAlerts(
           token: session.token,
           page: 1,
@@ -784,9 +778,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
       } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载更多失败：${error.userMessage}')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('加载更多失败：${error.userMessage}')));
       }
     } catch (_) {
       if (mounted) {
@@ -804,7 +798,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   /// 未处理告警按页追加，`_alertTotal` 始终是服务端全量数。
   Future<void> _loadMoreAlerts() async {
     final session = _session;
-    if (session == null || _loadingMoreAlerts || _alerts.length >= _alertTotal) {
+    if (session == null ||
+        _loadingMoreAlerts ||
+        _alerts.length >= _alertTotal) {
       return;
     }
     setState(() => _loadingMoreAlerts = true);
@@ -827,9 +823,9 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
       } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载告警失败：${error.userMessage}')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('加载告警失败：${error.userMessage}')));
       }
     } finally {
       client.close();
@@ -936,9 +932,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     if (refreshToken.isNotEmpty) {
       // 先吊销服务端 refresh（离线/失败不阻塞本地退出），再清本地会话
       try {
-        await _createApiClient(_baseUrl).logoutSession(
-          refreshToken: refreshToken,
-        );
+        await _createApiClient(_baseUrl)
+            .logoutSession(refreshToken: refreshToken);
       } catch (_) {
         // 服务端不可达时仍允许本地退出
       }
@@ -1145,24 +1140,27 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   /// `openAlertCount`，不再依赖未处理告警列表的前 50 条。
   List<DeviceSummary> get _filteredDevices {
     final keyword = _keyword.toLowerCase();
-    return _devices.where((device) {
-      if (_groupFilter.isNotEmpty && _deviceGroupName(device) != _groupFilter) {
-        return false;
-      }
-      if (keyword.isNotEmpty) {
-        final id = device.deviceId.toLowerCase();
-        final name = device.name.toLowerCase();
-        if (!id.contains(keyword) && !name.contains(keyword)) {
-          return false;
-        }
-      }
-      return switch (_statusFilter) {
-        _BoardStatusFilter.all => true,
-        _BoardStatusFilter.online => _isOnline(device),
-        _BoardStatusFilter.offline => !_isOnline(device),
-        _BoardStatusFilter.alert => device.openAlertCount > 0,
-      };
-    }).toList(growable: false);
+    return _devices
+        .where((device) {
+          if (_groupFilter.isNotEmpty &&
+              _deviceGroupName(device) != _groupFilter) {
+            return false;
+          }
+          if (keyword.isNotEmpty) {
+            final id = device.deviceId.toLowerCase();
+            final name = device.name.toLowerCase();
+            if (!id.contains(keyword) && !name.contains(keyword)) {
+              return false;
+            }
+          }
+          return switch (_statusFilter) {
+            _BoardStatusFilter.all => true,
+            _BoardStatusFilter.online => _isOnline(device),
+            _BoardStatusFilter.offline => !_isOnline(device),
+            _BoardStatusFilter.alert => device.openAlertCount > 0,
+          };
+        })
+        .toList(growable: false);
   }
 
   bool get _filterActive =>
@@ -1895,6 +1893,8 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
   static const int _pageSize = 10;
 
   List<CommandItem> _commands = const <CommandItem>[];
+  DeviceShadow? _shadow;
+
   /// 历史上报按时间倒序（最新在前），实时新上报插入顶部。
   List<SensorReading> _records = const <SensorReading>[];
   bool _loading = true;
@@ -2009,7 +2009,9 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(rotation ? '轮换设备凭证' : '签发设备凭证'),
-        content: SingleChildScrollView(child: Text(_credentialImpactText(rotation))),
+        content: SingleChildScrollView(
+          child: Text(_credentialImpactText(rotation)),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
@@ -2149,10 +2151,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                 SelectableText(
                   result.password,
                   key: const Key('one-time-credential-password'),
-                  style: const TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 13,
-                  ),
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
                 ),
                 const SizedBox(height: 10),
                 Row(
@@ -2183,7 +2182,10 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                       '补救：在 Broker 主机执行重载（systemctl reload mosquitto '
                       '或 docker compose restart mqtt），确认成功后再让设备改用新口令。\n'
                       '重载详情：${result.reloadDetail}',
-                      style: const TextStyle(fontSize: 12, color: Color(0xFF8A6D3B)),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF8A6D3B),
+                      ),
                     ),
                   ),
                 ],
@@ -2202,7 +2204,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     );
   }
 
-  /// 首屏：指令回执 + 第一页历史上报。
+  /// 首屏：指令回执 + 第一页历史上报 + 设备影子。
   Future<void> _loadDetail() async {
     final client = widget.apiClientFactory(widget.baseUrl);
     try {
@@ -2216,6 +2218,10 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
           deviceId: widget.device.deviceId,
           limit: _pageSize + 1,
         ),
+        client.fetchDeviceShadow(
+          token: widget.token,
+          deviceId: widget.device.deviceId,
+        ),
       ]);
       final batches = results[1] as List<SensorReading>;
       // 网关按时间正序返回，最新一条在末尾；探测多取的一条要丢掉
@@ -2225,6 +2231,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
       if (mounted) {
         setState(() {
           _commands = results[0] as List<CommandItem>;
+          _shadow = results[2] as DeviceShadow;
           _records = _newestFirst(page);
           _serverCount = page.length;
           _hasMore = batches.length > _pageSize;
@@ -2320,17 +2327,18 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
 
   /// 统一按时间倒序（无时间戳时用 seq 兜底），保证实时插入与分页顺序一致。
   List<SensorReading> _newestFirst(List<SensorReading> rows) {
-    final sorted = List<SensorReading>.of(rows)..sort((a, b) {
-      final at = a.ts;
-      final bt = b.ts;
-      if (at != null && bt != null) {
-        final byTime = bt.compareTo(at);
-        if (byTime != 0) {
-          return byTime;
+    final sorted = List<SensorReading>.of(rows)
+      ..sort((a, b) {
+        final at = a.ts;
+        final bt = b.ts;
+        if (at != null && bt != null) {
+          final byTime = bt.compareTo(at);
+          if (byTime != 0) {
+            return byTime;
+          }
         }
-      }
-      return b.seq.compareTo(a.seq);
-    });
+        return b.seq.compareTo(a.seq);
+      });
     return List<SensorReading>.unmodifiable(sorted);
   }
 
@@ -2346,12 +2354,158 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
             style: const TextStyle(fontSize: 12, color: Colors.black45),
           ),
         ),
-        Expanded(
-          child: Text(value, style: const TextStyle(fontSize: 12)),
-        ),
+        Expanded(child: Text(value, style: const TextStyle(fontSize: 12))),
       ],
     ),
   );
+
+  String _shadowStatusLabel(String status) {
+    switch (status) {
+      case 'synced':
+        return '已同步';
+      case 'pending':
+        return '待同步';
+      case 'offline_pending':
+        return '离线待同步';
+      default:
+        return '未设期望';
+    }
+  }
+
+  Color _shadowStatusColor(String status) {
+    switch (status) {
+      case 'synced':
+        return Colors.green;
+      case 'pending':
+        return Colors.orange;
+      case 'offline_pending':
+        return Colors.blueGrey;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  String _shadowValue(Object? value) =>
+      value == null ? 'null' : value.toString();
+
+  Widget _buildShadowStateRow(DeviceShadow shadow, String key) {
+    final pending = shadow.diffKeys.contains(key);
+    final hasDesired = shadow.desired.containsKey(key);
+    final hasReported = shadow.reported.containsKey(key);
+    return Container(
+      key: ValueKey<String>('device-shadow-key-$key'),
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: pending ? const Color(0xFFFFF8E1) : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  key,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Text(
+                pending ? '待同步' : '一致',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: pending ? Colors.orange.shade800 : Colors.black45,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 3),
+          Text(
+            '期望：${hasDesired ? _shadowValue(shadow.desired[key]) : '—'}',
+            style: const TextStyle(fontSize: 12),
+          ),
+          Text(
+            '上报：${hasReported ? _shadowValue(shadow.reported[key]) : '—'}',
+            style: const TextStyle(fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 设备影子只读区：写操作集中在 Web，移动端不复制 merge patch 编辑器。
+  Widget _buildShadowSection() {
+    final shadow = _shadow;
+    if (shadow == null) {
+      return const SizedBox.shrink();
+    }
+    final keys = <String>{
+      ...shadow.desired.keys,
+      ...shadow.reported.keys,
+    }.toList()..sort();
+    return Container(
+      key: const Key('device-shadow-section'),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '设备影子',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                ),
+              ),
+              Chip(
+                key: const Key('device-shadow-status-chip'),
+                label: Text(
+                  _shadowStatusLabel(shadow.syncStatus),
+                  style: const TextStyle(fontSize: 11, color: Colors.white),
+                ),
+                backgroundColor: _shadowStatusColor(shadow.syncStatus),
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ],
+          ),
+          Text(
+            '期望版本 v${shadow.version} · 设备已应用 v${shadow.reportedVersion}',
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+          Text(
+            '差异 ${shadow.diffKeys.length} 项',
+            key: const Key('device-shadow-diff-count'),
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+          if (keys.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                '尚未设置期望或上报状态',
+                style: TextStyle(fontSize: 12, color: Colors.black45),
+              ),
+            )
+          else
+            ...keys.map((key) => _buildShadowStateRow(shadow, key)),
+          const SizedBox(height: 8),
+          const Text(
+            '只读视图；期望状态请在 Web 管理端修改。',
+            style: TextStyle(fontSize: 11, color: Colors.black45),
+          ),
+        ],
+      ),
+    );
+  }
 
   /// 凭证状态区：只展示元数据与短前缀，绝不渲染口令或完整指纹。
   Widget _buildCredentialSection() {
@@ -2411,9 +2565,15 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
             _credentialRow('用户名', _device.mqttUsername ?? _device.deviceId),
             _credentialRow('版本', '${_device.mqttCredentialVersion}'),
             _credentialRow('首次签发', _formatTime(_device.mqttCredentialIssuedAt)),
-            _credentialRow('最近轮换', _formatTime(_device.mqttCredentialRotatedAt)),
+            _credentialRow(
+              '最近轮换',
+              _formatTime(_device.mqttCredentialRotatedAt),
+            ),
             if (revoked)
-              _credentialRow('吊销时间', _formatTime(_device.mqttCredentialRevokedAt)),
+              _credentialRow(
+                '吊销时间',
+                _formatTime(_device.mqttCredentialRevokedAt),
+              ),
             _credentialRow(
               '指纹前缀',
               _device.mqttCredentialFingerprintPrefix == null
@@ -2526,6 +2686,8 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                   ),
               ],
             ),
+            const SizedBox(height: 12),
+            _buildShadowSection(),
             const SizedBox(height: 12),
             _buildCredentialSection(),
             const SizedBox(height: 12),

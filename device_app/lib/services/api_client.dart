@@ -135,6 +135,22 @@ class ApiClient {
     return DevicePage.fromJson(data);
   }
 
+  /// 设备影子只读视图；同步状态与差异直接使用服务端派生结果。
+  Future<DeviceShadow> fetchDeviceShadow({
+    required String token,
+    required String deviceId,
+  }) async {
+    final data = await _send(
+      'GET',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/shadow',
+      token: token,
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '设备影子响应缺少 data');
+    }
+    return DeviceShadow.fromJson(data);
+  }
+
   /// 签发/轮换设备凭证：口令只在本次响应出现一次，调用方必须立即展示并清空。
   Future<DeviceCredentialResult> issueDeviceCredential({
     required String token,
@@ -393,7 +409,9 @@ class ApiClient {
               .post(uri, headers: headers, body: jsonEncode(body ?? const {}))
               .timeout(timeout);
         } else if (method == 'DELETE') {
-          response = await _client.delete(uri, headers: headers).timeout(timeout);
+          response = await _client
+              .delete(uri, headers: headers)
+              .timeout(timeout);
         } else {
           response = await _client.get(uri, headers: headers).timeout(timeout);
         }
@@ -403,7 +421,10 @@ class ApiClient {
         throw ApiException(ApiErrorKind.network, error.message);
       } catch (_) {
         // 覆盖 SocketException 等平台底层网络异常，统一收敛为可读提示
-        throw const ApiException(ApiErrorKind.network, '无法连接网关，请确认地址、后端进程与网络连通性');
+        throw const ApiException(
+          ApiErrorKind.network,
+          '无法连接网关，请确认地址、后端进程与网络连通性',
+        );
       }
 
       try {

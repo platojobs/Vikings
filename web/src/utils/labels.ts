@@ -80,6 +80,8 @@ export function auditActionLabel(action: string): string {
     'device.update': '编辑设备',
     'device.delete': '删除设备',
     'device.bulk_create': '批量注册设备',
+    'device.shadow_desired_update': '更新设备期望状态',
+    'device.shadow_desired_batch': '批量更新期望状态',
   }
   return labels[action] ?? action
 }

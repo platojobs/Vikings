@@ -1029,5 +1029,71 @@ curl -s -X POST http://127.0.0.1:8000/api/rules/restore-defaults \
    换设备或等窗口结束再看。
 8. **规则缓存**：单实例网关 write-through；多实例部署需要每个实例都保存一次规则或重启刷新。
 
+## 17. 设备影子同步与排障（v1.36.0）
+
+### 17.1 单台与批量期望的标准操作
+
+1. 在 Web「设备管理」打开设备详情，在「设备影子」核对期望、上报、差异键与同步徽章；
+2. operator/admin 在 JSON merge patch 编辑器中提交，例如 `{"report_interval":30}`；
+   `null` 表示删除期望键，也可以使用对应键的清除入口。viewer 只能查看；
+3. 保存后以服务端返回的 `version` 与 `sync_status` 为准：同值 patch 显示无变化，
+   不会空增版本；设备离线时显示「离线待同步」，不需要反复提交；
+4. 批量操作在设备列表沿用分组/标签筛选与跨页勾选，点「批量期望」，二次确认后查看
+   `matched / updated / unchanged / not_found` 和逐台结果。单次最多 200 台；
+5. 设备下次上线/唤醒主动拉取并应用期望，再上报 `reported` 与已应用 `version`；
+   差异清零后变为「已同步」。移动端详情提供同一份只读视图，不提供编辑器。
+
+同步状态解释：
+
+| 状态 | 处置 |
+| --- | --- |
+| `empty` | 当前没有期望；`reported` 中额外自由状态键不需要清理 |
+| `synced` | 所有期望键已与上报一致，无需重复下发 |
+| `pending` | 设备在线但仍有差异；先等设备本轮应用，再查设备同步日志 |
+| `offline_pending` | 期望已保存，等设备下次上线；不要手工改库为 synced |
+
+### 17.2 用模拟器验证上线同步
+
+先取得 operator/admin access token（变量 `TOKEN`）与设备 MQTT 一次性口令，再执行：
+
+```bash
+GATEWAY_API_URL='http://127.0.0.1:8000' \
+GATEWAY_API_TOKEN="$TOKEN" \
+MQTT_DEVICE_PASSWORD='<设备 MQTT 口令>' \
+python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
+```
+
+- 每轮发布 `online` 后，脚本 GET `/api/devices/dev-0001/shadow`；有未应用版本或差异时，
+  模拟应用当前 `desired`，再 POST `/shadow/reported`，请求体为 `{reported, version}`；
+  已同步时不重复 POST。
+- `--api-url` / `--api-token` 也可替代对应环境变量，两者必须同时提供；
+  `--api-timeout` 默认 5 秒。未配置这些参数时完全保持原有 MQTT 上报/指令行为。
+- 影子 REST 失败只打印「影子同步失败（继续本轮上报）」，不会阻断传感器与 OTA 联调；
+  修复 token/网关后等下一轮自动重试。
+- 这里的 token 是 operator/admin **用户 access token**，不是设备 MQTT 口令；默认 20 分钟过期。
+  不要把 token 写入镜像、仓库或日志。脚本只用于联调，模拟上报不代表真实硬件已执行配置。
+- 当前没有 shadow MQTT Topic 或网关实时推送；生产硬件若要完全设备级鉴权的 MQTT 影子链路，
+  需要后续版本单独设计，不能把本模拟器当作该能力已交付。
+
+### 17.3 影子一直未同步：按顺序排查
+
+1. **看差异而不是只看版本**：GET 影子检查 `diff_keys` 与 `pending_desired`。
+   `reported_version` 会防乱序后退并夹紧到当前版本，最终同步仍由字段值决定；
+2. **看在线状态**：`offline_pending` 先按第 10.2 节处理连接、LWT 与凭证；
+   设备不上线就不会拉取离线期望；
+3. **看设备是否实现同步**：确认唤醒后确实 GET 影子、应用期望并 POST reported；
+   仅发布传感器数据或 OTA 回执不会自动清除影子差异；
+4. **看权限与过期**：POST reported 需要 operator/admin，viewer 为 403、token 过期为 401；
+   模拟器日志会保留可读错误，重新登录获取 token 后下一轮重试；
+5. **看 patch 是否合法**：最多 32 个扁平键，键长 1~32，值仅字符串/数字/布尔/null；
+   嵌套对象与数组会被拒绝。`null` 在 desired/reported 中均表示清除对应键；
+6. **看批量目标口径**：显式 ID、标签、分组同时出现时取交集；被筛选排除的现存设备不计入
+   `matched`，也不会冒充 `not_found`。先在设备列表用同一条件确认目标，再提交；
+7. **看审计**：单台 `device.shadow_desired_update`、批量 `device.shadow_desired_batch`。
+   审计只含键名、版本、筛选与数量，不包含期望状态值；需要核值时读取影子接口，不要改审计表。
+
+若需回滚错误期望，用同一目标提交旧值或清除对应键，这会产生一个新版本；不要直接修改
+`device_shadow.version` 或把 `sync_status` 写入数据库（该状态本来就是实时派生）。
+
 
 

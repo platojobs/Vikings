@@ -336,6 +336,11 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 | PATCH | `/api/devices/{deviceId}` | 编辑名称 / 型号 / 固件版本 / 分组；设备 ID 与状态不可改 |
 | DELETE | `/api/devices/{deviceId}` | 删除设备（仅 admin）；存在历史时序数据时返回 409 |
 | GET | `/api/devices/{deviceId}` | 详情 + 最新一条传感器数据 |
+| GET | `/api/devices/{deviceId}/shadow` | v1.36.0：设备影子（期望/上报/差异/同步状态），登录可读 |
+| PUT | `/api/devices/{deviceId}/shadow/desired` | v1.36.0：merge 写入期望，`{patch}`，operator/admin |
+| DELETE | `/api/devices/{deviceId}/shadow/desired` | v1.36.0：清除期望键，重复 Query `keys`，operator/admin |
+| POST | `/api/devices/{deviceId}/shadow/reported` | v1.36.0：上报实际状态，`{reported, version}`，operator/admin |
+| POST | `/api/devices/shadow/desired/batch` | v1.36.0：按设备/标签/分组批量写期望，operator/admin |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit`、`offset`（v1.13.0） |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
 | GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`、`deviceIds`，均可选 |
@@ -397,6 +402,73 @@ v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹�
   调用方必须逐类展示；**不会**因为个别失败而整体失败或静默返回 200 成功。
 - 写操作审计 `device.tags_update`，记录设备数与标签集合，不记录设备口令等敏感字段。
 - `GET /api/devices/tags` 登录即可读，返回每个标签下的设备数，按设备数倒序；用于 Web/移动端筛选。
+
+**设备影子（v1.36.0）**：一行一设备，保存云端期望 `desired` 与设备实际上报 `reported`，
+响应中的差异和同步状态由服务端统一派生：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "device_id": "dev-0001",
+    "desired": {"report_interval": 30, "led": true},
+    "reported": {"report_interval": 10, "led": true},
+    "version": 7,
+    "reported_version": 6,
+    "sync_status": "pending",
+    "diff_keys": ["report_interval"],
+    "pending_desired": {"report_interval": 30},
+    "desired_updated_at": "2026-11-13T02:00:00+00:00",
+    "desired_updated_by": "operator",
+    "reported_updated_at": "2026-11-13T02:01:00+00:00"
+  }
+}
+```
+
+| 状态 | 判定 |
+| --- | --- |
+| `empty` | `desired={}`；即使 `reported` 留有自由状态键，也不视为待同步 |
+| `synced` | `desired` 非空，且所有期望键均与 `reported` 同值 |
+| `pending` | 设备在线，且至少一个期望键缺失或值不同 |
+| `offline_pending` | 设备离线，且至少一个期望键缺失或值不同；设备上线后主动拉取 |
+
+- `diff_keys` 只检查 `desired` 中的键；`reported` 额外拥有的键不构成差异。
+  `pending_desired` 是这些差异键对应的当前期望值，客户端不得在本地另造一套判定。
+- `PUT desired` 入参 `{"patch":{"report_interval":30,"led":null}}` 使用 merge patch：
+  普通值新增/覆盖，`null` 删除对应期望键。`DELETE desired?keys=led&keys=fan_speed`
+  是等价的显式清键入口，`keys` 为空返回 400。
+- 只有 patch 真正改变 `desired` 才令 `version +1`；同值覆盖、删除不存在的键均幂等，
+  不递增版本、不重复写审计。空 patch 返回 422，非法键/值返回 400。
+- `POST reported` 入参 `{"reported":{"report_interval":30},"version":7}` 同样按字段 merge，
+  `null` 清除对应上报键。`reported_version` 只前进、不随乱序旧回执后退，并夹紧到当前
+  `version`；同步状态仍以实际字段差异为准，不只看版本号。
+- 单个 patch/reported 最多 32 键；键长 1~32；值只允许字符串、数字、布尔、`null`，
+  不允许数组或嵌套对象；单值 JSON 序列化长度上限 512。
+- 所有登录角色可 GET；单台/批量写 `desired` 及 POST `reported` 均为 operator/admin，
+  viewer 写入 403，未登录 401，设备不存在 404。
+
+**批量期望 `POST /api/devices/shadow/desired/batch`**：
+
+```json
+{
+  "device_ids": ["dev-0001", "dev-0002"],
+  "tags": ["冷库"],
+  "group": "华东",
+  "patch": {"report_interval": 30}
+}
+```
+
+- `device_ids` / `tags` / `group` 至少提供一种；同时提供时取交集。标签多值为「或」，
+  与分组、显式 ID 为「且」，复用 v1.35.0 的设备筛选口径。
+- 显式 ID 最多 200 个，标签最多 16 个，筛选后最多 200 台。被标签/分组条件排除的现存设备
+  不进入 `matched` 与 `results`，**不会误标为不存在**；`not_found` 只统计显式 ID 中真正不存在的设备。
+- 逐台返回 `updated` / `unchanged` / `not_found`、`version` 与 `error`，并汇总
+  `matched/updated/unchanged/not_found`；部分不存在不回滚其他设备。
+- 单台写审计 `device.shadow_desired_update`，批量有实际变更时写一条
+  `device.shadow_desired_batch`；只记录键名、版本、筛选与数量，**不记录期望状态值**。
+- 当前版本设备侧链路为**唤醒后 REST 主动 GET desired、应用后 POST reported**；
+  未新增 shadow MQTT Topic，也不宣称网关会实时推送期望。离线期望等待下一次上线/唤醒。
 
 写操作权限：注册 / 批量注册 / 编辑 / **首次签发**设备凭证为 operator+admin；
 **轮换已有有效凭证**与**吊销凭证**仅 admin（会造成设备断线，v1.26.0 起收紧）；删除为 admin。
@@ -1006,6 +1078,7 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 标签列表 | `GET /api/devices/tags` | v1.35.0 标签 chips 数据源，含 `device_count` |
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
 | 单设备历史上报 | `GET /api/devices/{id}/records` | 详情页分页：`limit=11&offset=<已取条数>`，多取 1 条用于判断是否还有更早数据，展示 10 条/页（v1.13.0） |
+| 设备影子 | `GET /api/devices/{id}/shadow` | v1.36.0 详情只读展示期望、上报、版本与服务端差异；编辑仍在 Web |
 | 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数；v1.35.0 起可叠加 `tag`（可重复，或语义） |
 | 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
 | 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
@@ -1269,7 +1342,22 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 | escalation_interval_minutes | int | 相邻升级间隔，默认 30，1~1440 |
 | updated_at / updated_by | timestamptz / varchar(64) | 最近修改时间与人员 |
 
-### 4.4 支撑表（OTA / 指令链路必需）
+### 4.4 支撑表（OTA / 指令 / 设备影子链路必需）
+
+### `device_shadow`（v1.36.0）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| device_id | varchar(64) PK | 一行一设备；删除设备时由设备服务显式清理 |
+| desired / reported | jsonb（SQLite 为 JSON） | 云端期望 / 设备实际上报的扁平键值对象 |
+| version | int | 期望版本；只有实际变更才 +1 |
+| reported_version | int | 设备已应用版本；只前进并夹紧到 version |
+| desired_updated_at | timestamptz NULL | 最近实际期望变更时间 |
+| desired_updated_by | varchar(64) NULL | 最近期望修改人 |
+| reported_updated_at | timestamptz NULL | 最近上报时间 |
+| created_at / updated_at | timestamptz | 行创建与更新时间 |
+
+同步状态和差异不落库，由 `desired`、`reported` 与设备当前在线状态实时派生。
 
 ### `device_command`
 
@@ -1351,7 +1439,8 @@ v1.34.0 起判定读 `alert_rule` 表；本表由旧 `/api/rules/thresholds` 写
 动作枚举：`login` / `command.create` / `command.bulk_create` / `ota.create` / `alert.ack` /
 `threshold.update` / `notify.config_update` / `user.create` / `user.update` / `user.delete` /
 `alert_rule.create` / `alert_rule.update` / `alert_rule.enable` / `alert_rule.disable` /
-`alert_rule.delete` / `alert_rule.restore_defaults`（v1.34.0）。
+`alert_rule.delete` / `alert_rule.restore_defaults`（v1.34.0） /
+`device.shadow_desired_update` / `device.shadow_desired_batch`（v1.36.0）。
 
 ### `app_user` 后台账号表
 

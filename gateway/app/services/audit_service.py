@@ -41,6 +41,9 @@ ACTION_DEVICE_CREATE = "device.create"
 ACTION_DEVICE_UPDATE = "device.update"
 # v1.35.0：批量打标签/移除标签（只记标签名与逐设备结果，设备标签本身不含敏感信息）
 ACTION_DEVICE_TAGS = "device.tags_update"
+# v1.36.0：设备影子期望写入（detail 只记键名与版本，不记值——值可能含设备控制语义）
+ACTION_DEVICE_SHADOW_DESIRED = "device.shadow_desired_update"
+ACTION_DEVICE_SHADOW_DESIRED_BATCH = "device.shadow_desired_batch"
 ACTION_DEVICE_DELETE = "device.delete"
 ACTION_DEVICE_BULK = "device.bulk_create"
 ACTION_DEVICE_CREDENTIAL = "device.credential_issue"

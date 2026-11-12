@@ -25,6 +25,7 @@ from app.api.routes import (
     notifications,
     ota,
     rules,
+    shadows,
     stats,
     system,
     users,
@@ -117,6 +118,7 @@ app.include_router(users.router)
 app.include_router(system.router)
 app.include_router(notifications.router)
 app.include_router(exports.router)
+app.include_router(shadows.router)
 app.include_router(health.router)
 app.include_router(health.metrics_router)
 

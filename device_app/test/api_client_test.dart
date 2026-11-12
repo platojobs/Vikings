@@ -135,6 +135,54 @@ void main() {
     );
   });
 
+  test('fetchDeviceShadow 编码设备 ID，并解析期望、上报与差异', () async {
+    late http.Request captured;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return _jsonResponse(
+          _ok(<String, dynamic>{
+            'device_id': 'dev/0001',
+            'desired': <String, dynamic>{'report_interval': 30, 'led': true},
+            'reported': <String, dynamic>{'report_interval': 10, 'led': true},
+            'version': 7,
+            'reported_version': 6,
+            'sync_status': 'pending',
+            'diff_keys': <String>['report_interval'],
+            'pending_desired': <String, dynamic>{'report_interval': 30},
+            'desired_updated_at': '2026-11-13T02:00:00+00:00',
+            'desired_updated_by': 'operator',
+            'reported_updated_at': '2026-11-13T02:01:00+00:00',
+          }),
+        );
+      }),
+    );
+
+    final shadow = await client.fetchDeviceShadow(
+      token: 'token',
+      deviceId: 'dev/0001',
+    );
+
+    expect(captured.method, 'GET');
+    expect(
+      captured.url,
+      Uri.parse('http://api.example:8000/api/devices/dev%2F0001/shadow'),
+    );
+    expect(captured.headers['Authorization'], 'Bearer token');
+    expect(shadow.deviceId, 'dev/0001');
+    expect(shadow.desired['report_interval'], 30);
+    expect(shadow.reported['report_interval'], 10);
+    expect(shadow.version, 7);
+    expect(shadow.reportedVersion, 6);
+    expect(shadow.syncStatus, 'pending');
+    expect(shadow.diffKeys, <String>['report_interval']);
+    expect(shadow.pendingDesired, <String, dynamic>{'report_interval': 30});
+    expect(shadow.desiredUpdatedBy, 'operator');
+    expect(shadow.desiredUpdatedAt, DateTime.utc(2026, 11, 13, 2));
+    expect(shadow.reportedUpdatedAt, DateTime.utc(2026, 11, 13, 2, 1));
+  });
+
   test('单设备历史记录拼接正确路径与 limit 参数', () async {
     late http.Request captured;
     final client = ApiClient(
@@ -382,10 +430,7 @@ void main() {
       }),
     );
 
-    await client.fetchDevices(
-      token: 'token',
-      tags: const <String>['冷库', '常温'],
-    );
+    await client.fetchDevices(token: 'token', tags: const <String>['冷库', '常温']);
     // Uri.replace 把 List<String> 展开为重复参数，后端 Optional[List[str]] 才能收到多值
     expect(deviceRequest.url.queryParametersAll['tag'], <String>['冷库', '常温']);
 

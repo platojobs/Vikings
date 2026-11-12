@@ -106,6 +106,50 @@ class DeviceTag(Base):
     )
 
 
+class DeviceShadow(Base):
+    """设备影子（v1.36.0）：期望状态 vs 上报状态 + 版本号 + 同步状态机。
+
+    设计要点：
+    - `desired`：云端期望设备达到的状态（如 `{"led": "on", "fan_speed": 3}`），
+      由管理端写入；设备离线时也可写入，上线后由设备侧拉取并应用。
+    - `reported`：设备实际应用并上报的状态；当前由 REST reported 端点触发更新。
+    - `version`：每次 desired 变更 +1，设备侧据此判断是否是最新期望，避免乱序覆盖。
+    - `sync_status`：由 shadow_service.compute_sync_status 派生，不落库，避免双写不一致。
+      取 `device.status` 联合判断，区分 `pending` / `offline_pending` / `synced`。
+    - 一行一设备，`device_id` 主键；不主动建外键，与 device_tag 一致的解耦风格。
+    - 上限：单次最多 32 个键，键长 1~32，单值 JSON 序列化长度 ≤ 512；
+      值必须是字符串 / 数字 / 布尔 / null，避免任意嵌套导致同步状态无法解释。
+    """
+
+    __tablename__ = "device_shadow"
+
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    desired: Mapped[Dict[str, Any]] = mapped_column(
+        JSONPayload, nullable=False, default=dict, server_default="{}"
+    )
+    reported: Mapped[Dict[str, Any]] = mapped_column(
+        JSONPayload, nullable=False, default=dict, server_default="{}"
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    desired_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    desired_updated_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    reported_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 设备端上一次消费的 desired 版本号；0 表示尚未同步过任何版本
+    reported_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class SensorRecord(Base):
     """传感器时序数据表：设备每次唤醒上报一条。"""
 

@@ -196,6 +196,84 @@ class DeviceTagBatchResult(BaseModel):
     removed: int
 
 
+# ==================== 设备影子（v1.36.0）====================
+
+class DeviceShadowOut(BaseModel):
+    """设备影子视图：期望 vs 上报 + 同步状态 + 差异键列表。
+
+    - `sync_status`：synced（已同步）/ pending（在线但未同步）/ offline_pending（离线未同步）/
+      empty（当前没有期望，包括期望被全部清除）；
+    - `diff_keys`：desired 与 reported 不一致的键列表，方便前端直接高亮；
+    - `pending_desired`：待下发的期望子集（diff_keys 对应的 desired 值），设备端只需应用这部分。
+    """
+
+    device_id: str
+    desired: Dict[str, Any] = {}
+    reported: Dict[str, Any] = {}
+    version: int = 0
+    reported_version: int = 0
+    sync_status: str = "empty"
+    diff_keys: List[str] = []
+    pending_desired: Dict[str, Any] = {}
+    desired_updated_at: Optional[datetime] = None
+    desired_updated_by: Optional[str] = None
+    reported_updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class DeviceShadowDesiredUpdate(BaseModel):
+    """管理端写入期望状态：合并更新（merge），不是整对象替换。
+
+    - 值为 null 表示清除该键的期望；
+    - 单次最多 32 个键；
+    - 不允许空 patch（明确由调用方判断是否要清空全部）。
+    """
+
+    patch: Dict[str, Any] = Field(min_length=1, max_length=32)
+
+
+class DeviceShadowReportedUpdate(BaseModel):
+    """设备端上报实际状态：按字段 merge 到该设备已上报的字段集合。
+
+    - 上报时携带 `version`（设备刚应用的 desired 版本号），云端据此推进 `reported_version`；
+    - 单次最多 32 个键，值为字符串 / 数字 / 布尔 / null。
+    """
+
+    reported: Dict[str, Any] = Field(min_length=0, max_length=32)
+    version: int = Field(ge=0)
+
+
+class DeviceShadowDesiredBatchRequest(BaseModel):
+    """批量设置期望状态：复用 v1.35.0 标签筛选，逐设备返回真实结果。
+
+    - 设备选择：要么显式 device_ids（最多 200），要么标签 tags（多值「或」）+ group；
+      两者都提供时取交集，避免误操作；
+    - patch 语义与单台一致：merge + null 删除。
+    """
+
+    device_ids: Optional[List[str]] = Field(default=None, max_length=200)
+    tags: Optional[List[str]] = Field(default=None, max_length=16)
+    group: Optional[str] = Field(default=None, max_length=64)
+    patch: Dict[str, Any] = Field(min_length=1, max_length=32)
+
+
+class DeviceShadowBatchItem(BaseModel):
+    device_id: str
+    # updated / unchanged / not_found
+    status: str
+    version: int = 0
+    error: Optional[str] = None
+
+
+class DeviceShadowBatchResult(BaseModel):
+    results: List[DeviceShadowBatchItem]
+    matched: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    not_found: int = 0
+
+
 class MqttCredentialOut(BaseModel):
     """设备凭证签发/轮换结果：口令只在此响应出现一次。"""
 

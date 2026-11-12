@@ -20,6 +20,9 @@ import json
 import os
 import random
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import aiomqtt
 
@@ -40,6 +43,10 @@ class SimulatedDevice:
         self.voltage = args.voltage
         self.temperature = args.temperature
         self.firmware = args.firmware
+        self.api_url = args.api_url.rstrip("/")
+        self.api_token = args.api_token
+        self.api_timeout = args.api_timeout
+        self.reported_state = {}
         self.seq = 0
         self.topic_report = "device/{}/sensor/report".format(self.device_id)
         self.topic_status = "device/{}/status".format(self.device_id)
@@ -64,6 +71,7 @@ class SimulatedDevice:
         ) as client:
             for round_no in range(1, self.count + 1):
                 await self._publish_status(client, "online", "boot")
+                await self._sync_shadow()
                 await client.subscribe(self.topic_cmd, qos=1)
                 self.seq += 1
                 await self._publish_report(client)
@@ -77,6 +85,74 @@ class SimulatedDevice:
                 if round_no < self.count:
                     print("[{}] 休眠 {} 秒".format(self.device_id, self.interval))
                     await asyncio.sleep(self.interval)
+
+    def _api_request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """同步 HTTP 请求由 asyncio.to_thread 调用，避免阻塞 MQTT 事件循环。"""
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.api_url + path,
+            data=body,
+            method=method,
+            headers={
+                "Accept": "application/json",
+                "Authorization": "Bearer " + self.api_token,
+                **({"Content-Type": "application/json"} if body is not None else {}),
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.api_timeout) as response:
+                envelope = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(detail)
+                detail = str(parsed.get("detail") or parsed.get("message") or detail)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            raise RuntimeError("网关 HTTP {}: {}".format(exc.code, detail)) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError("网关连接失败: {}".format(exc)) from exc
+
+        if envelope.get("code") != 0:
+            raise RuntimeError("网关返回错误: {}".format(envelope.get("message", "未知错误")))
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError("网关响应缺少 data 对象")
+        return data
+
+    async def _sync_shadow(self) -> None:
+        """每次唤醒拉取并应用期望，再上报实际状态与已应用版本。"""
+        if not self.api_url:
+            return
+        path = "/api/devices/{}/shadow".format(urllib.parse.quote(self.device_id, safe=""))
+        try:
+            shadow = await asyncio.to_thread(self._api_request, "GET", path)
+            desired = shadow.get("desired", {})
+            if not isinstance(desired, dict):
+                raise RuntimeError("影子 desired 不是对象")
+            version = int(shadow.get("version", 0) or 0)
+            reported_version = int(shadow.get("reported_version", 0) or 0)
+            diff_keys = shadow.get("diff_keys", [])
+            if version == 0 and not desired:
+                return
+            if version <= reported_version and not diff_keys:
+                return
+
+            # 模拟器把当前期望视为已应用配置；真实硬件应在此写入自身配置存储。
+            self.reported_state = dict(desired)
+            await asyncio.to_thread(
+                self._api_request,
+                "POST",
+                path + "/reported",
+                {"reported": self.reported_state, "version": version},
+            )
+            print(
+                "[{}] 影子已同步 version={} keys={}".format(
+                    self.device_id, version, ",".join(sorted(desired)) or "-"
+                )
+            )
+        except Exception as exc:
+            print("[{}] 影子同步失败（继续本轮上报）: {}".format(self.device_id, exc))
 
     async def _publish_status(self, client, status: str, reason: str) -> None:
         payload = {
@@ -149,6 +225,17 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=24.0)
     parser.add_argument("--firmware", default="1.0.0")
     parser.add_argument(
+        "--api-url",
+        default=os.environ.get("GATEWAY_API_URL", ""),
+        help="可选：网关 REST 地址（如 http://127.0.0.1:8000），配置后每次唤醒同步影子",
+    )
+    parser.add_argument(
+        "--api-token",
+        default=os.environ.get("GATEWAY_API_TOKEN", ""),
+        help="影子 REST 同步所需的 operator/admin access token，也可用 GATEWAY_API_TOKEN",
+    )
+    parser.add_argument("--api-timeout", type=float, default=5.0, help="影子 REST 请求超时秒数")
+    parser.add_argument(
         "--username",
         default=os.environ.get("MQTT_DEVICE_USERNAME", ""),
         help="MQTT 用户名，默认等于 device-id（Broker ACL 用 %%u 绑定设备子树）",
@@ -159,6 +246,8 @@ def main() -> None:
         help="MQTT 口令，也可用 MQTT_DEVICE_PASSWORD 环境变量；Broker 已禁用匿名",
     )
     args = parser.parse_args()
+    if bool(args.api_url) != bool(args.api_token):
+        parser.error("影子同步必须同时提供 --api-url 与 --api-token（或对应 GATEWAY_API_* 环境变量）")
     if not args.password:
         parser.error(
             "必须提供设备 MQTT 口令（--password 或 MQTT_DEVICE_PASSWORD）。"

@@ -8,7 +8,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   batchUpdateDeviceTags,
+  batchUpdateShadowDesired,
   bulkCreateDevices,
+  clearDeviceShadowDesiredKeys,
   createDevice,
   deleteDevice,
   fetchDeviceCommands,
@@ -16,12 +18,14 @@ import {
   fetchDeviceGroups,
   fetchDeviceRecords,
   fetchDevices,
+  fetchDeviceShadow,
   fetchDeviceTags,
   issueDeviceCredential,
   revokeDeviceCredential,
   sendBulkCommand,
   sendCommand,
   updateDevice,
+  updateDeviceShadowDesired,
 } from '@/api/devices'
 import { BULK_DEVICE_LIMIT, bulkCommandLabel, summarizeBulkCommand } from '@/utils/batch'
 import { formatDateTime, formatMetric } from '@/utils/format'
@@ -51,6 +55,10 @@ import type {
   DeviceCreateBody,
   DeviceDetail,
   DeviceGroupStat,
+  DeviceShadow,
+  DeviceShadowBatchItem,
+  DeviceShadowBatchResult,
+  DeviceShadowValue,
   DeviceStatus,
   DeviceTagBatchItem,
   DeviceTagBatchResult,
@@ -508,6 +516,8 @@ const drawerLoading = ref(false)
 const detail = ref<DeviceDetail | null>(null)
 const historyRecords = ref<SensorRecord[]>([])
 const commands = ref<CommandItem[]>([])
+const shadow = ref<DeviceShadow | null>(null)
+const shadowPatchText = ref('{}')
 
 async function openDevice(row: Device, column?: { type?: string }): Promise<void> {
   if (column?.type === 'selection') return // 勾选不打开详情抽屉
@@ -516,21 +526,242 @@ async function openDevice(row: Device, column?: { type?: string }): Promise<void
   detail.value = null
   historyRecords.value = []
   commands.value = []
+  shadow.value = null
+  shadowPatchText.value = '{}'
 
   try {
-    const [deviceDetail, records, commandList] = await Promise.all([
+    const [deviceDetail, records, commandList, deviceShadow] = await Promise.all([
       fetchDeviceDetail(row.device_id),
       fetchDeviceRecords(row.device_id, { limit: 200 }),
       fetchDeviceCommands(row.device_id),
+      fetchDeviceShadow(row.device_id),
     ])
     detail.value = deviceDetail
     historyRecords.value = records
     commands.value = commandList
+    shadow.value = deviceShadow
+    shadowPatchText.value = JSON.stringify(deviceShadow.desired, null, 2)
   } catch {
     // 错误提示已由 HTTP 层统一处理
   } finally {
     drawerLoading.value = false
   }
+}
+
+// ==================== 设备影子（v1.36.0） ====================
+
+interface ShadowStateRow {
+  key: string
+  hasDesired: boolean
+  hasReported: boolean
+  desired: DeviceShadowValue | undefined
+  reported: DeviceShadowValue | undefined
+  pending: boolean
+}
+
+const shadowRows = computed<ShadowStateRow[]>(() => {
+  const current = shadow.value
+  if (!current) return []
+  const keys = Array.from(
+    new Set([...Object.keys(current.desired), ...Object.keys(current.reported)]),
+  ).sort()
+  return keys.map((key) => ({
+    key,
+    hasDesired: Object.prototype.hasOwnProperty.call(current.desired, key),
+    hasReported: Object.prototype.hasOwnProperty.call(current.reported, key),
+    desired: current.desired[key],
+    reported: current.reported[key],
+    pending: current.diff_keys.includes(key),
+  }))
+})
+const shadowDesiredRows = computed(() => shadowRows.value.filter((row) => row.hasDesired))
+const shadowReportedRows = computed(() => shadowRows.value.filter((row) => row.hasReported))
+const shadowDiffRows = computed(() => shadowRows.value.filter((row) => row.pending))
+const shadowRefreshing = ref(false)
+const shadowSaving = ref(false)
+
+const SHADOW_SYNC_LABELS: Record<DeviceShadow['sync_status'], string> = {
+  empty: '未设期望',
+  synced: '已同步',
+  pending: '待同步',
+  offline_pending: '离线待同步',
+}
+
+function shadowSyncLabel(status: DeviceShadow['sync_status']): string {
+  return SHADOW_SYNC_LABELS[status]
+}
+
+function shadowSyncTagType(
+  status: DeviceShadow['sync_status'],
+): 'success' | 'info' | 'warning' | 'danger' {
+  if (status === 'synced') return 'success'
+  if (status === 'pending') return 'warning'
+  if (status === 'offline_pending') return 'danger'
+  return 'info'
+}
+
+function formatShadowValue(value: DeviceShadowValue | undefined): string {
+  if (value === undefined) return '未上报'
+  if (value === null) return 'null'
+  return typeof value === 'string' ? value : JSON.stringify(value)
+}
+
+/** 管理端只接受扁平 merge patch；嵌套对象与数组在提交前直接给出可读提示 */
+function parseShadowPatch(text: string): Record<string, DeviceShadowValue> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error('期望状态必须是合法 JSON 对象')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('期望状态必须是 JSON 对象，不能是数组或标量')
+  }
+  const entries = Object.entries(parsed)
+  if (entries.length === 0) throw new Error('请至少填写一个期望键；清除键请使用 null 值')
+  if (entries.length > 32) throw new Error('单次最多设置 32 个期望键')
+  for (const [key, value] of entries) {
+    if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
+      throw new Error(`键「${key}」的值仅支持字符串、数字、布尔或 null`)
+    }
+  }
+  return parsed as Record<string, DeviceShadowValue>
+}
+
+async function refreshShadow(): Promise<void> {
+  const deviceId = detail.value?.device_id
+  if (!deviceId || shadowRefreshing.value) return
+  shadowRefreshing.value = true
+  try {
+    shadow.value = await fetchDeviceShadow(deviceId)
+    shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    shadowRefreshing.value = false
+  }
+}
+
+async function submitShadowDesired(): Promise<void> {
+  if (!detail.value) return
+  let patch: Record<string, DeviceShadowValue>
+  try {
+    patch = parseShadowPatch(shadowPatchText.value)
+  } catch (error) {
+    ElMessage.warning((error as Error).message)
+    return
+  }
+
+  const previousVersion = shadow.value?.version ?? 0
+  shadowSaving.value = true
+  try {
+    shadow.value = await updateDeviceShadowDesired(detail.value.device_id, patch)
+    shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    ElMessage.success(
+      shadow.value.version === previousVersion
+        ? '期望状态无变化'
+        : `期望状态已保存（版本 v${shadow.value.version}）`,
+    )
+  } catch {
+    // 错误提示已由 HTTP 层统一处理（包含键数量与值类型校验原因）
+  } finally {
+    shadowSaving.value = false
+  }
+}
+
+async function clearShadowDesiredKey(key: string): Promise<void> {
+  if (!detail.value) return
+  try {
+    await ElMessageBox.confirm(
+      `确认清除期望键「${key}」？设备下次同步后将不再应用该项期望。`,
+      '清除期望状态',
+      { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  shadowSaving.value = true
+  try {
+    shadow.value = await clearDeviceShadowDesiredKeys(detail.value.device_id, [key])
+    shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    ElMessage.success(`已清除期望键「${key}」`)
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    shadowSaving.value = false
+  }
+}
+
+const batchShadowVisible = ref(false)
+const batchShadowSaving = ref(false)
+const batchShadowPatchText = ref('{}')
+const batchShadowResult = ref<DeviceShadowBatchResult | null>(null)
+
+function openBatchShadow(): void {
+  if (selectedCount.value === 0) {
+    ElMessage.warning('请先勾选需要设置期望状态的设备')
+    return
+  }
+  batchShadowPatchText.value = '{\n  "report_interval": 30\n}'
+  batchShadowResult.value = null
+  batchShadowVisible.value = true
+}
+
+async function submitBatchShadow(): Promise<void> {
+  if (selectedCount.value === 0) return
+  let patch: Record<string, DeviceShadowValue>
+  try {
+    patch = parseShadowPatch(batchShadowPatchText.value)
+  } catch (error) {
+    ElMessage.warning((error as Error).message)
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将合并写入 ${selectedCount.value} 台设备的期望状态；离线设备会在上线后同步。`,
+      '批量设置期望',
+      { type: 'warning', confirmButtonText: '确认写入', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+
+  batchShadowSaving.value = true
+  try {
+    const result = await batchUpdateShadowDesired({
+      device_ids: selectedDevices.value.map((device) => device.device_id),
+      patch,
+    })
+    batchShadowResult.value = result
+    if (result.not_found > 0 || result.matched === 0) {
+      ElMessage.warning(
+        `批量期望部分完成：更新 ${result.updated} 台，无变化 ${result.unchanged} 台，不存在 ${result.not_found} 台`,
+      )
+    } else {
+      ElMessage.success(
+        `批量期望完成：更新 ${result.updated} 台，无变化 ${result.unchanged} 台`,
+      )
+    }
+    if (detail.value && selectedMap.value.has(detail.value.device_id)) {
+      await refreshShadow()
+    }
+  } catch {
+    // 错误提示已由 HTTP 层统一处理
+  } finally {
+    batchShadowSaving.value = false
+  }
+}
+
+function batchShadowStatusLabel(status: DeviceShadowBatchItem['status']): string {
+  return { updated: '已更新', unchanged: '无变化', not_found: '设备不存在' }[status]
+}
+
+function batchShadowStatusType(
+  status: DeviceShadowBatchItem['status'],
+): 'success' | 'info' | 'danger' {
+  if (status === 'updated') return 'success'
+  if (status === 'unchanged') return 'info'
+  return 'danger'
 }
 
 // ==================== MQTT 凭证 ====================
@@ -932,6 +1163,14 @@ onUnmounted(() => {
           <el-button plain :disabled="selectedCount === 0" @click="openBatchCommand">
             批量指令{{ selectedCount ? `（${selectedCount}）` : '' }}
           </el-button>
+          <el-button
+            plain
+            :disabled="selectedCount === 0"
+            data-test="batch-shadow-button"
+            @click="openBatchShadow"
+          >
+            批量期望{{ selectedCount ? `（${selectedCount}）` : '' }}
+          </el-button>
           <el-button plain :disabled="selectedCount === 0" @click="goBatchOta">
             批量 OTA{{ selectedCount ? `（${selectedCount}）` : '' }}
           </el-button>
@@ -1072,6 +1311,145 @@ onUnmounted(() => {
             {{ detail.latest ? `${detail.latest.rssi} dBm` : '—' }}
           </el-descriptions-item>
         </el-descriptions>
+
+        <section v-if="detail" class="drawer-section shadow-section" data-test="device-shadow">
+          <div class="section-header">
+            <h3>设备影子</h3>
+            <el-tag v-if="shadow" :type="shadowSyncTagType(shadow.sync_status)" size="small">
+              {{ shadowSyncLabel(shadow.sync_status) }}
+            </el-tag>
+            <span class="section-hint">期望状态与设备实际上报</span>
+            <div class="section-actions shadow-header-actions">
+              <el-button size="small" :loading="shadowRefreshing" @click="refreshShadow">
+                刷新
+              </el-button>
+            </div>
+          </div>
+
+          <template v-if="shadow">
+            <div class="shadow-meta">
+              <span>期望版本 <strong>v{{ shadow.version }}</strong></span>
+              <span>设备已应用 <strong>v{{ shadow.reported_version }}</strong></span>
+              <span>待同步 <strong>{{ shadow.diff_keys.length }}</strong> 项</span>
+            </div>
+
+            <div class="shadow-grid">
+              <div class="shadow-panel">
+                <div class="shadow-panel-title">
+                  <span>期望状态</span>
+                  <small>云端 merge 下发</small>
+                </div>
+                <div v-if="shadowDesiredRows.length" class="shadow-state-list">
+                  <div
+                    v-for="row in shadowDesiredRows"
+                    :key="row.key"
+                    class="shadow-state-row"
+                    :class="{ 'is-pending': row.pending }"
+                  >
+                    <code class="shadow-state-key">{{ row.key }}</code>
+                    <span class="shadow-state-value" :title="formatShadowValue(row.desired)">
+                      {{ formatShadowValue(row.desired) }}
+                    </span>
+                    <el-button
+                      v-if="canWrite"
+                      link
+                      type="danger"
+                      size="small"
+                      :disabled="shadowSaving"
+                      @click="clearShadowDesiredKey(row.key)"
+                    >
+                      清除
+                    </el-button>
+                  </div>
+                </div>
+                <div v-else class="shadow-empty">暂无期望状态</div>
+              </div>
+
+              <div class="shadow-panel">
+                <div class="shadow-panel-title">
+                  <span>实际上报</span>
+                  <small>设备应用后的状态</small>
+                </div>
+                <div v-if="shadowReportedRows.length" class="shadow-state-list">
+                  <div
+                    v-for="row in shadowReportedRows"
+                    :key="row.key"
+                    class="shadow-state-row"
+                    :class="{ 'is-pending': row.pending }"
+                  >
+                    <code class="shadow-state-key">{{ row.key }}</code>
+                    <span class="shadow-state-value" :title="formatShadowValue(row.reported)">
+                      {{ formatShadowValue(row.reported) }}
+                    </span>
+                  </div>
+                </div>
+                <div v-else class="shadow-empty">设备尚未上报</div>
+              </div>
+
+              <div class="shadow-panel shadow-diff-panel">
+                <div class="shadow-panel-title">
+                  <span>待同步差异</span>
+                  <small>{{ shadow.diff_keys.length }} 个键</small>
+                </div>
+                <div v-if="shadowDiffRows.length" class="shadow-state-list">
+                  <div v-for="row in shadowDiffRows" :key="row.key" class="shadow-diff-row">
+                    <code class="shadow-state-key">{{ row.key }}</code>
+                    <div class="shadow-diff-values">
+                      <span>期望：{{ formatShadowValue(row.desired) }}</span>
+                      <span>实际：{{ formatShadowValue(row.reported) }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="shadow-empty">期望与上报一致</div>
+              </div>
+            </div>
+
+            <div class="shadow-timestamps">
+              <span>
+                期望更新：{{ formatDateTime(shadow.desired_updated_at) }}
+                <template v-if="shadow.desired_updated_by"> · {{ shadow.desired_updated_by }}</template>
+              </span>
+              <span>上报更新：{{ formatDateTime(shadow.reported_updated_at) }}</span>
+            </div>
+
+            <div v-if="canWrite" class="shadow-editor">
+              <el-input
+                v-model="shadowPatchText"
+                type="textarea"
+                :rows="5"
+                resize="vertical"
+                spellcheck="false"
+                data-test="shadow-patch-input"
+                placeholder='{"report_interval":30,"led":"on"}'
+              />
+              <div class="shadow-editor-actions">
+                <span class="section-hint">merge 语义：只修改列出的键，值为 null 表示清除</span>
+                <el-button
+                  type="primary"
+                  :loading="shadowSaving"
+                  :disabled="!shadowPatchText.trim()"
+                  data-test="shadow-save-button"
+                  @click="submitShadowDesired"
+                >
+                  保存期望
+                </el-button>
+              </div>
+            </div>
+            <el-alert
+              v-else
+              title="当前账号为只读角色，可查看期望、上报与差异，但不能修改。"
+              type="info"
+              :closable="false"
+              show-icon
+              class="readonly-tip"
+            />
+          </template>
+          <el-empty
+            v-else-if="!drawerLoading"
+            description="影子加载失败，请点击刷新重试"
+            :image-size="60"
+          />
+        </section>
 
         <section v-if="detail" class="drawer-section credential-section" data-test="device-credential">
           <div class="section-header">
@@ -1504,6 +1882,73 @@ onUnmounted(() => {
       </template>
     </el-dialog>
 
+    <!-- v1.36.0 批量期望：沿用跨页选择集，逐台返回更新/无变化/不存在 -->
+    <el-dialog v-model="batchShadowVisible" title="批量设置期望状态" width="720px">
+      <template v-if="!batchShadowResult">
+        <el-alert
+          :title="`已选择 ${selectedCount} 台设备；可先按分组或标签筛选，再跨页勾选`"
+          type="info"
+          :closable="false"
+          show-icon
+          class="batch-shadow-tip"
+        />
+        <el-input
+          v-model="batchShadowPatchText"
+          type="textarea"
+          :rows="8"
+          resize="vertical"
+          spellcheck="false"
+          class="shadow-patch-input"
+          data-test="batch-shadow-patch-input"
+        />
+        <p class="section-hint">
+          对所有目标设备应用同一个 merge patch；未列出的键保持不变，null 表示清除该键。
+          离线设备不会立即生效，上线后由设备主动拉取并上报。
+        </p>
+      </template>
+      <template v-else>
+        <el-alert
+          :type="batchShadowResult.not_found || !batchShadowResult.matched ? 'warning' : 'success'"
+          :title="`匹配 ${batchShadowResult.matched} 台 · 已更新 ${batchShadowResult.updated} 台 · 无变化 ${batchShadowResult.unchanged} 台 · 不存在 ${batchShadowResult.not_found} 台`"
+          :closable="false"
+          show-icon
+          class="batch-shadow-tip"
+          data-test="batch-shadow-summary"
+        />
+        <el-table :data="batchShadowResult.results" size="small" row-key="device_id" max-height="320">
+          <el-table-column prop="device_id" label="设备 ID" min-width="160" />
+          <el-table-column label="结果" width="110">
+            <template #default="{ row }">
+              <el-tag :type="batchShadowStatusType(row.status)" size="small">
+                {{ batchShadowStatusLabel(row.status) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="期望版本" width="100">
+            <template #default="{ row }">v{{ row.version }}</template>
+          </el-table-column>
+          <el-table-column label="原因" min-width="180">
+            <template #default="{ row }">{{ row.error || '—' }}</template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template #footer>
+        <el-button @click="batchShadowVisible = false">
+          {{ batchShadowResult ? '关闭' : '取消' }}
+        </el-button>
+        <el-button
+          v-if="!batchShadowResult"
+          type="primary"
+          :loading="batchShadowSaving"
+          :disabled="selectedCount === 0 || !batchShadowPatchText.trim()"
+          data-test="batch-shadow-submit"
+          @click="submitBatchShadow"
+        >
+          写入期望（{{ selectedCount }} 台）
+        </el-button>
+      </template>
+    </el-dialog>
+
     <!-- v1.35.0 标签编辑：单个与批量复用同一弹窗；结果逐台展示部分失败 -->
     <el-dialog v-model="tagDialogVisible" :title="tagDialogTitle" width="760px" destroy-on-close>
       <el-alert
@@ -1791,6 +2236,154 @@ onUnmounted(() => {
   width: 100%;
 }
 
+.shadow-header-actions {
+  margin-left: auto;
+}
+
+.shadow-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 10px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.shadow-meta strong {
+  color: #334155;
+  font-weight: 600;
+}
+
+.shadow-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.shadow-panel {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.shadow-diff-panel {
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
+.shadow-panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shadow-panel-title small {
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.shadow-state-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.shadow-state-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 3px 5px;
+  border-radius: 4px;
+}
+
+.shadow-state-row.is-pending {
+  background: #fef3c7;
+}
+
+.shadow-state-key {
+  flex: 0 0 auto;
+  max-width: 45%;
+  overflow: hidden;
+  color: #475569;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+
+.shadow-state-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #0f172a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shadow-diff-row {
+  padding: 4px 5px;
+  border-radius: 4px;
+  background: #fef3c7;
+}
+
+.shadow-diff-values {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 3px;
+  color: #92400e;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.shadow-empty {
+  padding: 20px 0;
+  color: #94a3b8;
+  font-size: 12px;
+  text-align: center;
+}
+
+.shadow-timestamps {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin: 8px 0 12px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.shadow-editor :deep(.el-textarea__inner),
+.shadow-patch-input :deep(.el-textarea__inner) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.shadow-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.batch-shadow-tip {
+  margin-bottom: 12px;
+}
+
 .batch-command-form {
   margin-top: 12px;
 }
@@ -1809,6 +2402,14 @@ onUnmounted(() => {
 @media (max-width: 768px) {
   .keyword-input {
     width: 100%;
+  }
+
+  .shadow-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .shadow-editor-actions {
+    align-items: flex-end;
   }
 
   .total-hint {

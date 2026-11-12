@@ -402,6 +402,41 @@ export interface DeviceTagBatchResult {
 export const TAG_MAX_LENGTH = 32
 export const TAG_MAX_PER_DEVICE = 16
 
+// ==================== 设备影子（v1.36.0） ====================
+
+export type DeviceShadowValue = string | number | boolean | null
+export type DeviceShadowSyncStatus = 'empty' | 'synced' | 'pending' | 'offline_pending'
+
+/** 设备影子：期望状态、设备上报与服务端计算的差异/同步状态 */
+export interface DeviceShadow {
+  device_id: string
+  desired: Record<string, DeviceShadowValue>
+  reported: Record<string, DeviceShadowValue>
+  version: number
+  reported_version: number
+  sync_status: DeviceShadowSyncStatus
+  diff_keys: string[]
+  pending_desired: Record<string, DeviceShadowValue>
+  desired_updated_at: string | null
+  desired_updated_by: string | null
+  reported_updated_at: string | null
+}
+
+export interface DeviceShadowBatchItem {
+  device_id: string
+  status: 'updated' | 'unchanged' | 'not_found'
+  version: number
+  error: string | null
+}
+
+export interface DeviceShadowBatchResult {
+  results: DeviceShadowBatchItem[]
+  matched: number
+  updated: number
+  unchanged: number
+  not_found: number
+}
+
 // ==================== 阈值在线配置（v1.33.0 兼容） ====================
 
 /** 单项阈值的生效值与来源（override=在线覆盖 / env=环境变量） */
@@ -457,6 +492,8 @@ export type AuditAction =
   | 'alert_rule.delete'
   | 'alert_rule.restore_defaults'
   | 'device.tags_update'
+  | 'device.shadow_desired_update'
+  | 'device.shadow_desired_batch'
 
 export interface AuditLog {
   id: number
