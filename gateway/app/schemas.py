@@ -1143,3 +1143,83 @@ class SystemStatusOut(BaseModel):
     scheduler: SchedulerStatusOut
     notify: NotifyStatusOut
     generated_at: datetime
+
+
+# ==================== 维护窗口（v1.39.0） ====================
+
+
+class MaintenanceRecurrence(BaseModel):
+    """周期窗口：UTC 周几 + HH:MM + 时长；weekday 0=周一、6=周日。
+
+    具体范围由服务层校验并返回 400（而不是框架 422），保证错误文案统一可读。
+    """
+
+    weekday: int
+    start: str
+    duration_minutes: int = Field(ge=1, le=7 * 24 * 60)
+
+
+class MaintenanceWindowCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    reason: Optional[str] = Field(default=None, max_length=500)
+    # 复用告警规则条件树；null 表示全部设备（显式全局）
+    scope: Optional[Dict[str, Any]] = None
+    mode: Literal["once", "weekly"] = "once"
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    recurrence: Optional[MaintenanceRecurrence] = None
+
+
+class MaintenanceWindowUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    reason: Optional[str] = Field(default=None, max_length=500)
+    scope: Optional[Dict[str, Any]] = None
+    mode: Optional[Literal["once", "weekly"]] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    recurrence: Optional[MaintenanceRecurrence] = None
+
+
+class MaintenanceWindowOut(BaseModel):
+    window_id: str
+    name: str
+    reason: Optional[str] = None
+    scope: Optional[Dict[str, Any]] = None
+    mode: str
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    recurrence: Optional[Dict[str, Any]] = None
+    status: str
+    active: bool
+    current_start: Optional[datetime] = None
+    current_end: Optional[datetime] = None
+    next_start: Optional[datetime] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MaintenanceSummaryOut(BaseModel):
+    window_id: str
+    occurrence_start: datetime
+    occurrence_end: datetime
+    suppressed_count: int
+    device_count: int
+    critical_suppressed: int
+    devices: List[str]
+    metrics: Dict[str, int]
+    levels: Dict[str, int]
+    ended_early: bool
+    created_at: datetime
+
+
+class MaintenanceSuppressionOut(BaseModel):
+    window_id: str
+    occurrence_start: datetime
+    device_id: str
+    metric: str
+    level: str
+    value: float
+    threshold: float
+    rule_name: Optional[str] = None
+    created_at: datetime

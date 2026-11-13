@@ -958,3 +958,67 @@ export interface SystemAlertMessage {
   aiGenerated: boolean
   ts: number
 }
+
+// ==================== 维护窗口（v1.39.0） ====================
+
+/** 周期窗口按 UTC 计算：weekday 0=周一、6=周日，start 为 HH:MM */
+export interface MaintenanceRecurrence {
+  weekday: number
+  start: string
+  duration_minutes: number
+}
+
+export interface MaintenanceWindow {
+  window_id: string
+  name: string
+  reason?: string | null
+  scope?: AlertRuleConditionNode | null
+  mode: 'once' | 'weekly'
+  starts_at?: string | null
+  ends_at?: string | null
+  recurrence?: MaintenanceRecurrence | null
+  status: 'scheduled' | 'ended'
+  active: boolean
+  current_start?: string | null
+  current_end?: string | null
+  next_start?: string | null
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
+export interface MaintenanceWindowCreateBody {
+  name: string
+  reason?: string | null
+  scope?: AlertRuleConditionNode | null
+  mode: 'once' | 'weekly'
+  starts_at?: string | null
+  ends_at?: string | null
+  recurrence?: MaintenanceRecurrence | null
+}
+
+export interface MaintenanceSummary {
+  window_id: string
+  occurrence_start: string
+  occurrence_end: string
+  suppressed_count: number
+  device_count: number
+  critical_suppressed: number
+  devices: string[]
+  metrics: Record<string, number>
+  levels: Record<string, number>
+  ended_early: boolean
+  created_at: string
+}
+
+export interface MaintenanceSuppression {
+  window_id: string
+  occurrence_start: string
+  device_id: string
+  metric: string
+  level: AlertLevel
+  value: number
+  threshold: number
+  rule_name?: string | null
+  created_at: string
+}

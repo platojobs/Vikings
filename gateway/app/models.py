@@ -570,6 +570,96 @@ class NotificationDelivery(Base):
     )
 
 
+class MaintenanceWindow(Base):
+    """计划维护窗口（v1.39.0）：时间范围内按条件树范围静音设备告警。
+
+    - `scope` 复用告警规则条件树（group/device/tag，all/any 嵌套）；
+      `None` 表示全部设备（显式全局，不用空树表达）；
+    - `mode=once` 用 `starts_at`/`ends_at`；`mode=weekly` 用 `recurrence`
+      （UTC 周几 + HH:MM + 时长），避免本地时区/DST 带来的边界漂移；
+    - 时间边界为半开区间 `[start, end)`，相邻窗口不会在边界重复计数；
+    - `status=ended` 表示已结束（含手工提前结束），不再匹配任何上报。
+    """
+
+    __tablename__ = "maintenance_window"
+    __table_args__ = (
+        Index("idx_maintenance_status", "status"),
+        Index("idx_maintenance_once_end", "mode", "ends_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    window_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    scope: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONPayload, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="once")
+    starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    recurrence: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONPayload, nullable=True)
+    # scheduled / ended；进行中由时间推导，不单独落库，避免调度器停摆导致状态卡死
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled", server_default="scheduled")
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system", server_default="system")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MaintenanceSuppression(Base):
+    """维护窗口内被抑制的上报（不是告警，不进入告警列表/统计/SLA）。
+
+    每条记录对应「一次本会触发告警的上报」：窗口 + 设备 + 指标 + 级别 + 实际值。
+    同一份上报命中多条规则时按指标各记一条，和「每指标一条告警」口径一致。
+    """
+
+    __tablename__ = "maintenance_suppression"
+    __table_args__ = (
+        Index("idx_maintenance_supp_window", "window_id", "occurrence_start", "created_at"),
+        Index("idx_maintenance_supp_device", "device_id", "created_at"),
+        Index("idx_maintenance_supp_metric", "metric", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    window_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurrence_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(32), nullable=False)
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    value: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    threshold: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    rule_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MaintenanceSummary(Base):
+    """维护窗口结束汇总：每个窗口的每次发生（once 一次 / weekly 每周一次）一条。"""
+
+    __tablename__ = "maintenance_summary"
+    __table_args__ = (
+        UniqueConstraint("window_id", "occurrence_start", name="uq_maintenance_summary_occurrence"),
+        Index("idx_maintenance_summary_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    window_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurrence_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    occurrence_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    suppressed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    device_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    critical_suppressed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    devices: Mapped[List[str]] = mapped_column(JSONPayload, nullable=False, default=list)
+    metrics: Mapped[Dict[str, int]] = mapped_column(JSONPayload, nullable=False, default=dict)
+    levels: Mapped[Dict[str, int]] = mapped_column(JSONPayload, nullable=False, default=dict)
+    ended_early: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class AppUser(Base):
     """后台账号表：角色驱动菜单与接口权限，口令只存 PBKDF2 哈希。"""
 

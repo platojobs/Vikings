@@ -15,6 +15,7 @@ from app.background_tasks import (
 )
 from app.config import get_settings
 from app.services.sla_service import sweep_escalations
+from app.services.maintenance_service import sweep_windows
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -45,14 +46,22 @@ class BackgroundScheduler:
                     settings.sla_sweep_interval_seconds,
                 )
             ),
+            asyncio.create_task(
+                self._loop(
+                    "维护窗口汇总",
+                    sweep_windows,
+                    settings.maintenance_sweep_interval_seconds,
+                )
+            ),
         ]
         logger.info(
-            "后台调度器启动：离线巡检 %ds / 指令超时巡检 %ds / 数据清理 %ds / 通知重试 %ds / SLA 巡检 %ds",
+            "后台调度器启动：离线巡检 %ds / 指令超时巡检 %ds / 数据清理 %ds / 通知重试 %ds / SLA 巡检 %ds / 维护窗口 %ds",
             settings.offline_sweep_interval_seconds,
             settings.command_sweep_interval_seconds,
             settings.data_purge_interval_seconds,
             settings.notification_retry_interval_seconds,
             settings.sla_sweep_interval_seconds,
+            settings.maintenance_sweep_interval_seconds,
         )
 
     async def stop(self) -> None:

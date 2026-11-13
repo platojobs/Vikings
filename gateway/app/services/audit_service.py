@@ -50,6 +50,10 @@ ACTION_DEVICE_DELETE = "device.delete"
 ACTION_DEVICE_BULK = "device.bulk_create"
 ACTION_DEVICE_CREDENTIAL = "device.credential_issue"
 ACTION_DEVICE_CREDENTIAL_REVOKE = "device.credential_revoke"
+# v1.39.0：维护窗口（创建 / 修改 / 提前结束）
+ACTION_MAINTENANCE_CREATE = "maintenance.create"
+ACTION_MAINTENANCE_UPDATE = "maintenance.update"
+ACTION_MAINTENANCE_END = "maintenance.end"
 # v1.30.0 CSV 导出：记录筛选与行数，不记录导出内容
 ACTION_EXPORT_RECORDS = "export.records"
 ACTION_EXPORT_ALERTS = "export.alerts"

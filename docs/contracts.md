@@ -843,6 +843,33 @@ v1.38.0 的迁移 `0013_rule_conditions` 只新增 `alert_rule.conditions` 列�
 的判定结果逐条不变（证据：`gateway/tests/test_rule_conditions.py::test_legacy_scope_forms_match_identically_after_backfill`
 与 `scripts/verify_conditions_v138.py`）。
 
+### 3.4.1 维护窗口（v1.39.0）
+
+维护窗口在**告警入库之前**拦截：窗口内命中规则的上报只写 `maintenance_suppression`，
+不创建 `device_alert`，因此不发通知、不占 SLA、不进入列表/统计/角标。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/maintenance/windows` | 登录可读 | 列表；`active` / `current_start` / `next_start` 按当前时间推导 |
+| POST | `/api/maintenance/windows` | admin | 新增；非法范围/时间 400 |
+| PATCH | `/api/maintenance/windows/{windowId}` | admin | 修改未结束窗口（部分字段） |
+| POST | `/api/maintenance/windows/{windowId}/end` | admin | 提前结束，立即恢复告警并生成汇总 |
+| GET | `/api/maintenance/windows/{windowId}/summaries` | 登录可读 | 每次窗口发生的汇总（含 `critical_suppressed`） |
+| GET | `/api/maintenance/windows/{windowId}/suppressions` | 登录可读 | 被抑制上报记录，`page` / `pageSize` |
+
+**语义**
+
+- `scope` 复用告警规则条件树（`all`/`any` 嵌套，叶子 `group`/`device`/`tag`）；`scope=null`
+  表示全部设备（显式全局，不用空树表达）。
+- `mode=once`：`starts_at`/`ends_at`；`mode=weekly`：
+  `recurrence={weekday, start:"HH:MM", duration_minutes}`，`weekday` 0=周一、6=周日。
+- 时间一律 **UTC**，区间 **`[start, end)`**；相邻窗口不在边界重复计数。周期窗口
+  跨天时延续到次日，`next_start` 在窗口内指向下一个周期。
+- 重叠窗口都可命中，但同一上报只记到最早创建（id 最小）的窗口，汇总不重复计数。
+- 窗口开始前已存在的 open 告警不受影响；窗口只拦截新的判定结果。
+- 汇总只落站内（窗口 `summaries` 接口 + Web 展示），不额外发通知：计划内维护的
+  汇总属于事后复盘信息，发通知会制造噪音；critical 压制条数在汇总中单独字段呈现。
+
 ### 3.5 审计日志
 
 | 方法 | 路径 | 说明 |

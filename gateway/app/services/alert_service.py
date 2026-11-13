@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.models import DeviceAlert
 from app.rules import evaluate
 from app.schemas import SensorReportMessage
-from app.services import sla_service, tag_service
+from app.services import maintenance_service, sla_service, tag_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -56,6 +56,24 @@ async def handle_report_alerts(
         report, device_id=report.device_id, group_name=group_name, tag_names=tag_names
     )
     if not hits:
+        return []
+
+    # v1.39.0：维护窗口在「告警入库之前」拦截。命中的上报只写抑制记录，
+    # 不创建 DeviceAlert → 不会发通知、不占 SLA、不进入列表/统计/角标。
+    window, occurrence_start = await maintenance_service.active_window(
+        session,
+        device_id=report.device_id,
+        group_name=group_name,
+        tag_names=tag_names,
+    )
+    if window is not None:
+        await maintenance_service.record_suppressions(
+            session, window, occurrence_start, report.device_id, hits
+        )
+        logger.info(
+            "维护窗口抑制告警 device=%s window=%s metrics=%s",
+            report.device_id, window.window_id, [hit["metric"] for hit in hits],
+        )
         return []
 
     # 先剔除被抑制的指标，再并发生成文案（LLM 是网络 IO，串行会拖慢消费）

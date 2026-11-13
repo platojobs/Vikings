@@ -22,6 +22,7 @@ from app.api.routes import (
     devices,
     exports,
     health,
+    maintenance,
     notifications,
     ota,
     rules,
@@ -119,6 +120,7 @@ app.include_router(system.router)
 app.include_router(notifications.router)
 app.include_router(exports.router)
 app.include_router(shadows.router)
+app.include_router(maintenance.router)
 app.include_router(health.router)
 app.include_router(health.metrics_router)
 

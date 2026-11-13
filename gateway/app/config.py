@@ -128,6 +128,8 @@ class Settings(BaseSettings):
     notification_retry_interval_seconds: int = 5
     # SLA 超时升级巡检周期（秒）：扫描已超时未处理告警并按配置逐级升级
     sla_sweep_interval_seconds: int = 30
+    # v1.39.0：维护窗口巡检（只为已结束的发生补汇总并结束一次性窗口）
+    maintenance_sweep_interval_seconds: int = 30
 
     # ---- 告警 Webhook 外推（空则关闭）----
     # 产生 critical 告警时向该 URL POST JSON，可用于对接钉钉/飞书/企业微信机器人

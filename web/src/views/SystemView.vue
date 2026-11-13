@@ -31,6 +31,13 @@ import {
   updateNotificationRule,
 } from '@/api/notifications'
 import {
+  createMaintenanceWindow,
+  endMaintenanceWindow,
+  fetchMaintenanceSummaries,
+  fetchMaintenanceSuppressions,
+  fetchMaintenanceWindows,
+} from '@/api/maintenance'
+import {
   createAlertRule,
   deleteAlertRule,
   fetchAlertRuleHistory,
@@ -54,6 +61,9 @@ import type {
   AlertRuleConditionNode,
   AlertRuleCreateBody,
   AlertRuleHistoryEntry,
+  MaintenanceSuppression,
+  MaintenanceSummary,
+  MaintenanceWindow,
   NotificationConfig,
   NotificationConfigPatch,
   NotificationRule,
@@ -787,12 +797,173 @@ function changeRows(entry: AlertRuleHistoryEntry): Array<{
   }))
 }
 
+// v1.39.0：维护窗口——窗口内命中规则的上报只记抑制记录，不入告警/通知/SLA
+const maintenanceWindows = ref<MaintenanceWindow[]>([])
+const maintenanceLoading = ref(false)
+const mwDialogVisible = ref(false)
+const mwSaving = ref(false)
+const mwForm = reactive({
+  name: '',
+  reason: '',
+  mode: 'once' as 'once' | 'weekly',
+  starts_at: '',
+  ends_at: '',
+  weekday: 6,
+  start: '18:00',
+  duration_minutes: 120,
+  scope_mode: 'global' as 'global' | 'conditions',
+  conditions: null as AlertRuleConditionNode | null,
+})
+
+const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+
+const mwSummaryVisible = ref(false)
+const mwSummaryWindow = ref<MaintenanceWindow | null>(null)
+const mwSummaries = ref<MaintenanceSummary[]>([])
+const mwSuppressionVisible = ref(false)
+const mwSuppressionWindow = ref<MaintenanceWindow | null>(null)
+const mwSuppressions = ref<MaintenanceSuppression[]>([])
+
+async function loadMaintenanceWindows(): Promise<void> {
+  maintenanceLoading.value = true
+  try {
+    maintenanceWindows.value = await fetchMaintenanceWindows()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '维护窗口加载失败')
+  } finally {
+    maintenanceLoading.value = false
+  }
+}
+
+function openCreateMaintenance(): void {
+  mwForm.name = ''
+  mwForm.reason = ''
+  mwForm.mode = 'once'
+  mwForm.starts_at = ''
+  mwForm.ends_at = ''
+  mwForm.weekday = 6
+  mwForm.start = '18:00'
+  mwForm.duration_minutes = 120
+  mwForm.scope_mode = 'global'
+  mwForm.conditions = emptyConditions()
+  mwDialogVisible.value = true
+  void loadRuleScopeOptions()
+}
+
+function mwScopeText(row: MaintenanceWindow): string {
+  return row.scope ? describeConditions(row.scope) : '全部设备'
+}
+
+function mwTimeText(row: MaintenanceWindow): string {
+  if (row.mode === 'weekly') {
+    const rec = row.recurrence
+    if (!rec) return '—'
+    return `每周${WEEKDAY_LABELS[rec.weekday] ?? rec.weekday} ${rec.start}（UTC）· ${rec.duration_minutes} 分钟`
+  }
+  const start = row.starts_at ? formatDateTime(row.starts_at) : '—'
+  const end = row.ends_at ? formatDateTime(row.ends_at) : '—'
+  return `${start} → ${end}`
+}
+
+function mwStatusText(row: MaintenanceWindow): string {
+  if (row.status === 'ended') return '已结束'
+  return row.active ? '进行中' : '未开始'
+}
+
+async function submitMaintenance(): Promise<void> {
+  if (!mwForm.name.trim()) {
+    ElMessage.warning('请填写窗口名称')
+    return
+  }
+  const body: Parameters<typeof createMaintenanceWindow>[0] = {
+    name: mwForm.name.trim(),
+    reason: mwForm.reason.trim() || null,
+    mode: mwForm.mode,
+    scope: mwForm.scope_mode === 'conditions' ? mwForm.conditions : null,
+  }
+  if (mwForm.mode === 'once') {
+    if (!mwForm.starts_at || !mwForm.ends_at) {
+      ElMessage.warning('请选择开始与结束时间')
+      return
+    }
+    body.starts_at = new Date(mwForm.starts_at).toISOString()
+    body.ends_at = new Date(mwForm.ends_at).toISOString()
+  } else {
+    body.recurrence = {
+      weekday: mwForm.weekday,
+      start: mwForm.start,
+      duration_minutes: mwForm.duration_minutes,
+    }
+  }
+  if (mwForm.scope_mode === 'conditions') {
+    const problem = mwForm.conditions ? validateConditions(mwForm.conditions) : '请配置条件树'
+    if (problem) {
+      ElMessage.warning(problem)
+      return
+    }
+  }
+  mwSaving.value = true
+  try {
+    await createMaintenanceWindow(body)
+    ElMessage.success('维护窗口已创建')
+    mwDialogVisible.value = false
+    await loadMaintenanceWindows()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '创建失败')
+  } finally {
+    mwSaving.value = false
+  }
+}
+
+async function confirmEndMaintenance(row: MaintenanceWindow): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '结束后立即恢复正常告警，已抑制的历史记录保留且不会回填成告警。确认结束？',
+      '提前结束维护窗口',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await endMaintenanceWindow(row.window_id)
+    ElMessage.success('窗口已结束，已生成汇总')
+    await loadMaintenanceWindows()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '结束失败')
+  }
+}
+
+async function openSummaries(row: MaintenanceWindow): Promise<void> {
+  mwSummaryWindow.value = row
+  mwSummaries.value = []
+  mwSummaryVisible.value = true
+  try {
+    mwSummaries.value = await fetchMaintenanceSummaries(row.window_id)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '汇总加载失败')
+  }
+}
+
+async function openSuppressions(row: MaintenanceWindow): Promise<void> {
+  mwSuppressionWindow.value = row
+  mwSuppressions.value = []
+  mwSuppressionVisible.value = true
+  try {
+    const page = await fetchMaintenanceSuppressions(row.window_id, 1, 50)
+    mwSuppressions.value = page.items
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '抑制记录加载失败')
+  }
+}
+
 onMounted(() => {
   loadStatus()
   loadNotificationConfig()
   loadRules()
   loadSlaConfig()
   loadAlertRules()
+  loadMaintenanceWindows()
   void loadRuleScopeOptions()
   timer = setInterval(loadStatus, 10_000)
 })
@@ -1063,6 +1234,74 @@ onBeforeUnmount(() => {
             </el-button>
             <el-button link size="small" @click="openAlertRuleHistory(row)">历史</el-button>
             <el-button link size="small" type="danger" @click="removeAlertRule(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card v-loading="maintenanceLoading" shadow="never">
+      <div class="section-head">
+        <div>
+          <span class="section-title">计划维护窗口</span>
+          <span class="section-desc">
+            窗口内命中规则的设备上报只记「抑制记录」，不产生告警、不发通知、不占 SLA；
+            窗口结束后生成汇总，critical 被压掉的条数会单独标出。时间一律按 UTC 计算。
+          </span>
+        </div>
+        <div class="head-actions">
+          <el-button size="small" @click="loadMaintenanceWindows">刷新</el-button>
+          <el-button size="small" type="primary" @click="openCreateMaintenance">
+            新增窗口
+          </el-button>
+        </div>
+      </div>
+
+      <el-table :data="maintenanceWindows" size="small" empty-text="暂无维护窗口">
+        <el-table-column label="名称" min-width="150">
+          <template #default="{ row }">
+            <span>{{ row.name }}</span>
+            <div class="form-hint">{{ row.reason || '—' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="范围" min-width="170">
+          <template #default="{ row }">{{ mwScopeText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="时间" min-width="220">
+          <template #default="{ row }">
+            {{ mwTimeText(row) }}
+            <div v-if="row.next_start" class="form-hint">
+              下次：{{ formatDateTime(row.next_start) }}
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag
+              :type="row.active ? 'danger' : row.status === 'ended' ? 'info' : 'success'"
+              size="small"
+            >
+              {{ mwStatusText(row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建" min-width="150">
+          <template #default="{ row }">
+            {{ row.created_by }} · {{ formatDateTime(row.created_at) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="220" fixed="right">
+          <template #default="{ row }">
+            <el-button link size="small" @click="openSummaries(row)">汇总</el-button>
+            <el-button link size="small" @click="openSuppressions(row)">抑制记录</el-button>
+            <el-button
+              link
+              size="small"
+              type="danger"
+              :disabled="row.status === 'ended'"
+              @click="confirmEndMaintenance(row)"
+            >
+              提前结束
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -1470,6 +1709,175 @@ onBeforeUnmount(() => {
         <el-button @click="ruleDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="ruleSaving" @click="saveRule">保存</el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="mwDialogVisible" title="新增维护窗口" width="640px">
+      <el-form label-width="110px">
+        <el-form-item label="名称" required>
+          <el-input v-model="mwForm.name" maxlength="64" placeholder="如：冷库机房割接" />
+        </el-form-item>
+        <el-form-item label="原因">
+          <el-input
+            v-model="mwForm.reason"
+            type="textarea"
+            :rows="2"
+            maxlength="500"
+            placeholder="可选，便于事后追溯"
+          />
+        </el-form-item>
+        <el-form-item label="形态" required>
+          <el-radio-group v-model="mwForm.mode">
+            <el-radio-button value="once">一次性</el-radio-button>
+            <el-radio-button value="weekly">每周周期</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <template v-if="mwForm.mode === 'once'">
+          <el-form-item label="开始（本地）" required>
+            <el-date-picker
+              v-model="mwForm.starts_at"
+              type="datetime"
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              placeholder="选择开始时间"
+            />
+          </el-form-item>
+          <el-form-item label="结束（本地）" required>
+            <el-date-picker
+              v-model="mwForm.ends_at"
+              type="datetime"
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              placeholder="选择结束时间"
+            />
+          </el-form-item>
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            title="提交时按浏览器本地时区转换为 UTC 存储；边界为 [开始, 结束)。"
+          />
+        </template>
+        <template v-else>
+          <el-form-item label="每周（UTC）" required>
+            <el-select v-model="mwForm.weekday" style="width: 140px">
+              <el-option
+                v-for="(label, index) in WEEKDAY_LABELS"
+                :key="index"
+                :label="label"
+                :value="index"
+              />
+            </el-select>
+            <el-time-picker
+              v-model="mwForm.start"
+              format="HH:mm"
+              value-format="HH:mm"
+              placeholder="UTC 开始时间"
+              style="margin-left: 8px; width: 140px"
+            />
+            <el-input-number
+              v-model="mwForm.duration_minutes"
+              :min="1"
+              :max="10080"
+              style="margin-left: 8px; width: 150px"
+            />
+            <span class="form-hint">分钟</span>
+          </el-form-item>
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            title="周期按 UTC 计算，不受部署机时区影响；跨天时窗口延续到次日。"
+          />
+        </template>
+        <el-form-item label="静音范围" required>
+          <el-radio-group v-model="mwForm.scope_mode">
+            <el-radio-button value="global">全部设备</el-radio-button>
+            <el-radio-button value="conditions">条件（且 / 或嵌套）</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="mwForm.scope_mode === 'conditions'" label="条件树" required>
+          <RuleConditionBuilder
+            v-if="mwForm.conditions"
+            v-model="mwForm.conditions"
+            :tag-options="ruleTagOptions"
+            :group-options="ruleGroupOptions"
+          />
+          <span class="form-hint">
+            与告警规则共用同一套条件树；同一条件内多值为「或」，条件组可嵌套「且 / 或」
+          </span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="mwDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="mwSaving" @click="submitMaintenance">
+          创建窗口
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="mwSummaryVisible"
+      :title="`维护汇总 · ${mwSummaryWindow?.name ?? ''}`"
+      width="720px"
+    >
+      <el-table :data="mwSummaries" size="small" empty-text="窗口尚未结束，暂无汇总">
+        <el-table-column label="发生时间" min-width="210">
+          <template #default="{ row }">
+            {{ formatDateTime(row.occurrence_start) }} → {{ formatDateTime(row.occurrence_end) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="抑制" width="80">
+          <template #default="{ row }">{{ row.suppressed_count }}</template>
+        </el-table-column>
+        <el-table-column label="设备数" width="80">
+          <template #default="{ row }">{{ row.device_count }}</template>
+        </el-table-column>
+        <el-table-column label="critical" width="90">
+          <template #default="{ row }">
+            <el-tag v-if="row.critical_suppressed" type="danger" size="small">
+              {{ row.critical_suppressed }} 条被压
+            </el-tag>
+            <span v-else>0</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="指标分布" min-width="160">
+          <template #default="{ row }">
+            {{
+              Object.entries(row.metrics)
+                .map(([key, value]) => `${metricMeta(key as AlertMetric).label} ${value}`)
+                .join(' / ') || '—'
+            }}
+          </template>
+        </el-table-column>
+        <el-table-column label="提前结束" width="90">
+          <template #default="{ row }">{{ row.ended_early ? '是' : '否' }}</template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
+
+    <el-dialog
+      v-model="mwSuppressionVisible"
+      :title="`抑制记录 · ${mwSuppressionWindow?.name ?? ''}`"
+      width="760px"
+    >
+      <el-table :data="mwSuppressions" size="small" empty-text="暂无抑制记录">
+        <el-table-column prop="device_id" label="设备" min-width="130" />
+        <el-table-column label="指标" width="110">
+          <template #default="{ row }">{{ metricMeta(row.metric).label }}</template>
+        </el-table-column>
+        <el-table-column label="级别" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.level === 'critical' ? 'danger' : 'warning'" size="small">
+              {{ row.level }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="实际 / 阈值" width="120">
+          <template #default="{ row }">{{ row.value }} / {{ row.threshold }}</template>
+        </el-table-column>
+        <el-table-column prop="rule_name" label="规则" min-width="140" />
+        <el-table-column label="时间" min-width="170">
+          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+        </el-table-column>
+      </el-table>
     </el-dialog>
 
     <el-empty v-if="!loading && !status" description="暂无系统状态数据" :image-size="90" />
