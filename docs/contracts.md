@@ -341,6 +341,8 @@ Web 用模块级 Promise，移动端用 `SessionRefreshCoordinator`，详见 3.1
 | DELETE | `/api/devices/{deviceId}/shadow/desired` | v1.36.0：清除期望键，重复 Query `keys`，operator/admin |
 | POST | `/api/devices/{deviceId}/shadow/reported` | v1.36.0：上报实际状态，`{reported, version}`，operator/admin |
 | POST | `/api/devices/shadow/desired/batch` | v1.36.0：按设备/标签/分组批量写期望，operator/admin |
+| GET | `/api/devices/{deviceId}/shadow/history` | v1.37.0：不可变期望快照，Query `limit`(1~100，默认 50)、`offset`(默认 0)，登录可读 |
+| POST | `/api/devices/{deviceId}/shadow/rollback` | v1.37.0：完整快照替换回滚，入参 `{version}`，operator/admin |
 | GET | `/api/devices/{deviceId}/records` | 历史数据，Query：`start`、`end`（ISO8601 或毫秒时间戳）、`limit`、`offset`（v1.13.0） |
 | GET | `/api/devices/{deviceId}/records/aggregate` | 时序聚合，Query：`bucket`(hour/day)、`start`、`end`，返回每桶 count 与三指标 avg/min/max |
 | GET | `/api/records/latest` | 全局最新数据（仪表盘首屏兜底），Query：`status`(online/offline)、`keyword`、`limit`(1~500)、`offset`、`deviceIds`，均可选 |
@@ -447,6 +449,39 @@ v1.12.0 起 `group` 参数支持「未分组」：传 `group=未分组` 时匹�
   不允许数组或嵌套对象；单值 JSON 序列化长度上限 512。
 - 所有登录角色可 GET；单台/批量写 `desired` 及 POST `reported` 均为 operator/admin，
   viewer 写入 403，未登录 401，设备不存在 404。
+
+**期望版本历史与精确回滚（v1.37.0）**：
+
+`GET /api/devices/{deviceId}/shadow/history?limit=50&offset=0` 按 `version` 倒序返回完整、
+不可变快照；`total` 是不受分页影响的总数，`items` 单条结构如下：
+
+```json
+{
+  "id": 4,
+  "device_id": "dev-0001",
+  "version": 8,
+  "desired": {"report_interval": 30},
+  "changed_keys": ["led", "report_interval"],
+  "action": "rollback",
+  "source_version": 5,
+  "created_at": "2026-11-13T03:00:00+00:00",
+  "created_by": "operator"
+}
+```
+
+- `action` 为 `baseline / merge / clear / batch / rollback`；`changed_keys` 包含相对前一状态的
+  新增、删除和值变化键，`source_version` 仅 rollback 记录目标版本，其余为 `null`。
+- merge、显式清键、批量修改和回滚只在期望真实变化后保存快照；同值写入不空增版本或历史。
+- `POST /api/devices/{deviceId}/shadow/rollback` 入参 `{"version":5}`，响应仍为 `DeviceShadowOut`。
+  回滚是**完整快照替换**，不是 merge：目标快照没有的当前键会移除；生成当前版本 +1 的
+  `rollback` 快照，不覆盖目标版本、不修改旧历史。
+- 当前 `desired` 已与目标快照一致时幂等返回，不递增版本、不新增历史或审计；目标快照不存在返回 404。
+- 回滚不修改 `reported` / `reported_version`。设备下次唤醒仍走 REST GET → 应用 → POST reported；
+  对完整快照移除的旧上报键必须显式上报 `null`，才能从 merge 后的 reported 中删除。
+- 历史 GET 所有登录角色可读，回滚仅 operator/admin；未登录 401、viewer 回滚 403。
+- 回滚审计动作 `device.shadow_rollback`，只记录 `sourceVersion`、新版本、变化键与 changed，
+  不记录期望状态值。历史表按功能需要保存完整 `desired` 快照。
+- 迁移 `0012_shadow_history` 只为升级时的当前影子各补一条 `baseline`，不会臆造此前未保存的版本。
 
 **批量期望 `POST /api/devices/shadow/desired/batch`**：
 
@@ -1079,6 +1114,7 @@ device_app 的移动看板只消费既有网关端点，v1.11.0 仅使用 3.2 �
 | 每设备最新值 | `GET /api/records/latest` | `deviceIds=<当前已加载页设备>`，只取已加载设备，避免全量 |
 | 单设备历史上报 | `GET /api/devices/{id}/records` | 详情页分页：`limit=11&offset=<已取条数>`，多取 1 条用于判断是否还有更早数据，展示 10 条/页（v1.13.0） |
 | 设备影子 | `GET /api/devices/{id}/shadow` | v1.36.0 详情只读展示期望、上报、版本与服务端差异；编辑仍在 Web |
+| 设备影子历史 | `GET /api/devices/{id}/shadow/history` | v1.37.0 展开时按需加载，`limit=20&offset=<已取条数>`；只读完整快照，不提供移动端回滚 |
 | 未处理告警 | `GET /api/alerts` | `status=open&page=1&pageSize=20`，`total` 为全量未处理数；v1.35.0 起可叠加 `tag`（可重复，或语义） |
 | 指令回执 | `GET /api/devices/{id}/commands` | `limit=20` |
 | 汇总卡 | `GET /api/stats/overview` | `device_total` / `device_online` / `alert_open` 等服务端全量统计 |
@@ -1359,6 +1395,23 @@ v1.11.0 拆掉「首屏 100 台」与「告警 pageSize=50」两个客户端上�
 
 同步状态和差异不落库，由 `desired`、`reported` 与设备当前在线状态实时派生。
 
+### `device_shadow_revision`（v1.37.0）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigserial PK | 快照 ID |
+| device_id | varchar(64) | 设备 ID；删除设备时显式清理历史 |
+| version | int | 期望版本；与 device_id 组成唯一约束 `uq_shadow_revision_device_version` |
+| desired | jsonb（SQLite 为 JSON） | 该版本变更后的完整、不可变期望快照 |
+| changed_keys | jsonb（SQLite 为 JSON） | 相对前一状态新增、删除或值变化的键，排序后保存 |
+| action | varchar(16) | baseline / merge / clear / batch / rollback |
+| source_version | int NULL | rollback 的目标快照版本，其余动作为 NULL |
+| created_at | timestamptz | 快照创建时间 |
+| created_by | varchar(64) NULL | 操作人；空影子 baseline 可为 NULL |
+
+历史只记录 `desired`，不复制 reported。升级时仅从 `device_shadow` 回填当前版本基线；
+downgrade 只删除本表，不删除或回退 `device_shadow` 当前状态。
+
 ### `device_command`
 
 | 字段 | 类型 | 说明 |
@@ -1440,7 +1493,8 @@ v1.34.0 起判定读 `alert_rule` 表；本表由旧 `/api/rules/thresholds` 写
 `threshold.update` / `notify.config_update` / `user.create` / `user.update` / `user.delete` /
 `alert_rule.create` / `alert_rule.update` / `alert_rule.enable` / `alert_rule.disable` /
 `alert_rule.delete` / `alert_rule.restore_defaults`（v1.34.0） /
-`device.shadow_desired_update` / `device.shadow_desired_batch`（v1.36.0）。
+`device.shadow_desired_update` / `device.shadow_desired_batch`（v1.36.0） /
+`device.shadow_rollback`（v1.37.0）。
 
 ### `app_user` 后台账号表
 

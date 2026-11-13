@@ -6,6 +6,8 @@
 - DELETE /devices/{device_id}/shadow/desired    清除指定键的期望（admin/operator）
 - POST   /devices/{device_id}/shadow/reported   设备端上报实际状态（admin/operator；REST）
 - POST   /devices/shadow/desired/batch          批量设置期望（admin/operator，复用标签筛选）
+- GET    /devices/{device_id}/shadow/history    查询不可变期望版本快照
+- POST   /devices/{device_id}/shadow/rollback   精确回滚到指定快照并生成新版本
 """
 
 from typing import List, Optional
@@ -22,6 +24,9 @@ from app.schemas import (
     DeviceShadowDesiredUpdate,
     DeviceShadowOut,
     DeviceShadowReportedUpdate,
+    DeviceShadowHistoryOut,
+    DeviceShadowRevisionOut,
+    DeviceShadowRollbackRequest,
 )
 from app.security import ROLE_OPERATOR, require_role, require_user
 from app.services import audit_service, device_service, shadow_service
@@ -49,6 +54,32 @@ async def get_device_shadow(
     device = await _load_device(session, device_id)
     row = await shadow_service.get_shadow(session, device_id)
     return ApiResponse(data=DeviceShadowOut(**shadow_service.build_out(row, device.status)))
+
+
+@router.get(
+    "/devices/{device_id}/shadow/history",
+    response_model=ApiResponse[DeviceShadowHistoryOut],
+)
+async def get_device_shadow_history(
+    device_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _: dict = Depends(require_user),
+):
+    """查询期望版本快照；所有登录角色只读，分页不改变既有影子语义。"""
+    await _load_device(session, device_id)
+    items, total = await shadow_service.list_revisions(
+        session, device_id, limit=limit, offset=offset
+    )
+    return ApiResponse(
+        data=DeviceShadowHistoryOut(
+            items=[DeviceShadowRevisionOut.model_validate(item) for item in items],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+    )
 
 
 @router.put(
@@ -122,6 +153,43 @@ async def clear_device_shadow_desired(
                 "mode": "clear",
                 "keys": sorted(removed),
                 "version": int(row.version or 0),
+                "changed": True,
+            },
+        )
+        await session.commit()
+    return ApiResponse(data=DeviceShadowOut(**shadow_service.build_out(row, device.status)))
+
+
+@router.post(
+    "/devices/{device_id}/shadow/rollback",
+    response_model=ApiResponse[DeviceShadowOut],
+)
+async def rollback_device_shadow(
+    device_id: str,
+    body: DeviceShadowRollbackRequest,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(require_role(ROLE_OPERATOR)),
+):
+    """回滚到完整历史快照；生成新版本，绝不覆盖目标版本或重写历史。"""
+    device = await _load_device(session, device_id)
+    try:
+        row, changed, changed_keys = await shadow_service.rollback_desired(
+            session, device_id, body.version, user.get("sub", "system")
+        )
+    except shadow_service.ShadowRevisionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    if changed:
+        await audit_service.log(
+            session,
+            operator=user.get("sub", "system"),
+            action=audit_service.ACTION_DEVICE_SHADOW_ROLLBACK,
+            target_type="device_shadow",
+            target_id=device_id,
+            detail={
+                "sourceVersion": body.version,
+                "version": int(row.version or 0),
+                "keys": changed_keys,
                 "changed": True,
             },
         )

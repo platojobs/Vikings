@@ -437,6 +437,27 @@ export interface DeviceShadowBatchResult {
   not_found: number
 }
 
+export type DeviceShadowRevisionAction = 'baseline' | 'merge' | 'clear' | 'batch' | 'rollback'
+
+export interface DeviceShadowRevision {
+  id: number
+  device_id: string
+  version: number
+  desired: Record<string, DeviceShadowValue>
+  changed_keys: string[]
+  action: DeviceShadowRevisionAction
+  source_version: number | null
+  created_at: string
+  created_by: string | null
+}
+
+export interface DeviceShadowHistory {
+  items: DeviceShadowRevision[]
+  total: number
+  limit: number
+  offset: number
+}
+
 // ==================== 阈值在线配置（v1.33.0 兼容） ====================
 
 /** 单项阈值的生效值与来源（override=在线覆盖 / env=环境变量） */
@@ -494,6 +515,7 @@ export type AuditAction =
   | 'device.tags_update'
   | 'device.shadow_desired_update'
   | 'device.shadow_desired_batch'
+  | 'device.shadow_rollback'
 
 export interface AuditLog {
   id: number

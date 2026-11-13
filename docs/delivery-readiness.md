@@ -22,8 +22,9 @@
 
 - 所有写操作都有审计：`grep audit_service.log(` 覆盖登录、设备、告警、指令、OTA、阈值、账号，动作常量集中在 `gateway/app/services/audit_service.py`；
 - 已有 `/api/health` 存活探针并暴露 Broker 连接状态（`gateway/app/api/routes/stats.py:22-35`）；
-- 自动化基线真实可跑（v1.26.0）：gateway `pytest` 127 条、Flutter 85 条、Web 25 条、
-  真实 Broker E2E 37/37；
+- 自动化基线真实可跑（v1.37.0）：gateway `pytest` 195 条、Flutter 100 条、Web 57 条、
+  真实 Broker E2E 41/41；影子历史/精确回滚已覆盖真实 REST 历史、分页、幂等与 reported
+  `null` 清键闭环，设备同步仍保持 REST 主动拉取/上报边界；
 - OTA 已从「代码链路完整但无 E2E」补齐为真实端到端覆盖：任务创建 → 网关下发 →
   模拟设备 received/progress/success → REST 汇总与固件版本一致 → 审计可查
   （`scripts/e2e/e2e_acceptance.py` 的 `ota_*` 与 `gateway_restart_*` / `db_outage_*`）。

@@ -143,6 +143,7 @@ class _FakeApiClient extends ApiClient {
     List<SensorReading>? readings,
     List<AlertItem>? alerts,
     List<SensorReading>? records,
+    List<DeviceShadowRevision>? shadowRevisions,
     this.stats,
   }) : devices = List<DeviceSummary>.of(
          devices ?? const <DeviceSummary>[_device],
@@ -150,6 +151,36 @@ class _FakeApiClient extends ApiClient {
        readings = readings ?? const <SensorReading>[_reading],
        alerts = alerts ?? const <AlertItem>[_openAlert],
        records = records ?? const <SensorReading>[],
+       shadowRevisions =
+           shadowRevisions ??
+           <DeviceShadowRevision>[
+             DeviceShadowRevision(
+               id: 8,
+               deviceId: 'dev-0001',
+               version: 7,
+               desired: const <String, dynamic>{
+                 'report_interval': 30,
+                 'led': true,
+               },
+               changedKeys: const <String>['led'],
+               action: 'rollback',
+               sourceVersion: 6,
+               createdAt: null,
+               createdBy: 'operator',
+             ),
+             DeviceShadowRevision(
+               id: 7,
+               deviceId: 'dev-0001',
+               version: 6,
+               desired: const <String, dynamic>{
+                 'report_interval': 30,
+                 'led': false,
+               },
+               changedKeys: const <String>['report_interval'],
+               action: 'merge',
+               createdBy: 'operator',
+             ),
+           ],
        super(baseUrl: 'http://192.168.1.8:8000');
 
   /// 仅在对应用例注入；为空时返回固定测试数据。
@@ -161,6 +192,7 @@ class _FakeApiClient extends ApiClient {
 
   /// 详情页历史上报：按网关语义（时间倒序取切片后翻转正序）返回。
   final List<SensorReading> records;
+  final List<DeviceShadowRevision> shadowRevisions;
   final StatsOverview? stats;
 
   int loginCalls = 0;
@@ -187,6 +219,9 @@ class _FakeApiClient extends ApiClient {
   int lastRecordLimit = 0;
   int lastRecordOffset = 0;
   final List<int> recordOffsets = <int>[];
+  int shadowHistoryFetchCalls = 0;
+  int lastShadowHistoryLimit = 0;
+  int lastShadowHistoryOffset = 0;
 
   @override
   Future<AuthSession> login({
@@ -409,6 +444,29 @@ class _FakeApiClient extends ApiClient {
     diffKeys: <String>['report_interval'],
     pendingDesired: <String, dynamic>{'report_interval': 30},
   );
+
+  @override
+  Future<DeviceShadowHistory> fetchDeviceShadowHistory({
+    required String token,
+    required String deviceId,
+    int limit = 20,
+    int offset = 0,
+  }) async {
+    shadowHistoryFetchCalls += 1;
+    lastShadowHistoryLimit = limit;
+    lastShadowHistoryOffset = offset;
+    final end = offset + limit > shadowRevisions.length
+        ? shadowRevisions.length
+        : offset + limit;
+    return DeviceShadowHistory(
+      items: offset >= shadowRevisions.length
+          ? const <DeviceShadowRevision>[]
+          : shadowRevisions.sublist(offset, end),
+      total: shadowRevisions.length,
+      limit: limit,
+      offset: offset,
+    );
+  }
 
   @override
   Future<List<CommandItem>> fetchCommands({
@@ -1424,7 +1482,39 @@ void main() {
     expect(find.text('report_interval'), findsOneWidget);
     expect(find.text('期望：30'), findsOneWidget);
     expect(find.text('上报：10'), findsOneWidget);
-    expect(find.text('只读视图；期望状态请在 Web 管理端修改。'), findsOneWidget);
+    expect(find.text('只读视图；期望状态请在 Web 管理端修改或回滚。'), findsOneWidget);
+    expect(find.text('保存期望'), findsNothing);
+  });
+
+  testWidgets('设备详情：影子历史按需加载且只读展示快照与变化键', (tester) async {
+    final api = _FakeApiClient();
+    await _pumpBoard(tester, api: api, session: _viewerSession);
+    await tester.pumpAndSettle();
+    await _openDeviceSheet(tester);
+
+    expect(api.shadowHistoryFetchCalls, 0);
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-shadow-history-toggle')),
+    );
+    await tester.tap(find.byKey(const Key('device-shadow-history-toggle')));
+    await tester.pumpAndSettle();
+    await _scrollSheetTo(
+      tester,
+      find.byKey(const Key('device-shadow-revision-6')),
+    );
+
+    expect(api.shadowHistoryFetchCalls, 1);
+    expect(api.lastShadowHistoryLimit, 20);
+    expect(api.lastShadowHistoryOffset, 0);
+    expect(find.text('v7 · 回滚 · 当前'), findsOneWidget);
+    expect(find.text('来源版本 v6'), findsOneWidget);
+    expect(find.text('v6 · 单台修改'), findsOneWidget);
+    expect(find.text('变化键：led'), findsOneWidget);
+    expect(find.text('变化键：report_interval'), findsOneWidget);
+    expect(find.textContaining('"led": true'), findsOneWidget);
+    expect(find.textContaining('"led": false'), findsOneWidget);
+    expect(find.text('回滚到此版本'), findsNothing);
     expect(find.text('保存期望'), findsNothing);
   });
 

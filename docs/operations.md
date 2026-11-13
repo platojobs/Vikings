@@ -1029,7 +1029,7 @@ curl -s -X POST http://127.0.0.1:8000/api/rules/restore-defaults \
    换设备或等窗口结束再看。
 8. **规则缓存**：单实例网关 write-through；多实例部署需要每个实例都保存一次规则或重启刷新。
 
-## 17. 设备影子同步与排障（v1.36.0）
+## 17. 设备影子同步、历史回滚与排障（v1.36.0 / v1.37.0）
 
 ### 17.1 单台与批量期望的标准操作
 
@@ -1041,7 +1041,9 @@ curl -s -X POST http://127.0.0.1:8000/api/rules/restore-defaults \
 4. 批量操作在设备列表沿用分组/标签筛选与跨页勾选，点「批量期望」，二次确认后查看
    `matched / updated / unchanged / not_found` 和逐台结果。单次最多 200 台；
 5. 设备下次上线/唤醒主动拉取并应用期望，再上报 `reported` 与已应用 `version`；
-   差异清零后变为「已同步」。移动端详情提供同一份只读视图，不提供编辑器。
+   差异清零后变为「已同步」。移动端详情提供同一份只读视图，不提供编辑器；
+6. 需要核对或恢复旧配置时展开「变更历史」：Web 与移动端均可查看完整快照、动作、变化键、
+   操作人和时间；只有 Web 的 operator/admin 可二次确认回滚，移动端没有写入口。
 
 同步状态解释：
 
@@ -1065,6 +1067,7 @@ python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
 
 - 每轮发布 `online` 后，脚本 GET `/api/devices/dev-0001/shadow`；有未应用版本或差异时，
   模拟应用当前 `desired`，再 POST `/shadow/reported`，请求体为 `{reported, version}`；
+  完整快照回滚移除的键会在本次 reported patch 中显式置 `null`，避免 merge 后残留旧值；
   已同步时不重复 POST。
 - `--api-url` / `--api-token` 也可替代对应环境变量，两者必须同时提供；
   `--api-timeout` 默认 5 秒。未配置这些参数时完全保持原有 MQTT 上报/指令行为。
@@ -1089,11 +1092,23 @@ python scripts/simulate_device.py --device-id dev-0001 --count 3 --interval 5
    嵌套对象与数组会被拒绝。`null` 在 desired/reported 中均表示清除对应键；
 6. **看批量目标口径**：显式 ID、标签、分组同时出现时取交集；被筛选排除的现存设备不计入
    `matched`，也不会冒充 `not_found`。先在设备列表用同一条件确认目标，再提交；
-7. **看审计**：单台 `device.shadow_desired_update`、批量 `device.shadow_desired_batch`。
-   审计只含键名、版本、筛选与数量，不包含期望状态值；需要核值时读取影子接口，不要改审计表。
+7. **看审计**：单台 `device.shadow_desired_update`、批量 `device.shadow_desired_batch`、
+   回滚 `device.shadow_rollback`。审计只含键名、版本、筛选与数量，不包含期望状态值；
+   需要核值时读取当前影子或历史快照接口，不要改审计表。
 
-若需回滚错误期望，用同一目标提交旧值或清除对应键，这会产生一个新版本；不要直接修改
-`device_shadow.version` 或把 `sync_status` 写入数据库（该状态本来就是实时派生）。
+### 17.4 用历史快照精确回滚（v1.37.0）
+
+1. 在 Web 设备详情展开「变更历史」，按版本倒序核对目标快照的**完整 desired**，不要只看
+   `changed_keys`；也可调用 `GET /api/devices/{id}/shadow/history?limit=50&offset=0` 分页核查；
+2. operator/admin 对目标版本二次确认，或调用 `POST /api/devices/{id}/shadow/rollback`，
+   请求体 `{"version":目标版本}`。回滚是完整替换而不是 merge：目标没有的当前键会删除，
+   并生成一个新 `rollback` 版本；目标快照和旧历史保持不变；
+3. 若当前期望已与目标快照一致，接口幂等返回当前影子，不空增版本、不重复写审计；
+   目标版本不存在返回 404，不要直接改 `device_shadow.version` 或历史表伪造版本；
+4. 回滚不会伪造设备已应用状态：`reported` 与 `reported_version` 保持原值。等设备下次唤醒
+   拉取、实际应用并上报后再判断同步结果；被完整快照移除的旧配置键必须上报 `null` 清除；
+5. 从 v1.36.0 升级时，`0012_shadow_history` 只为每台设备的当前期望补一条 `baseline`。
+   升级前没有保存的更早版本无法恢复；downgrade 只删除历史表，不回退当前影子。
 
 
 

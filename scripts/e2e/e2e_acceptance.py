@@ -1025,6 +1025,80 @@ def verify_rest_device(ctx: Context) -> str:
     )
 
 
+def verify_shadow_history_rollback(ctx: Context) -> str:
+    """真实 REST：历史不可变、完整替换回滚、幂等与设备 reported 清键闭环。"""
+    path = f"/api/devices/{ctx.device_id}/shadow"
+    baseline = api(ctx, "GET", path + "/history", params={"limit": 100, "offset": 0})
+    if baseline["total"] not in (0, 1) or (
+        baseline["items"] and baseline["items"][0]["action"] != "baseline"
+    ):
+        raise RuntimeError(f"新设备影子应为空历史或只有 v0 基线，实际：{baseline}")
+
+    desired_v1 = {"e2e_mode": "one"}
+    first = api(ctx, "PUT", path + "/desired", json={"patch": desired_v1})
+    if first["version"] != 1:
+        raise RuntimeError(f"首次期望版本异常：{first}")
+
+    desired_v2 = {**desired_v1, "e2e_extra": True}
+    second = api(ctx, "PUT", path + "/desired", json={"patch": {"e2e_extra": True}})
+    if second["version"] != 2:
+        raise RuntimeError(f"第二次期望版本异常：{second}")
+    applied_v2 = api(
+        ctx,
+        "POST",
+        path + "/reported",
+        json={"reported": desired_v2, "version": 2},
+    )
+    if applied_v2["reported"] != desired_v2 or applied_v2["reported_version"] != 2:
+        raise RuntimeError(f"设备 v2 实际上报异常：{applied_v2}")
+
+    rolled = api(ctx, "POST", path + "/rollback", json={"version": 1})
+    if (
+        rolled["version"] != 3
+        or rolled["desired"] != desired_v1
+        or rolled["reported"] != desired_v2
+        or rolled["reported_version"] != 2
+    ):
+        raise RuntimeError(f"回滚未精确替换 desired 或篡改了 reported：{rolled}")
+
+    repeated = api(ctx, "POST", path + "/rollback", json={"version": 1})
+    if repeated["version"] != 3 or repeated["desired"] != desired_v1:
+        raise RuntimeError(f"同内容回滚不应新增版本：{repeated}")
+
+    history = api(ctx, "GET", path + "/history", params={"limit": 2, "offset": 0})
+    if history["total"] != 4 or [item["version"] for item in history["items"]] != [3, 2]:
+        raise RuntimeError(f"历史分页或版本数异常：{history}")
+    latest, immutable_v2 = history["items"]
+    if (
+        latest["action"] != "rollback"
+        or latest["source_version"] != 1
+        or latest["desired"] != desired_v1
+        or immutable_v2["desired"] != desired_v2
+    ):
+        raise RuntimeError(f"回滚快照或旧版本不可变性异常：{history}")
+    older = api(ctx, "GET", path + "/history", params={"limit": 1, "offset": 2})
+    if older["items"][0]["version"] != 1:
+        raise RuntimeError(f"历史 offset 分页异常：{older}")
+
+    # 与 simulate_device._sync_shadow 相同：完整快照移除的键必须显式上报 null。
+    synced = api(
+        ctx,
+        "POST",
+        path + "/reported",
+        json={"reported": {**desired_v1, "e2e_extra": None}, "version": 3},
+    )
+    if (
+        synced["reported"] != desired_v1
+        or synced["reported_version"] != 3
+        or synced["sync_status"] != "synced"
+    ):
+        raise RuntimeError(f"回滚后的设备清键上报未恢复同步：{synced}")
+    return (
+        "v0 基线 → v1/v2 → 回滚 v1 生成 v3；旧 v2 快照与 reported 不变，"
+        "重复回滚不增版，设备 null 清键后恢复 synced"
+    )
+
+
 def verify_overview_stats(ctx: Context) -> str:
     """移动端概览页数据与 REST 口径一致：设备、告警、24 小时趋势与异常设备。"""
     overview = api(ctx, "GET", "/api/stats/overview")
@@ -2505,6 +2579,7 @@ def main() -> int:
         rep.run("realtime_report", lambda: verify_realtime_report(ctx))
         # 先查 REST 快照：此时设备仍在线，可同时验证设备与最新值
         rep.run("rest_device", lambda: verify_rest_device(ctx))
+        rep.run("shadow_history_rollback", lambda: verify_shadow_history_rollback(ctx))
         rep.run("realtime_status", lambda: verify_realtime_status(ctx))
         rep.run("realtime_alert", lambda: verify_realtime_alert(ctx))
         rep.run("overview_stats", lambda: verify_overview_stats(ctx))

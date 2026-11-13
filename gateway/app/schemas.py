@@ -274,6 +274,33 @@ class DeviceShadowBatchResult(BaseModel):
     not_found: int = 0
 
 
+# ==================== 设备影子历史与回滚（v1.37.0）====================
+
+class DeviceShadowRevisionOut(BaseModel):
+    id: int
+    device_id: str
+    version: int
+    desired: Dict[str, Any] = {}
+    changed_keys: List[str] = []
+    action: str
+    source_version: Optional[int] = None
+    created_at: datetime
+    created_by: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class DeviceShadowHistoryOut(BaseModel):
+    items: List[DeviceShadowRevisionOut]
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+
+
+class DeviceShadowRollbackRequest(BaseModel):
+    version: int = Field(ge=0)
+
+
 class MqttCredentialOut(BaseModel):
     """设备凭证签发/轮换结果：口令只在此响应出现一次。"""
 

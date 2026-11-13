@@ -44,6 +44,8 @@ ACTION_DEVICE_TAGS = "device.tags_update"
 # v1.36.0：设备影子期望写入（detail 只记键名与版本，不记值——值可能含设备控制语义）
 ACTION_DEVICE_SHADOW_DESIRED = "device.shadow_desired_update"
 ACTION_DEVICE_SHADOW_DESIRED_BATCH = "device.shadow_desired_batch"
+# v1.37.0：回滚只记录来源/新版本与变化键名，快照值仍不进入审计
+ACTION_DEVICE_SHADOW_ROLLBACK = "device.shadow_rollback"
 ACTION_DEVICE_DELETE = "device.delete"
 ACTION_DEVICE_BULK = "device.bulk_create"
 ACTION_DEVICE_CREDENTIAL = "device.credential_issue"

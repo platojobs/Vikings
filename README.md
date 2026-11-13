@@ -498,6 +498,7 @@ http://192.168.1.8:5173
 - 移动看板（v1.7.0 / v1.8.0 / v1.9.0）：登录网关后查看设备列表、实时值、单设备历史上报、未处理告警与指令回执；
   admin / operator 可下发指令（含单台 OTA）与确认告警，viewer 只读；
   MQTT over WebSocket 实时推送（9001）+ REST 首屏兜底，断线指数退避重连并显示连接状态；
+  v1.36.0 起只读展示设备影子，v1.37.0 起按需分页查看完整期望快照与变化键，编辑和回滚仍在 Web；
   token 存 iOS Keychain / Android Keystore，兼容旧版本明文会话自动迁移
 
 ### 网关（Python）
@@ -544,6 +545,9 @@ http://192.168.1.8:5173
   导出的 `tag` 筛选为「或」语义，与既有筛选「且」组合，不传标签行为不变；
   规则范围新增标签维度并支持多个分组/设备/标签（**组内「或」**，规则间仍取最高级别）；
   Web 可查看规则变更历史（数据来自审计 `changes` 前后值），阈值前后值可对照
+- 设备影子与历史回滚（v1.36.0 / v1.37.0）：统一派生期望/上报差异与同步状态，
+  merge、清键、批量修改和回滚均保存不可变完整快照；按版本完整替换回滚并生成新版本，
+  同内容幂等，reported 仍由设备后续 REST 主动上报确认
 - JWT 鉴权 + 统一 `{code, message, data}` 响应体
 
 ### 管理后台（Vue3）
@@ -555,6 +559,8 @@ http://192.168.1.8:5173
   v1.35.0 展示设备标签，admin 可单台或勾选多台批量打/移除标签（逐台结果与失败原因可见）；
   多选后**批量指令**（config / calibrate / reboot，单次最多 200 台，逐台成功/失败/跳过与具体原因，
   `request_id` 幂等防重复下发）与**批量 OTA**跳转（v1.28.0）
+- 设备影子（v1.36.0 / v1.37.0）：详情展示期望、上报、待同步差异与双版本，支持 merge、
+  清键和批量期望；变更历史分页展示完整快照，operator/admin 二次确认后按版本精确回滚
 - 历史查询：明细 / 按小时 / 按天聚合视图，服务端流式 CSV 导出（v1.30.0，含进度与可读错误）
 - 告警中心：统计卡片、实时告警推送、在线确认、「触发规则」列（hover 显示命中规则
   与实际值）；时间范围与标签筛选（v1.35.0）与 CSV 导出（v1.30.0，viewer 不可导出）；
@@ -604,6 +610,9 @@ http://192.168.1.8:5173
 | POST | `/api/devices/bulk` | 批量注册（重复跳过） |
 | PATCH/DELETE | `/api/devices/{id}` | 编辑元数据 / 删除（删除仅 admin） |
 | GET | `/api/devices/{id}` | 设备详情 + 最新数据 |
+| GET/PUT/DELETE/POST | `/api/devices/{id}/shadow*` | 设备影子读取、期望 merge/清键、reported 上报（v1.36.0） |
+| GET | `/api/devices/{id}/shadow/history` | 不可变期望快照分页（v1.37.0，登录可读） |
+| POST | `/api/devices/{id}/shadow/rollback` | 完整快照替换回滚并生成新版本（v1.37.0，operator/admin） |
 | GET | `/api/devices/tags` | 标签列表与设备数（v1.35.0，登录可读） |
 | POST | `/api/devices/tags/batch` | 批量打/移除设备标签（v1.35.0，仅 admin，逐台结果） |
 | GET | `/api/devices/{id}/records` | 历史数据（start / end / limit，可选 offset；不传 offset 行为不变） |
@@ -645,6 +654,8 @@ http://192.168.1.8:5173
 | `rule_config` | 阈值在线覆盖 | 优先于环境变量，改完即时生效 |
 | `alert_rule` | 告警规则（v1.34.0，v1.35.0 多值范围） | 指标 / 方向 / 阈值 / 级别 / 范围 / 启用 / 连续次数 / 优先级；`scope_values` 存多值（组内或），`scope_value` 兼容首值；默认规则种子 + 进程内缓存热生效 |
 | `device_tag` | 设备标签（v1.35.0） | 复合主键 `(device_id, tag)` 强制唯一，`(tag, device_id)` 索引；单设备多标签，不用逗号拼接 |
+| `device_shadow` | 当前设备影子（v1.36.0） | 一行一设备，保存 desired / reported 与双版本；同步状态和差异实时派生 |
+| `device_shadow_revision` | 期望版本历史（v1.37.0） | `(device_id, version)` 唯一；保存完整不可变快照、动作、变化键和回滚来源版本 |
 | `audit_log` | 管理动作审计 | 动作 + 目标 + JSON 上下文，按时间索引 |
 | `app_user` | 后台账号与角色 | PBKDF2 口令哈希，角色驱动接口权限 |
 
@@ -746,6 +757,8 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 覆盖内容：
 
 - 设备上线 / 上报 / 休眠下线，REST 设备列表与 `/api/records/latest` 可读；
+- 设备影子 v0 基线 → v1/v2 → 回滚 v1 生成 v3：旧快照与 reported 不变、重复回滚不增版、
+  历史分页正确，设备用 `null` 清除被快照移除的旧上报键后恢复 synced（v1.37.0）；
 - WebSocket 9001 秒级收到上报、上下线与 critical 告警；
 - REST 下发 config 指令，模拟设备回执 success 并同步到指令历史；
 - REST 确认告警，状态变为 acked（open 消失、acked 可查）；
@@ -779,7 +792,7 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（37 项，含鉴权隔离、API 凭证轮换与重载结果审计） | 约 2~3 分钟 |
+| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（41 项，含鉴权隔离、API 凭证轮换、影子历史/精确回滚与重载结果审计） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
 每次运行由脚本在临时目录生成随机凭证与 `passwd`，**不提交任何真实口令文件**；
@@ -886,3 +899,5 @@ npm run test        # vitest run，CI 与本地同一命令
 | `v1.32.0` | 电池健康与续航看板：新增只读 `/api/stats/battery-health`（分组 + 7/14/30 天窗口），按「最新电量 + 每日平均电量最小二乘衰减」分层为严重/预警/健康/未知，并推算预计到 15% 的天数；窗口内无上报设备如实记 `unknown`；Web 新增 `/battery-health` 页（分层卡、机队趋势、分组汇总、风险清单）；PostgreSQL 按 UTC 自然日分桶，SQLite 单测同口径（[发布说明](docs/releases/v1.32.0.md)） |
 | `v1.34.0` | 可配置告警阈值规则：新增 `alert_rule` 表与 `0009_alert_rules` 迁移，10 个硬编码阈值以默认规则种子回填（读取 `rule_config` 覆盖值），升级前后判定一致；规则含指标 / 方向 / 阈值 / 级别 / 范围（全局·分组·设备）/ 启用 / 连续 N 次 / 优先级，同指标多命中取最高级别；告警写 `matched_rule` 快照（ID/名称/阈值/实际值）；admin 在线增删改热生效（write-through 缓存），规则停用不再产生新告警；Web 系统设置新增独立「告警规则」卡片，告警详情可看触发原因；审计只记字段名（[发布说明](docs/releases/v1.34.0.md)） |
 | `v1.35.0` | 设备标签体系 + 告警规则范围扩展 + 规则变更历史视图：新增 `device_tag` 关联表与 `0010_device_tags` 迁移（复合主键唯一、`(tag, device_id)` 索引；单标签 ≤32、单设备 ≤16）；Web 与移动端支持单台/批量打标签、标签筛选，列表/告警/两类导出均支持 `tag`（或语义、与既有筛选且组合、不传时行为不变）；`alert_rule.scope_type` 新增 `tag` 并支持多分组/多设备/多标签（`scope_values`，**组内或**），迁移回填旧单值规则；Web 规则历史抽屉直接读审计 `changes` 前后值；真实验证覆盖迁移三场景、标签命中/非命中、批量部分失败与导出行数（[发布说明](docs/releases/v1.35.0.md)） |
+| `v1.36.0` | 设备影子：新增 `device_shadow` 与 `0011_device_shadow` 迁移，统一期望/上报/差异/同步状态机；merge/null 清键、幂等版本、乱序上报保护、按设备/标签/分组批量期望；Web 编辑与批量入口、移动端只读视图，模拟器唤醒后 REST 主动同步（[发布说明](docs/releases/v1.36.0.md)） |
+| `v1.37.0` | 设备影子变更历史与精确回滚：新增 `device_shadow_revision` 与 `0012_shadow_history` 迁移，merge/清键/批量/回滚保存完整不可变快照；按版本完整替换回滚并生成新版本，同内容幂等且不伪造 reported；Web 历史查看与二次确认回滚、移动端只读历史；模拟器用 `null` 清除回滚移除的旧上报键（[发布说明](docs/releases/v1.37.0.md)） |

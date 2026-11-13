@@ -17,6 +17,7 @@ import type {
   DeviceRecordsQuery,
   DeviceShadow,
   DeviceShadowBatchResult,
+  DeviceShadowHistory,
   DeviceShadowValue,
   DeviceTagBatchResult,
   DeviceTagStat,
@@ -218,4 +219,24 @@ export function batchUpdateShadowDesired(body: {
     method: 'POST',
     body,
   })
+}
+
+// ==================== 设备影子历史与回滚（v1.37.0） ====================
+
+export function fetchDeviceShadowHistory(
+  deviceId: string,
+  query: { limit?: number; offset?: number } = {},
+): Promise<DeviceShadowHistory> {
+  return request<DeviceShadowHistory>(
+    `/api/devices/${encodeURIComponent(deviceId)}/shadow/history`,
+    { params: { limit: query.limit ?? 20, offset: query.offset ?? 0 } },
+  )
+}
+
+/** 精确恢复目标完整快照；服务端生成新版本，不覆盖历史。 */
+export function rollbackDeviceShadow(deviceId: string, version: number): Promise<DeviceShadow> {
+  return request<DeviceShadow>(
+    `/api/devices/${encodeURIComponent(deviceId)}/shadow/rollback`,
+    { method: 'POST', body: { version } },
+  )
 }

@@ -19,9 +19,11 @@ import {
   fetchDeviceRecords,
   fetchDevices,
   fetchDeviceShadow,
+  fetchDeviceShadowHistory,
   fetchDeviceTags,
   issueDeviceCredential,
   revokeDeviceCredential,
+  rollbackDeviceShadow,
   sendBulkCommand,
   sendCommand,
   updateDevice,
@@ -58,6 +60,7 @@ import type {
   DeviceShadow,
   DeviceShadowBatchItem,
   DeviceShadowBatchResult,
+  DeviceShadowRevision,
   DeviceShadowValue,
   DeviceStatus,
   DeviceTagBatchItem,
@@ -518,6 +521,10 @@ const historyRecords = ref<SensorRecord[]>([])
 const commands = ref<CommandItem[]>([])
 const shadow = ref<DeviceShadow | null>(null)
 const shadowPatchText = ref('{}')
+const shadowHistoryVisible = ref(false)
+const shadowHistoryItems = ref<DeviceShadowRevision[]>([])
+const shadowHistoryTotal = ref(0)
+const shadowHistoryLoading = ref(false)
 
 async function openDevice(row: Device, column?: { type?: string }): Promise<void> {
   if (column?.type === 'selection') return // 勾选不打开详情抽屉
@@ -528,6 +535,9 @@ async function openDevice(row: Device, column?: { type?: string }): Promise<void
   commands.value = []
   shadow.value = null
   shadowPatchText.value = '{}'
+  shadowHistoryVisible.value = false
+  shadowHistoryItems.value = []
+  shadowHistoryTotal.value = 0
 
   try {
     const [deviceDetail, records, commandList, deviceShadow] = await Promise.all([
@@ -628,6 +638,75 @@ function parseShadowPatch(text: string): Record<string, DeviceShadowValue> {
   return parsed as Record<string, DeviceShadowValue>
 }
 
+const SHADOW_ACTION_LABELS: Record<DeviceShadowRevision['action'], string> = {
+  baseline: '基线',
+  merge: '单台修改',
+  clear: '清除键',
+  batch: '批量修改',
+  rollback: '回滚',
+}
+
+function shadowActionLabel(action: DeviceShadowRevision['action']): string {
+  return SHADOW_ACTION_LABELS[action]
+}
+
+function formatRevisionDesired(revision: DeviceShadowRevision): string {
+  return JSON.stringify(revision.desired, null, 2)
+}
+
+async function loadShadowHistory(append = false): Promise<void> {
+  const deviceId = detail.value?.device_id
+  if (!deviceId || shadowHistoryLoading.value) return
+  shadowHistoryLoading.value = true
+  try {
+    const offset = append ? shadowHistoryItems.value.length : 0
+    const result = await fetchDeviceShadowHistory(deviceId, { limit: 20, offset })
+    shadowHistoryItems.value = append
+      ? [...shadowHistoryItems.value, ...result.items]
+      : result.items
+    shadowHistoryTotal.value = result.total
+  } catch {
+    // 错误提示已由 HTTP 层统一处理；保留已加载的历史，避免误显示为空
+  } finally {
+    shadowHistoryLoading.value = false
+  }
+}
+
+async function toggleShadowHistory(): Promise<void> {
+  shadowHistoryVisible.value = !shadowHistoryVisible.value
+  if (shadowHistoryVisible.value) await loadShadowHistory()
+}
+
+async function rollbackShadowRevision(revision: DeviceShadowRevision): Promise<void> {
+  if (!detail.value || shadowSaving.value) return
+  try {
+    await ElMessageBox.confirm(
+      `将期望精确恢复为 v${revision.version} 的完整快照并生成新版本。当前多出的键会被移除，设备将在下次上线或唤醒时同步。`,
+      '回滚设备影子',
+      { type: 'warning', confirmButtonText: '确认回滚', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+
+  const previousVersion = shadow.value?.version ?? 0
+  shadowSaving.value = true
+  try {
+    shadow.value = await rollbackDeviceShadow(detail.value.device_id, revision.version)
+    shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    if (shadowHistoryVisible.value) await loadShadowHistory()
+    ElMessage.success(
+      shadow.value.version === previousVersion
+        ? '当前期望已与目标快照一致，无需生成新版本'
+        : `已回滚到 v${revision.version} 的内容，生成新版本 v${shadow.value.version}`,
+    )
+  } catch {
+    // 错误提示已由 HTTP 层统一处理（目标版本不存在时明确返回 404）
+  } finally {
+    shadowSaving.value = false
+  }
+}
+
 async function refreshShadow(): Promise<void> {
   const deviceId = detail.value?.device_id
   if (!deviceId || shadowRefreshing.value) return
@@ -635,6 +714,7 @@ async function refreshShadow(): Promise<void> {
   try {
     shadow.value = await fetchDeviceShadow(deviceId)
     shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    if (shadowHistoryVisible.value) await loadShadowHistory()
   } catch {
     // 错误提示已由 HTTP 层统一处理
   } finally {
@@ -657,6 +737,7 @@ async function submitShadowDesired(): Promise<void> {
   try {
     shadow.value = await updateDeviceShadowDesired(detail.value.device_id, patch)
     shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    if (shadowHistoryVisible.value) await loadShadowHistory()
     ElMessage.success(
       shadow.value.version === previousVersion
         ? '期望状态无变化'
@@ -684,6 +765,7 @@ async function clearShadowDesiredKey(key: string): Promise<void> {
   try {
     shadow.value = await clearDeviceShadowDesiredKeys(detail.value.device_id, [key])
     shadowPatchText.value = JSON.stringify(shadow.value.desired, null, 2)
+    if (shadowHistoryVisible.value) await loadShadowHistory()
     ElMessage.success(`已清除期望键「${key}」`)
   } catch {
     // 错误提示已由 HTTP 层统一处理
@@ -1320,6 +1402,9 @@ onUnmounted(() => {
             </el-tag>
             <span class="section-hint">期望状态与设备实际上报</span>
             <div class="section-actions shadow-header-actions">
+              <el-button size="small" @click="toggleShadowHistory">
+                {{ shadowHistoryVisible ? '收起历史' : '版本历史' }}
+              </el-button>
               <el-button size="small" :loading="shadowRefreshing" @click="refreshShadow">
                 刷新
               </el-button>
@@ -1412,6 +1497,71 @@ onUnmounted(() => {
               <span>上报更新：{{ formatDateTime(shadow.reported_updated_at) }}</span>
             </div>
 
+            <div v-if="shadowHistoryVisible" class="shadow-history" data-test="shadow-history">
+              <div class="shadow-history-heading">
+                <strong>期望版本历史</strong>
+                <span>共 {{ shadowHistoryTotal }} 个不可变快照</span>
+              </div>
+              <el-alert
+                title="回滚是完整快照替换，并生成一个新版本；历史记录不会被覆盖。"
+                type="info"
+                :closable="false"
+                show-icon
+                class="shadow-history-tip"
+              />
+              <div v-if="!shadowHistoryItems.length && !shadowHistoryLoading" class="shadow-empty">
+                暂无版本历史
+              </div>
+              <article
+                v-for="revision in shadowHistoryItems"
+                :key="revision.id"
+                class="shadow-revision"
+                :data-test="`shadow-revision-${revision.version}`"
+              >
+                <div class="shadow-revision-heading">
+                  <strong>v{{ revision.version }}</strong>
+                  <el-tag size="small" :type="revision.action === 'rollback' ? 'warning' : 'info'">
+                    {{ shadowActionLabel(revision.action) }}
+                  </el-tag>
+                  <el-tag v-if="revision.version === shadow.version" size="small" type="success">
+                    当前内容版本
+                  </el-tag>
+                  <span class="shadow-revision-time">
+                    {{ formatDateTime(revision.created_at) }} · {{ revision.created_by || '系统' }}
+                  </span>
+                </div>
+                <div v-if="revision.source_version !== null" class="shadow-revision-source">
+                  内容恢复自 v{{ revision.source_version }}
+                </div>
+                <pre class="shadow-revision-json">{{ formatRevisionDesired(revision) }}</pre>
+                <div class="shadow-revision-footer">
+                  <span>
+                    {{ revision.changed_keys.length ? `变化键：${revision.changed_keys.join('、')}` : '升级或初始状态基线' }}
+                  </span>
+                  <el-button
+                    v-if="canWrite && revision.version !== shadow.version"
+                    size="small"
+                    type="warning"
+                    plain
+                    :disabled="shadowSaving"
+                    :data-test="`shadow-rollback-${revision.version}`"
+                    @click="rollbackShadowRevision(revision)"
+                  >
+                    回滚到此内容
+                  </el-button>
+                </div>
+              </article>
+              <el-button
+                v-if="shadowHistoryItems.length < shadowHistoryTotal"
+                link
+                type="primary"
+                :loading="shadowHistoryLoading"
+                @click="loadShadowHistory(true)"
+              >
+                加载更早版本（{{ shadowHistoryItems.length }} / {{ shadowHistoryTotal }}）
+              </el-button>
+            </div>
+
             <div v-if="canWrite" class="shadow-editor">
               <el-input
                 v-model="shadowPatchText"
@@ -1437,7 +1587,7 @@ onUnmounted(() => {
             </div>
             <el-alert
               v-else
-              title="当前账号为只读角色，可查看期望、上报与差异，但不能修改。"
+              title="当前账号为只读角色，可查看期望、上报、差异与历史，但不能修改或回滚。"
               type="info"
               :closable="false"
               show-icon
@@ -2363,6 +2513,77 @@ onUnmounted(() => {
   margin: 8px 0 12px;
   color: #94a3b8;
   font-size: 11px;
+}
+
+.shadow-history {
+  margin: 0 0 14px;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.shadow-history-heading,
+.shadow-revision-heading,
+.shadow-revision-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.shadow-history-heading {
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: #475569;
+  font-size: 12px;
+}
+
+.shadow-history-tip {
+  margin-bottom: 8px;
+}
+
+.shadow-revision {
+  padding: 10px 0;
+  border-top: 1px solid #e2e8f0;
+}
+
+.shadow-revision-heading strong {
+  color: #0f172a;
+}
+
+.shadow-revision-time,
+.shadow-revision-source,
+.shadow-revision-footer {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.shadow-revision-time {
+  margin-left: auto;
+}
+
+.shadow-revision-source {
+  margin-top: 5px;
+  color: #92400e;
+}
+
+.shadow-revision-json {
+  max-height: 150px;
+  margin: 8px 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 4px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.shadow-revision-footer {
+  justify-content: space-between;
 }
 
 .shadow-editor :deep(.el-textarea__inner),

@@ -150,6 +150,39 @@ class DeviceShadow(Base):
     )
 
 
+class DeviceShadowRevision(Base):
+    """设备影子期望版本快照（v1.37.0）。
+
+    每次 desired 真实变化后保存完整快照；回滚读取目标快照并生成一个新版本，
+    不修改或删除既有历史。`(device_id, version)` 唯一，升级时仅为存量当前状态
+    补 baseline，无法 reconstruct 的旧版本保持缺失。
+    """
+
+    __tablename__ = "device_shadow_revision"
+    __table_args__ = (
+        UniqueConstraint("device_id", "version", name="uq_shadow_revision_device_version"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    desired: Mapped[Dict[str, Any]] = mapped_column(
+        JSONPayload, nullable=False, default=dict, server_default="{}"
+    )
+    changed_keys: Mapped[List[str]] = mapped_column(
+        JSONPayload, nullable=False, default=list, server_default="[]"
+    )
+    # baseline / merge / clear / batch / rollback
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
 class SensorRecord(Base):
     """传感器时序数据表：设备每次唤醒上报一条。"""
 

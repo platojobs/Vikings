@@ -151,6 +151,25 @@ class ApiClient {
     return DeviceShadow.fromJson(data);
   }
 
+  /// 设备影子版本历史，只在用户展开时请求；移动端不提供回滚写操作。
+  Future<DeviceShadowHistory> fetchDeviceShadowHistory({
+    required String token,
+    required String deviceId,
+    int limit = 20,
+    int offset = 0,
+  }) async {
+    final data = await _send(
+      'GET',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/shadow/history',
+      token: token,
+      query: <String, dynamic>{'limit': '$limit', 'offset': '$offset'},
+    );
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException(ApiErrorKind.invalidResponse, '影子历史响应缺少 data');
+    }
+    return DeviceShadowHistory.fromJson(data);
+  }
+
   /// 签发/轮换设备凭证：口令只在本次响应出现一次，调用方必须立即展示并清空。
   Future<DeviceCredentialResult> issueDeviceCredential({
     required String token,

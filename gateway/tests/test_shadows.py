@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app import rules
 from app.database import get_session
 from app.main import app
-from app.models import AuditLog, Device, DeviceShadow, DeviceTag
+from app.models import AuditLog, Device, DeviceShadow, DeviceShadowRevision, DeviceTag
 from app.security import ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, create_access_token
 from app.services import device_service, shadow_service
 from db_utils import create_test_engine
@@ -498,6 +498,183 @@ def test_device_delete_cascades_shadow(tmp_path):
             await session.commit()
             row = await session.get(DeviceShadow, "dev-1")
             assert row is None
+            revisions = (
+                await session.execute(
+                    select(DeviceShadowRevision).where(DeviceShadowRevision.device_id == "dev-1")
+                )
+            ).scalars().all()
+            assert list(revisions) == []
+
+    _run(tmp_path, scenario)
+
+
+# ==================== v1.37.0 版本历史与回滚 ====================
+
+
+def test_shadow_history_records_merge_clear_batch_and_paginates(tmp_path):
+    async def scenario(client, factory):
+        async with factory() as session:
+            await _seed(session, [("dev-1", "默认分组", "online", [])])
+
+        resp = await client.put(
+            "/api/devices/dev-1/shadow/desired",
+            headers=_headers(ROLE_OPERATOR),
+            json={"patch": {"led": "on", "fan_speed": 1}},
+        )
+        assert resp.status_code == 200
+        # 同值写入既不加版本，也不制造重复历史。
+        await client.put(
+            "/api/devices/dev-1/shadow/desired",
+            headers=_headers(ROLE_OPERATOR),
+            json={"patch": {"led": "on"}},
+        )
+        resp = await client.delete(
+            "/api/devices/dev-1/shadow/desired?keys=fan_speed",
+            headers=_headers(ROLE_OPERATOR),
+        )
+        assert resp.json()["data"]["version"] == 2
+        resp = await client.post(
+            "/api/devices/shadow/desired/batch",
+            headers=_headers(ROLE_OPERATOR),
+            json={"device_ids": ["dev-1"], "patch": {"led": "off"}},
+        )
+        assert resp.json()["data"]["updated"] == 1
+
+        resp = await client.get(
+            "/api/devices/dev-1/shadow/history?limit=2",
+            headers=_headers(ROLE_VIEWER),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert data["total"] == 4  # baseline v0 + merge v1 + clear v2 + batch v3
+        assert [item["version"] for item in data["items"]] == [3, 2]
+        assert data["items"][0]["action"] == "batch"
+        assert data["items"][0]["desired"] == {"led": "off"}
+        assert data["items"][0]["changed_keys"] == ["led"]
+        assert data["items"][1]["action"] == "clear"
+        assert data["items"][1]["changed_keys"] == ["fan_speed"]
+
+        resp = await client.get(
+            "/api/devices/dev-1/shadow/history?limit=2&offset=2",
+            headers=_headers(ROLE_VIEWER),
+        )
+        items = resp.json()["data"]["items"]
+        assert [item["version"] for item in items] == [1, 0]
+        assert items[0]["desired"] == {"led": "on", "fan_speed": 1}
+        assert items[0]["changed_keys"] == ["fan_speed", "led"]
+        assert items[1]["action"] == "baseline" and items[1]["desired"] == {}
+
+        assert (await client.get("/api/devices/dev-1/shadow/history")).status_code == 401
+        assert (
+            await client.get(
+                "/api/devices/dev-ghost/shadow/history", headers=_headers(ROLE_VIEWER)
+            )
+        ).status_code == 404
+        assert (
+            await client.get(
+                "/api/devices/dev-1/shadow/history?limit=0", headers=_headers(ROLE_VIEWER)
+            )
+        ).status_code == 422
+
+    _run(tmp_path, scenario)
+
+
+def test_shadow_rollback_restores_exact_snapshot_and_preserves_reported(tmp_path):
+    async def scenario(client, factory):
+        async with factory() as session:
+            await _seed(session, [("dev-1", "默认分组", "online", [])])
+
+        await client.put(
+            "/api/devices/dev-1/shadow/desired",
+            headers=_headers(ROLE_OPERATOR),
+            json={"patch": {"led": "on", "fan_speed": 1}},
+        )
+        await client.post(
+            "/api/devices/dev-1/shadow/reported",
+            headers=_headers(ROLE_OPERATOR),
+            json={"reported": {"led": "on", "fan_speed": 1}, "version": 1},
+        )
+        await client.put(
+            "/api/devices/dev-1/shadow/desired",
+            headers=_headers(ROLE_OPERATOR),
+            json={"patch": {"led": "off", "extra": True}},
+        )
+        await client.post(
+            "/api/devices/dev-1/shadow/reported",
+            headers=_headers(ROLE_OPERATOR),
+            json={"reported": {"led": "off", "extra": True}, "version": 2},
+        )
+
+        resp = await client.post(
+            "/api/devices/dev-1/shadow/rollback",
+            headers=_headers(ROLE_OPERATOR),
+            json={"version": 1},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert data["version"] == 3
+        assert data["desired"] == {"led": "on", "fan_speed": 1}
+        assert "extra" not in data["desired"], "回滚必须精确替换，而不是把旧键 merge 回来"
+        assert data["reported"] == {"led": "off", "fan_speed": 1, "extra": True}
+        assert data["reported_version"] == 2
+        assert data["sync_status"] == "pending"
+
+        resp = await client.get(
+            "/api/devices/dev-1/shadow/history?limit=1", headers=_headers(ROLE_VIEWER)
+        )
+        latest = resp.json()["data"]["items"][0]
+        assert latest["version"] == 3
+        assert latest["action"] == "rollback"
+        assert latest["source_version"] == 1
+        assert latest["changed_keys"] == ["extra", "led"]
+        assert latest["desired"] == {"led": "on", "fan_speed": 1}
+
+        # 当前内容已与目标一致时幂等，不生成 v4，也不重复写审计。
+        resp = await client.post(
+            "/api/devices/dev-1/shadow/rollback",
+            headers=_headers(ROLE_OPERATOR),
+            json={"version": 1},
+        )
+        assert resp.json()["data"]["version"] == 3
+
+        async with factory() as session:
+            revisions = list(
+                (await session.execute(select(DeviceShadowRevision))).scalars().all()
+            )
+            assert len(revisions) == 4
+            v2 = next(item for item in revisions if item.version == 2)
+            assert v2.desired == {"led": "off", "fan_speed": 1, "extra": True}
+            audit = (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "device.shadow_rollback")
+                )
+            ).scalars().all()
+            assert len(audit) == 1
+            assert audit[0].detail == {
+                "sourceVersion": 1,
+                "version": 3,
+                "keys": ["extra", "led"],
+                "changed": True,
+            }
+            assert "off" not in str(audit[0].detail)
+
+        assert (
+            await client.post(
+                "/api/devices/dev-1/shadow/rollback",
+                headers=_headers(ROLE_OPERATOR),
+                json={"version": 99},
+            )
+        ).status_code == 404
+        assert (
+            await client.post(
+                "/api/devices/dev-1/shadow/rollback",
+                headers=_headers(ROLE_VIEWER),
+                json={"version": 1},
+            )
+        ).status_code == 403
+        assert (
+            await client.post("/api/devices/dev-1/shadow/rollback", json={"version": 1})
+        ).status_code == 401
 
     _run(tmp_path, scenario)
 

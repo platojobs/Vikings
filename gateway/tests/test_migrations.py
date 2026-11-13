@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -19,7 +20,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0011_device_shadow"
+HEAD = "0012_shadow_history"
 # v1.34.0 规则表与命中规则快照列
 ALERT_RULE_INDEXES = {"idx_alert_rule_metric", "idx_alert_rule_scope"}
 MATCHED_RULE_COLUMN = {"matched_rule"}
@@ -158,6 +159,8 @@ def test_upgrade_on_empty_database(tmp_path):
         "sla_config",
         # v1.34.0 可配置告警规则
         "alert_rule",
+        "device_shadow",
+        "device_shadow_revision",
     } <= _table_names(db_path)
     assert NEW_INDEXES <= _index_names(db_path)
     assert ALERT_RULE_INDEXES <= _index_names(db_path)
@@ -242,10 +245,11 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    # 从 0011 连降六步（0011 → 0010 → 0009 → 0008 → 0007 → 0006 → 0005）验证往返
-    down = _run_alembic(db_path, "downgrade", "-6")
+    # 从 0012 连降七步到 0005，验证影子历史、影子、标签等迁移往返
+    down = _run_alembic(db_path, "downgrade", "-7")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
+    assert "device_shadow_revision" not in _table_names(db_path), "downgrade 必须移除影子历史表"
     assert "device_shadow" not in _table_names(db_path), "downgrade 必须移除设备影子表"
     assert "device_tag" not in _table_names(db_path), "downgrade 必须移除设备标签表"
     assert "alert_rule" not in _table_names(db_path), "downgrade 必须移除告警规则表"
@@ -282,6 +286,47 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
         )
     assert "mqtt_credential_revoked_at" in _device_columns(db_path)
     assert _alembic_version(db_path) == HEAD
+
+
+def test_v136_shadow_backfilled_as_single_baseline(tmp_path):
+    """v1.36 只有当前状态：升级补一个可回滚基线，不伪造更早版本。"""
+    db_path = tmp_path / "v136-shadow.db"
+    assert _run_alembic(db_path, "upgrade", "0011_device_shadow").returncode == 0
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO device "
+            "(device_id, name, model, firmware_version, group_name, status) "
+            "VALUES ('dev-v136', '存量影子', 'VG-S100', '1.0.0', '默认分组', 'offline')"
+        )
+        con.execute(
+            "INSERT INTO device_shadow "
+            "(device_id, desired, reported, version, desired_updated_by) "
+            "VALUES ('dev-v136', '{\"led\":\"on\",\"fan_speed\":2}', '{}', 4, 'ops')"
+        )
+        con.commit()
+
+    up = _run_alembic(db_path, "upgrade", "head")
+    assert up.returncode == 0, up.stderr
+    with sqlite3.connect(db_path) as con:
+        rows = con.execute(
+            "select device_id, version, desired, changed_keys, action, source_version, created_by "
+            "from device_shadow_revision"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0:2] == ("dev-v136", 4)
+    assert json.loads(rows[0][2]) == {"led": "on", "fan_speed": 2}
+    assert json.loads(rows[0][3]) == []
+    assert rows[0][4:] == ("baseline", None, "ops")
+
+    down = _run_alembic(db_path, "downgrade", "-1")
+    assert down.returncode == 0, down.stderr
+    assert "device_shadow_revision" not in _table_names(db_path)
+    with sqlite3.connect(db_path) as con:
+        current = con.execute(
+            "select desired, version from device_shadow where device_id='dev-v136'"
+        ).fetchone()
+    assert json.loads(current[0]) == {"led": "on", "fan_speed": 2}
+    assert current[1] == 4, "downgrade 只删除历史，不影响 v1.36 当前影子"
 
 
 def test_v129_config_and_delivery_preserved_and_default_rule_seeded(tmp_path):

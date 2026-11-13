@@ -293,6 +293,80 @@ class DeviceShadow {
   );
 }
 
+/// 设备影子不可变版本快照；回滚也会生成一条新的快照。
+class DeviceShadowRevision {
+  const DeviceShadowRevision({
+    required this.id,
+    required this.deviceId,
+    required this.version,
+    this.desired = const <String, dynamic>{},
+    this.changedKeys = const <String>[],
+    this.action = 'merge',
+    this.sourceVersion,
+    this.createdAt,
+    this.createdBy,
+  });
+
+  final int id;
+  final String deviceId;
+  final int version;
+  final Map<String, dynamic> desired;
+  final List<String> changedKeys;
+  final String action;
+  final int? sourceVersion;
+  final DateTime? createdAt;
+  final String? createdBy;
+
+  factory DeviceShadowRevision.fromJson(Map<String, dynamic> json) =>
+      DeviceShadowRevision(
+        id: _asInt(json['id']),
+        deviceId: _asString(json['device_id']),
+        version: _asInt(json['version']),
+        desired: DeviceShadow._stateFrom(json['desired']),
+        changedKeys: (json['changed_keys'] is List)
+            ? (json['changed_keys'] as List)
+                  .map((item) => item.toString())
+                  .toList(growable: false)
+            : const <String>[],
+        action: _asString(json['action'], 'merge'),
+        sourceVersion: _asNullableInt(json['source_version']),
+        createdAt: _asTime(json['created_at']),
+        createdBy: _asNullableString(json['created_by']),
+      );
+}
+
+/// `GET /api/devices/{id}/shadow/history` 的版本快照分页结果。
+class DeviceShadowHistory {
+  const DeviceShadowHistory({
+    this.items = const <DeviceShadowRevision>[],
+    this.total = 0,
+    this.limit = 20,
+    this.offset = 0,
+  });
+
+  final List<DeviceShadowRevision> items;
+  final int total;
+  final int limit;
+  final int offset;
+
+  factory DeviceShadowHistory.fromJson(Map<String, dynamic> json) =>
+      DeviceShadowHistory(
+        items: (json['items'] is List)
+            ? (json['items'] as List)
+                  .whereType<Map>()
+                  .map(
+                    (item) => DeviceShadowRevision.fromJson(
+                      Map<String, dynamic>.from(item),
+                    ),
+                  )
+                  .toList(growable: false)
+            : const <DeviceShadowRevision>[],
+        total: _asInt(json['total']),
+        limit: _asInt(json['limit'], 20),
+        offset: _asInt(json['offset']),
+      );
+}
+
 /// `POST /api/devices/{id}/mqtt-credential`：口令只在本次响应出现一次。
 class DeviceCredentialResult {
   const DeviceCredentialResult({

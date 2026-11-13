@@ -183,6 +183,71 @@ void main() {
     expect(shadow.reportedUpdatedAt, DateTime.utc(2026, 11, 13, 2, 1));
   });
 
+  test('fetchDeviceShadowHistory 保留分页、认证并解析完整快照', () async {
+    late http.Request captured;
+    final client = ApiClient(
+      baseUrl: 'http://api.example:8000',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return _jsonResponse(
+          _ok(<String, dynamic>{
+            'items': <dynamic>[
+              <String, dynamic>{
+                'id': 8,
+                'device_id': 'dev/0001',
+                'version': 3,
+                'desired': <String, dynamic>{
+                  'led': 'on',
+                  'report_interval': 30,
+                },
+                'changed_keys': <String>['led'],
+                'action': 'rollback',
+                'source_version': 1,
+                'created_at': '2026-11-13T09:00:00+00:00',
+                'created_by': 'operator',
+              },
+            ],
+            'total': 24,
+            'limit': 20,
+            'offset': 20,
+          }),
+        );
+      }),
+    );
+
+    final history = await client.fetchDeviceShadowHistory(
+      token: 'token',
+      deviceId: 'dev/0001',
+      limit: 20,
+      offset: 20,
+    );
+
+    expect(captured.method, 'GET');
+    expect(
+      captured.url,
+      Uri.parse(
+        'http://api.example:8000/api/devices/dev%2F0001/shadow/history?limit=20&offset=20',
+      ),
+    );
+    expect(captured.headers['Authorization'], 'Bearer token');
+    expect(history.total, 24);
+    expect(history.limit, 20);
+    expect(history.offset, 20);
+    expect(history.items, hasLength(1));
+    final revision = history.items.single;
+    expect(revision.id, 8);
+    expect(revision.version, 3);
+    expect(revision.desired, <String, dynamic>{
+      'led': 'on',
+      'report_interval': 30,
+    });
+    expect(revision.changedKeys, <String>['led']);
+    expect(revision.action, 'rollback');
+    expect(revision.sourceVersion, 1);
+    expect(revision.createdBy, 'operator');
+    expect(revision.createdAt, DateTime.utc(2026, 11, 13, 9));
+  });
+
   test('单设备历史记录拼接正确路径与 limit 参数', () async {
     late http.Request captured;
     final client = ApiClient(

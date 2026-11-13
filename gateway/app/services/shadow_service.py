@@ -1,6 +1,7 @@
-"""设备影子服务（v1.36.0）。
+"""设备影子服务（v1.36.0 / v1.37.0）。
 
-职责：期望状态写入、上报状态接收、同步状态派生、批量下发与差异计算。
+职责：期望状态写入、上报状态接收、同步状态派生、批量下发、差异计算、
+不可变版本快照与完整快照精确回滚。
 
 设计要点：
 - 一行一设备，主键即 device_id；不存在「孤儿影子」：设备删除时由 device_service 显式清理；
@@ -19,10 +20,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Device, DeviceShadow
+from app.models import Device, DeviceShadow, DeviceShadowRevision
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,10 @@ _ALLOWED_VALUE_TYPES = (str, int, float, bool, type(None))
 
 class ShadowValidationError(ValueError):
     """期望/上报数据不合法；路由层转换为 400。"""
+
+
+class ShadowRevisionNotFound(ValueError):
+    """目标影子版本没有快照；路由层转换为 404。"""
 
 
 def _now() -> datetime:
@@ -128,12 +133,67 @@ def compute_sync_status(
     return "offline_pending" if device_status == "offline" else "pending"
 
 
+def _changed_keys(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    """返回前后快照中新增、删除或值发生变化的键。"""
+    return sorted(
+        key
+        for key in set(before or {}) | set(after or {})
+        if key not in before or key not in after or before[key] != after[key]
+    )
+
+
+async def _record_revision(
+    session: AsyncSession,
+    row: DeviceShadow,
+    *,
+    action: str,
+    operator: Optional[str],
+    changed_keys: Optional[Sequence[str]] = None,
+    source_version: Optional[int] = None,
+    created_at: Optional[datetime] = None,
+) -> DeviceShadowRevision:
+    revision = DeviceShadowRevision(
+        device_id=row.device_id,
+        version=int(row.version or 0),
+        desired=dict(row.desired or {}),
+        changed_keys=sorted(set(changed_keys or [])),
+        action=action,
+        source_version=source_version,
+        created_by=operator,
+    )
+    if created_at is not None:
+        revision.created_at = created_at
+    session.add(revision)
+    await session.flush()
+    return revision
+
+
+async def _ensure_current_revision(
+    session: AsyncSession, row: DeviceShadow, operator: str
+) -> None:
+    """为未经过 v1.37 迁移的当前状态补基线，保证首次变更也可回退。"""
+    stmt = select(DeviceShadowRevision.id).where(
+        DeviceShadowRevision.device_id == row.device_id,
+        DeviceShadowRevision.version == int(row.version or 0),
+    )
+    if (await session.execute(stmt)).scalar_one_or_none() is not None:
+        return
+    await _record_revision(
+        session,
+        row,
+        action="baseline",
+        operator=row.desired_updated_by or operator,
+        created_at=row.desired_updated_at or row.created_at or _now(),
+    )
+
+
 async def _ensure_row(session: AsyncSession, device_id: str) -> DeviceShadow:
     row = await session.get(DeviceShadow, device_id)
     if row is None:
         row = DeviceShadow(device_id=device_id, desired={}, reported={}, version=0)
         session.add(row)
         await session.flush()
+        await _record_revision(session, row, action="baseline", operator=None)
     return row
 
 
@@ -170,19 +230,30 @@ async def apply_desired_patch(
     device_id: str,
     patch: Dict[str, Any],
     operator: str,
+    *,
+    action: str = "merge",
 ) -> Tuple[DeviceShadow, bool]:
     """合并写入期望状态；返回 (row, 是否真的变更)。
 
-    纯幂等 patch（所有键已处于目标值）不递增版本号，但仍返回 row 供路由层回显。
+    纯幂等 patch（所有键已处于目标值）不递增版本号，也不新增历史快照。
     """
     _validate_patch(patch, field="patch")
     row = await _ensure_row(session, device_id)
-    new_desired, changed = _apply_patch(row.desired or {}, patch)
+    await _ensure_current_revision(session, row, operator)
+    before = dict(row.desired or {})
+    new_desired, changed = _apply_patch(before, patch)
     if changed:
         row.desired = new_desired
         row.version = int(row.version or 0) + 1
         row.desired_updated_at = _now()
         row.desired_updated_by = operator
+        await _record_revision(
+            session,
+            row,
+            action=action,
+            operator=operator,
+            changed_keys=_changed_keys(before, new_desired),
+        )
     await session.flush()
     return row, changed
 
@@ -218,14 +289,23 @@ async def clear_desired_keys(
 ) -> Tuple[DeviceShadow, List[str]]:
     """清除指定键的期望；返回 (row, 实际被清除的键)。"""
     row = await _ensure_row(session, device_id)
+    await _ensure_current_revision(session, row, operator)
+    before = dict(row.desired or {})
     patch = {key: None for key in keys if key}
-    new_desired, _ = _apply_patch(row.desired or {}, patch)
-    removed = sorted(set((row.desired or {}).keys()) - set(new_desired.keys()))
+    new_desired, _ = _apply_patch(before, patch)
+    removed = sorted(set(before.keys()) - set(new_desired.keys()))
     if removed:
         row.desired = new_desired
         row.version = int(row.version or 0) + 1
         row.desired_updated_at = _now()
         row.desired_updated_by = operator
+        await _record_revision(
+            session,
+            row,
+            action="clear",
+            operator=operator,
+            changed_keys=removed,
+        )
     await session.flush()
     return row, removed
 
@@ -283,7 +363,9 @@ async def batch_apply_desired(
     """对一组设备应用同一个 patch；逐设备返回真实状态。"""
     results: List[Dict[str, Any]] = []
     for device_id in device_ids:
-        row, changed = await apply_desired_patch(session, device_id, patch, operator)
+        row, changed = await apply_desired_patch(
+            session, device_id, patch, operator, action="batch"
+        )
         results.append(
             {
                 "device_id": device_id,
@@ -295,6 +377,80 @@ async def batch_apply_desired(
     return results
 
 
+async def list_revisions(
+    session: AsyncSession,
+    device_id: str,
+    *,
+    limit: int,
+    offset: int,
+) -> Tuple[List[DeviceShadowRevision], int]:
+    """按版本倒序返回不可变快照；offset/limit 只影响查询，不改变历史。"""
+    filters = (DeviceShadowRevision.device_id == device_id,)
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(DeviceShadowRevision).where(*filters)
+            )
+        ).scalar_one()
+    )
+    stmt = (
+        select(DeviceShadowRevision)
+        .where(*filters)
+        .order_by(DeviceShadowRevision.version.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    items = list((await session.execute(stmt)).scalars().all())
+    return items, total
+
+
+async def rollback_desired(
+    session: AsyncSession,
+    device_id: str,
+    target_version: int,
+    operator: str,
+) -> Tuple[DeviceShadow, bool, List[str]]:
+    """用目标版本的完整快照替换当前期望，并生成一个新版本。
+
+    这是精确替换而不是 merge：目标快照没有的当前键会被移除。reported 与
+    reported_version 保持不动，由设备下一次主动同步确认新期望。若当前期望已经
+    与目标快照一致，则幂等返回，不空增版本。
+    """
+    row = await _ensure_row(session, device_id)
+    await _ensure_current_revision(session, row, operator)
+    stmt = select(DeviceShadowRevision).where(
+        DeviceShadowRevision.device_id == device_id,
+        DeviceShadowRevision.version == target_version,
+    )
+    target = (await session.execute(stmt)).scalar_one_or_none()
+    if target is None:
+        raise ShadowRevisionNotFound(f"设备 {device_id} 的影子版本 v{target_version} 不存在")
+
+    before = dict(row.desired or {})
+    restored = dict(target.desired or {})
+    changed_keys = _changed_keys(before, restored)
+    if not changed_keys:
+        return row, False, []
+
+    row.desired = restored
+    row.version = int(row.version or 0) + 1
+    row.desired_updated_at = _now()
+    row.desired_updated_by = operator
+    await _record_revision(
+        session,
+        row,
+        action="rollback",
+        operator=operator,
+        changed_keys=changed_keys,
+        source_version=target_version,
+    )
+    await session.flush()
+    return row, True, changed_keys
+
+
 async def delete_device_shadow(session: AsyncSession, device_id: str) -> None:
-    """设备删除时清理影子（无外键，显式清理避免孤儿行）。"""
+    """设备删除时同时清理当前影子与版本历史，避免孤儿行。"""
+    await session.execute(
+        delete(DeviceShadowRevision).where(DeviceShadowRevision.device_id == device_id)
+    )
     await session.execute(delete(DeviceShadow).where(DeviceShadow.device_id == device_id))

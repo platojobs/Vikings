@@ -138,13 +138,18 @@ class SimulatedDevice:
             if version <= reported_version and not diff_keys:
                 return
 
+            # 完整快照回滚可能移除键；reported 是 merge patch，必须显式补 null，
+            # 否则服务端会保留已经不在设备实际配置中的旧键。
+            reported_patch = dict(desired)
+            for key in set(self.reported_state) - set(desired):
+                reported_patch[key] = None
             # 模拟器把当前期望视为已应用配置；真实硬件应在此写入自身配置存储。
             self.reported_state = dict(desired)
             await asyncio.to_thread(
                 self._api_request,
                 "POST",
                 path + "/reported",
-                {"reported": self.reported_state, "version": version},
+                {"reported": reported_patch, "version": version},
             )
             print(
                 "[{}] 影子已同步 version={} keys={}".format(

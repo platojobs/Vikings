@@ -9,9 +9,11 @@ import {
   batchUpdateShadowDesired,
   clearDeviceShadowDesiredKeys,
   fetchDeviceShadow,
+  fetchDeviceShadowHistory,
+  rollbackDeviceShadow,
   updateDeviceShadowDesired,
 } from '@/api/devices'
-import type { DeviceShadow, DeviceShadowBatchResult } from '@/types'
+import type { DeviceShadow, DeviceShadowBatchResult, DeviceShadowHistory } from '@/types'
 
 const shadow: DeviceShadow = {
   device_id: 'dev-0001',
@@ -89,5 +91,47 @@ describe('设备影子 API', () => {
       },
     })
     expect(data.not_found).toBe(1)
+  })
+
+  it('历史查询保留分页参数并返回可展示快照', async () => {
+    const history: DeviceShadowHistory = {
+      items: [
+        {
+          id: 8,
+          device_id: 'dev/0001',
+          version: 3,
+          desired: { led: 'on' },
+          changed_keys: ['led'],
+          action: 'rollback',
+          source_version: 1,
+          created_at: '2026-11-13T09:00:00Z',
+          created_by: 'operator',
+        },
+      ],
+      total: 4,
+      limit: 20,
+      offset: 20,
+    }
+    requestMock.mockResolvedValue(history)
+
+    const data = await fetchDeviceShadowHistory('dev/0001', { limit: 20, offset: 20 })
+
+    expect(requestMock).toHaveBeenCalledWith('/api/devices/dev%2F0001/shadow/history', {
+      params: { limit: 20, offset: 20 },
+    })
+    expect(data.items[0].desired).toEqual({ led: 'on' })
+    expect(data.total).toBe(4)
+  })
+
+  it('回滚使用 POST 提交目标版本并展示新版本结果', async () => {
+    requestMock.mockResolvedValue({ ...shadow, version: 4 })
+
+    const data = await rollbackDeviceShadow('dev/0001', 1)
+
+    expect(requestMock).toHaveBeenCalledWith('/api/devices/dev%2F0001/shadow/rollback', {
+      method: 'POST',
+      body: { version: 1 },
+    })
+    expect(data.version).toBe(4)
   })
 })

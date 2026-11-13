@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -1894,6 +1895,12 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
 
   List<CommandItem> _commands = const <CommandItem>[];
   DeviceShadow? _shadow;
+  List<DeviceShadowRevision> _shadowHistory = const <DeviceShadowRevision>[];
+  int _shadowHistoryTotal = 0;
+  bool _shadowHistoryVisible = false;
+  bool _shadowHistoryLoading = false;
+  bool _shadowHistoryLoaded = false;
+  String? _shadowHistoryError;
 
   /// 历史上报按时间倒序（最新在前），实时新上报插入顶部。
   List<SensorReading> _records = const <SensorReading>[];
@@ -2359,6 +2366,69 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     ),
   );
 
+  Future<void> _toggleShadowHistory() async {
+    if (_shadowHistoryVisible) {
+      setState(() => _shadowHistoryVisible = false);
+      return;
+    }
+    setState(() => _shadowHistoryVisible = true);
+    if (!_shadowHistoryLoaded) {
+      await _loadShadowHistory();
+    }
+  }
+
+  Future<void> _loadShadowHistory({bool append = false}) async {
+    if (_shadowHistoryLoading) {
+      return;
+    }
+    setState(() {
+      _shadowHistoryLoading = true;
+      _shadowHistoryError = null;
+    });
+    final client = widget.apiClientFactory(widget.baseUrl);
+    try {
+      final result = await client.fetchDeviceShadowHistory(
+        token: widget.token,
+        deviceId: widget.device.deviceId,
+        limit: 20,
+        offset: append ? _shadowHistory.length : 0,
+      );
+      if (mounted) {
+        setState(() {
+          _shadowHistory = append
+              ? <DeviceShadowRevision>[..._shadowHistory, ...result.items]
+              : result.items;
+          _shadowHistoryTotal = result.total;
+          _shadowHistoryLoaded = true;
+        });
+      }
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() => _shadowHistoryError = error.userMessage);
+      }
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() => _shadowHistoryLoading = false);
+      }
+    }
+  }
+
+  String _shadowRevisionActionLabel(String action) {
+    switch (action) {
+      case 'baseline':
+        return '基线';
+      case 'clear':
+        return '清除键';
+      case 'batch':
+        return '批量修改';
+      case 'rollback':
+        return '回滚';
+      default:
+        return '单台修改';
+    }
+  }
+
   String _shadowStatusLabel(String status) {
     switch (status) {
       case 'synced':
@@ -2438,6 +2508,98 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     );
   }
 
+  Widget _buildShadowRevision(DeviceShadowRevision revision) {
+    final current = revision.version == _shadow?.version;
+    return Container(
+      key: ValueKey<String>('device-shadow-revision-${revision.version}'),
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF5F7FA),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'v${revision.version} · ${_shadowRevisionActionLabel(revision.action)}'
+            '${current ? ' · 当前' : ''}',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          Text(
+            '${revision.createdBy ?? '系统'} · ${_formatTime(revision.createdAt)}',
+            style: const TextStyle(fontSize: 11, color: Colors.black54),
+          ),
+          if (revision.sourceVersion != null)
+            Text(
+              '来源版本 v${revision.sourceVersion}',
+              style: const TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+          Text(
+            '变化键：${revision.changedKeys.isEmpty ? '—' : revision.changedKeys.join(', ')}',
+            style: const TextStyle(fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            const JsonEncoder.withIndent('  ').convert(revision.desired),
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildShadowHistory() {
+    if (!_shadowHistoryVisible) {
+      return const SizedBox.shrink();
+    }
+    if (_shadowHistoryLoading && _shadowHistory.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 12),
+        child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (_shadowHistoryError != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _shadowHistoryError!,
+                  style: const TextStyle(fontSize: 12, color: Colors.red),
+                ),
+                TextButton(
+                  onPressed: () => _loadShadowHistory(),
+                  child: const Text('重试'),
+                ),
+              ],
+            ),
+          ),
+        if (_shadowHistoryLoaded && _shadowHistory.isEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              '暂无版本历史',
+              style: TextStyle(fontSize: 12, color: Colors.black45),
+            ),
+          ),
+        ..._shadowHistory.map(_buildShadowRevision),
+        if (_shadowHistory.length < _shadowHistoryTotal)
+          TextButton(
+            key: const Key('device-shadow-history-more'),
+            onPressed: _shadowHistoryLoading
+                ? null
+                : () => _loadShadowHistory(append: true),
+            child: Text(_shadowHistoryLoading ? '加载中…' : '加载更早版本'),
+          ),
+      ],
+    );
+  }
+
   /// 设备影子只读区：写操作集中在 Web，移动端不复制 merge patch 编辑器。
   Widget _buildShadowSection() {
     final shadow = _shadow;
@@ -2498,8 +2660,15 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
           else
             ...keys.map((key) => _buildShadowStateRow(shadow, key)),
           const SizedBox(height: 8),
+          TextButton(
+            key: const Key('device-shadow-history-toggle'),
+            style: TextButton.styleFrom(padding: EdgeInsets.zero),
+            onPressed: _shadowHistoryLoading ? null : _toggleShadowHistory,
+            child: Text(_shadowHistoryVisible ? '收起变更历史' : '查看变更历史'),
+          ),
+          _buildShadowHistory(),
           const Text(
-            '只读视图；期望状态请在 Web 管理端修改。',
+            '只读视图；期望状态请在 Web 管理端修改或回滚。',
             style: TextStyle(fontSize: 11, color: Colors.black45),
           ),
         ],

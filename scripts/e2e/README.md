@@ -66,7 +66,7 @@ python scripts/e2e/e2e_acceptance.py
 > 会导致口令不一致，因此脚本选择直接失败。验收前请先停掉 `start_all.sh` 或本机
 > Mosquitto / uvicorn。
 
-## 4. 覆盖项（25 项）
+## 4. 覆盖项（当前 41 项，核心步骤如下）
 
 | 步骤 | 验证内容 |
 | --- | --- |
@@ -80,6 +80,7 @@ python scripts/e2e/e2e_acceptance.py
 | `simulator` | 启动模拟设备（`voltage=2.90` 触发 critical） |
 | `realtime_report` | WS 收到上报，端到端延迟 < 3000ms |
 | `rest_device` | REST 设备列表与 `/api/records/latest` 可读，状态 online |
+| `shadow_history_rollback` | 真实 REST 验证 v0 基线、v1/v2 快照、回滚生成 v3、旧快照与 reported 不变、重复回滚幂等、历史分页，以及设备 reported `null` 清键后恢复 synced |
 | `realtime_status` | WS 收到 online 与 offline（含 LWT / 休眠下线） |
 | `realtime_alert` | WS 秒级收到 `device/system/alert`，含 `alertId` |
 | `command_window` | 等设备下一轮唤醒窗口（指令只能在窗口内收到） |
@@ -133,8 +134,8 @@ python scripts/e2e/e2e_acceptance.py
 | 清理 | 脚本自行清理；作业另有 `if: always()` 兜底 `pkill`，并输出 `.run/e2e/*.log` 便于排查 |
 
 CI 覆盖：鉴权隔离（匿名拒绝、跨设备越权、客户端只读、凭证轮换）、
-MQTT over WebSocket 9001 握手与实时增量、设备唤醒窗口与指令 ack、
-告警从 MQTT 到 REST 的 acked 状态、停 Broker 后的断连/REST 降级/恢复重连。
+MQTT over WebSocket 9001 握手与实时增量、设备唤醒窗口与指令 ack、影子历史/精确回滚与
+reported `null` 清键、告警从 MQTT 到 REST 的 acked 状态、停 Broker 后的断连/REST 降级/恢复重连。
 
 排查方式：打开 `e2e` 作业 → 查看「运行真实 Broker 端到端验收」的逐项 PASS/FAIL →
 查看「失败时输出日志」步骤中 `mosquitto.log`、`gateway.log`、`simulator.log` 的末尾 80 行。

@@ -82,6 +82,7 @@ export function auditActionLabel(action: string): string {
     'device.bulk_create': '批量注册设备',
     'device.shadow_desired_update': '更新设备期望状态',
     'device.shadow_desired_batch': '批量更新期望状态',
+    'device.shadow_rollback': '回滚设备期望状态',
   }
   return labels[action] ?? action
 }

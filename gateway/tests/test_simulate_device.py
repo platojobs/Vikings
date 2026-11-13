@@ -70,6 +70,37 @@ def test_shadow_sync_applies_desired_and_reports_version():
     assert device.reported_state == {"report_interval": 30, "led": True}
 
 
+def test_shadow_sync_clears_reported_keys_removed_by_exact_rollback():
+    device = _device()
+    device.reported_state = {"report_interval": 30, "led": True, "extra": "old"}
+    device._api_request = Mock(
+        side_effect=[
+            {
+                "desired": {"report_interval": 30, "led": True},
+                "version": 8,
+                "reported_version": 7,
+                "diff_keys": ["extra"],
+            },
+            {"device_id": "dev/0001", "sync_status": "synced"},
+        ]
+    )
+
+    asyncio.run(device._sync_shadow())
+
+    assert device._api_request.call_args_list == [
+        call("GET", "/api/devices/dev%2F0001/shadow"),
+        call(
+            "POST",
+            "/api/devices/dev%2F0001/shadow/reported",
+            {
+                "reported": {"report_interval": 30, "led": True, "extra": None},
+                "version": 8,
+            },
+        ),
+    ]
+    assert device.reported_state == {"report_interval": 30, "led": True}
+
+
 def test_shadow_sync_skips_report_when_already_synced():
     device = _device()
     device._api_request = Mock(
