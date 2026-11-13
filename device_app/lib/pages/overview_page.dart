@@ -62,7 +62,16 @@ class _OverviewPageState extends State<OverviewPage>
 
   late final AppStorage _storage;
   late final SessionRefreshCoordinator _refresher;
-  late final ApiClient Function(String baseUrl) _createApiClient;
+  late final ApiClient Function(String baseUrl) _rawCreateApiClient;
+
+  /// 页面创建的每个客户端都绑定这个取消令牌，dispose 时统一取消在途请求。
+  final RequestCancellation _cancellation = RequestCancellation();
+
+  ApiClient _createApiClient(String baseUrl) {
+    final client = _rawCreateApiClient(baseUrl);
+    client.bindCancellation(_cancellation);
+    return client;
+  }
 
   AuthSession? _session;
   String _baseUrl = ApiConfig.defaultBaseUrl;
@@ -93,7 +102,7 @@ class _OverviewPageState extends State<OverviewPage>
       onRefreshed: _onSessionRefreshed,
       clientBuilder: widget.apiClientFactory,
     );
-    _createApiClient =
+    _rawCreateApiClient =
         widget.apiClientFactory ??
         (String baseUrl) => ApiClient(baseUrl: baseUrl, refresher: _refresher);
     WidgetsBinding.instance.addObserver(this);
@@ -133,6 +142,7 @@ class _OverviewPageState extends State<OverviewPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _cancellation.cancel();
     widget.feedPolling?.removeListener(_syncLiveLifecycle);
     _refreshDebounce?.cancel();
     _pollTimer?.cancel();

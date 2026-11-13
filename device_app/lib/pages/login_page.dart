@@ -35,7 +35,15 @@ class LoginPage extends StatefulWidget {
 
 class _LoginPageState extends State<LoginPage> {
   late final AppStorage _storage;
-  late final ApiClient Function(String baseUrl) _createApiClient;
+  late final ApiClient Function(String baseUrl) _rawCreateApiClient;
+  final RequestCancellation _cancellation = RequestCancellation();
+
+  ApiClient _createApiClient(String baseUrl) {
+    final client = _rawCreateApiClient(baseUrl);
+    client.bindCancellation(_cancellation);
+    return client;
+  }
+
   late final TextEditingController _baseUrlController;
   late final TextEditingController _usernameController;
   late final TextEditingController _passwordController;
@@ -47,7 +55,7 @@ class _LoginPageState extends State<LoginPage> {
   void initState() {
     super.initState();
     _storage = widget.storage ?? AppStorage();
-    _createApiClient =
+    _rawCreateApiClient =
         widget.apiClientFactory ??
         (String baseUrl) => ApiClient(baseUrl: baseUrl);
     _baseUrlController = TextEditingController(text: widget.initialBaseUrl);
@@ -57,6 +65,7 @@ class _LoginPageState extends State<LoginPage> {
 
   @override
   void dispose() {
+    _cancellation.cancel();
     _baseUrlController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();

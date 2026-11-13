@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/mobile_api_models.dart';
 
@@ -11,27 +12,84 @@ abstract class SessionRefresher {
   Future<AuthSession?> refresh(String staleAccessToken);
 }
 
+/// 页面级取消令牌：页面持有一个，创建的每个 [ApiClient] 都绑定它，
+/// dispose 时一次性取消在途请求，避免回写已卸载的 State。
+class RequestCancellation {
+  final CancelToken token = CancelToken();
+
+  bool get isCancelled => token.isCancelled;
+
+  void cancel([String? reason]) {
+    if (!token.isCancelled) {
+      token.cancel(reason ?? '页面已销毁');
+    }
+  }
+}
+
+/// 拦截器之间传递上下文的键，避免把 token 塞进日志或查询串。
+const String _kAuthToken = 'authToken';
+const String _kAllowRefresh = 'allowRefresh';
+const String _kAuthRetried = 'authRetried';
+const String _kRetryAttempt = 'retryAttempt';
+const String _kLogStartedAt = 'logStartedAt';
+
 /// 移动看板的 REST 客户端：只读复用网关既有接口。
 ///
-/// 统一处理三类可预期故障并给出可读文案：
-/// 401（token 失效，先尝试单飞 refresh 再重放一次）、超时、网络不可达；
-/// 业务错误沿用网关 message。
+/// 横切逻辑都放在 dio 拦截器里：
+/// - 认证头统一注入（access 来自安全存储，由页面传入，不在页面手写 Header）；
+/// - 401 先走页面的单飞 [SessionRefresher]，成功后重放一次，失败保留 401 语义；
+/// - 错误统一映射为 [ApiErrorKind]，页面既有分支不变；
+/// - 仅幂等 GET 做有限次退避重试，写操作与 4xx 一律不重试；
+/// - 日志只记录方法、路径、状态与耗时，不输出 token、口令或 Authorization。
 class ApiClient {
   ApiClient({
     required this.baseUrl,
-    http.Client? httpClient,
+    Dio? dio,
     this.timeout = const Duration(seconds: 8),
     this.refresher,
-  }) : _client = httpClient ?? http.Client();
+    RequestCancellation? cancellation,
+    bool enableLogging = false,
+  }) : _dio = dio ?? Dio() {
+    _cancelToken = cancellation?.token;
+    _dio.options = BaseOptions(
+      baseUrl: baseUrl,
+      connectTimeout: timeout,
+      receiveTimeout: timeout,
+      sendTimeout: timeout,
+      responseType: ResponseType.bytes,
+      listFormat: ListFormat.multi,
+      // 4xx/5xx 交给拦截器按网关 detail 统一映射，避免 dio 默认文案丢掉中文原因
+      validateStatus: (status) =>
+          status != null && status >= 200 && status < 300,
+    );
+    _dio.interceptors.addAll(<Interceptor>[
+      _AuthInterceptor(),
+      _UnauthorizedInterceptor(dio: _dio, refresher: refresher),
+      _GetRetryInterceptor(dio: _dio),
+      _ErrorMappingInterceptor(),
+      if (enableLogging) _SanitizedLogInterceptor(),
+    ]);
+  }
 
   final String baseUrl;
   final Duration timeout;
-  final http.Client _client;
 
   /// 为空时保持旧行为：401 直接抛 unauthorized，由页面清会话回登录页。
   final SessionRefresher? refresher;
 
-  void close() => _client.close();
+  final Dio _dio;
+  CancelToken? _cancelToken;
+
+  /// 页面销毁时取消在途请求：客户端由页面创建，取消令牌挂在页面上。
+  void bindCancellation(RequestCancellation cancellation) {
+    _cancelToken = cancellation.token;
+  }
+
+  /// 仅用于测试断言超时配置，业务代码不要直接操作 dio。
+  @visibleForTesting
+  Dio get dio => _dio;
+
+  void close() => _dio.close(force: true);
 
   Future<AuthSession> login({
     required String username,
@@ -408,106 +466,47 @@ class ApiClient {
     String path, {
     String? token,
     Map<String, dynamic>? body,
-    // 值可为 String 或 List<String>；Uri.replace 会把列表展开为重复查询参数
+    // 值可为 String 或 List<String>；dio 的 ListFormat.multi 展开为重复查询参数
     Map<String, dynamic>? query,
     bool allowRefresh = true,
   }) async {
-    final uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
-
-    for (var attempt = 0; ; attempt += 1) {
-      final headers = <String, String>{
-        'Accept': 'application/json',
-        if (body != null) 'Content-Type': 'application/json',
-        if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token',
-      };
-
-      http.Response response;
-      try {
-        if (method == 'POST') {
-          response = await _client
-              .post(uri, headers: headers, body: jsonEncode(body ?? const {}))
-              .timeout(timeout);
-        } else if (method == 'DELETE') {
-          response = await _client
-              .delete(uri, headers: headers)
-              .timeout(timeout);
-        } else {
-          response = await _client.get(uri, headers: headers).timeout(timeout);
-        }
-      } on TimeoutException {
-        throw const ApiException(ApiErrorKind.timeout, '网关响应超时，请检查网络后重试');
-      } on http.ClientException catch (error) {
-        throw ApiException(ApiErrorKind.network, error.message);
-      } catch (_) {
-        // 覆盖 SocketException 等平台底层网络异常，统一收敛为可读提示
-        throw const ApiException(
-          ApiErrorKind.network,
-          '无法连接网关，请确认地址、后端进程与网络连通性',
-        );
+    final options = Options(
+      method: method.toUpperCase(),
+      extra: <String, dynamic>{
+        _kAuthToken: token,
+        _kAllowRefresh: allowRefresh,
+      },
+    );
+    try {
+      final response = await _dio.request<List<int>>(
+        path,
+        // 与旧实现保持一致：POST 无 body 时发送空对象，DELETE/GET 不带 body
+        data: body ?? (method.toUpperCase() == 'POST' ? const <String, dynamic>{} : null),
+        queryParameters: query,
+        options: options,
+        cancelToken: _cancelToken,
+      );
+      return _decodePayload(response.data, response.statusCode ?? 0);
+    } on DioException catch (error) {
+      final mapped = error.error;
+      if (mapped is ApiException) {
+        throw mapped;
       }
-
-      try {
-        // 解码/业务异常只在传输成功后才产生，交给调用方按 ApiErrorKind 处理
-        return _decode(response);
-      } on ApiException catch (error) {
-        final canRetry =
-            error.kind == ApiErrorKind.unauthorized &&
-            attempt == 0 &&
-            allowRefresh &&
-            refresher != null &&
-            token != null &&
-            token.isNotEmpty;
-        if (!canRetry) rethrow;
-        // 单飞协调器保证并发 401 只发一次 refresh；失败则返回 null → 保留 401 语义
-        final renewed = await refresher!.refresh(token);
-        if (renewed == null || renewed.token.isEmpty) rethrow;
-        token = renewed.token;
+      if (error.type == DioExceptionType.cancel) {
+        throw const ApiException(ApiErrorKind.cancelled, '请求已取消');
       }
+      throw ApiException(
+        ApiErrorKind.network,
+        error.message ?? '无法连接网关，请确认地址、后端进程与网络连通性',
+      );
     }
   }
 
-  dynamic _decode(http.Response response) {
-    Map<String, dynamic>? envelope;
-    try {
-      // FastAPI 返回 UTF-8 JSON 但不一定带 charset，必须按字节解码，
-      // 否则 http 的默认 latin1 会把中文告警文案解成乱码
-      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
-      if (decoded is Map<String, dynamic>) {
-        envelope = decoded;
-      }
-    } catch (_) {
-      envelope = null;
-    }
-
-    if (response.statusCode == 401) {
-      throw const ApiException(
-        ApiErrorKind.unauthorized,
-        '登录已失效，请重新登录',
-        statusCode: 401,
-      );
-    }
-    if (response.statusCode == 403) {
-      throw const ApiException(
-        ApiErrorKind.forbidden,
-        '当前账号无权访问该数据',
-        statusCode: 403,
-      );
-    }
-    if (response.statusCode == 409) {
-      throw ApiException(
-        ApiErrorKind.conflict,
-        envelope?['detail']?.toString() ?? '操作冲突，请刷新后重试',
-        statusCode: 409,
-      );
-    }
-    if (response.statusCode >= 400) {
-      final detail =
-          envelope?['detail']?.toString() ?? envelope?['message']?.toString();
-      throw ApiException(
-        ApiErrorKind.server,
-        detail ?? '网关请求失败（HTTP ${response.statusCode}）',
-        statusCode: response.statusCode,
-      );
+  /// 仅处理 2xx：状态码错误由 [_ErrorMappingInterceptor] 统一映射。
+  dynamic _decodePayload(List<int>? bytes, int statusCode) {
+    final envelope = _decodeEnvelopeBytes(bytes);
+    if (statusCode >= 400) {
+      throw _httpStatusException(statusCode, envelope);
     }
     if (envelope == null) {
       throw const ApiException(ApiErrorKind.invalidResponse, '网关返回数据格式异常');
@@ -533,6 +532,262 @@ class ApiClient {
   }
 }
 
+/// 按字节解码网关 JSON（UTF-8），失败返回 null。
+Map<String, dynamic>? _decodeEnvelopeBytes(List<int>? bytes) {
+  if (bytes == null || bytes.isEmpty) {
+    return null;
+  }
+  try {
+    final decoded = jsonDecode(utf8.decode(bytes));
+    return decoded is Map<String, dynamic> ? decoded : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 状态码 → 既有错误分类，页面按 [ApiErrorKind] 的既有分支不受影响。
+ApiException _httpStatusException(
+  int statusCode,
+  Map<String, dynamic>? envelope,
+) {
+  switch (statusCode) {
+    case 401:
+      return const ApiException(
+        ApiErrorKind.unauthorized,
+        '登录已失效，请重新登录',
+        statusCode: 401,
+      );
+    case 403:
+      return const ApiException(
+        ApiErrorKind.forbidden,
+        '当前账号无权访问该数据',
+        statusCode: 403,
+      );
+    case 409:
+      return ApiException(
+        ApiErrorKind.conflict,
+        envelope?['detail']?.toString() ?? '操作冲突，请刷新后重试',
+        statusCode: 409,
+      );
+    default:
+      if (statusCode >= 400) {
+        final detail =
+            envelope?['detail']?.toString() ?? envelope?['message']?.toString();
+        return ApiException(
+          ApiErrorKind.server,
+          detail ?? '网关请求失败（HTTP $statusCode）',
+          statusCode: statusCode,
+        );
+      }
+      return ApiException(
+        ApiErrorKind.network,
+        '网关返回异常（HTTP $statusCode）',
+        statusCode: statusCode,
+      );
+  }
+}
+
+/// 认证头统一注入：页面只传 access（来自安全存储），不再手写 Header。
+class _AuthInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    options.headers['Accept'] = 'application/json';
+    final token = options.extra[_kAuthToken];
+    if (token is String && token.isNotEmpty) {
+      options.headers['Authorization'] = 'Bearer $token';
+    } else {
+      options.headers.remove('Authorization');
+    }
+    handler.next(options);
+  }
+}
+
+/// 401 单飞续期：并发多个 401 共用页面持有的协调器，只发一次 refresh，
+/// 其余请求拿到新 access 后各自重放；refresh 失败保留 401，由页面清会话回登录页。
+class _UnauthorizedInterceptor extends Interceptor {
+  _UnauthorizedInterceptor({required this.dio, required this.refresher});
+
+  final Dio dio;
+  final SessionRefresher? refresher;
+
+  @override
+  Future<void> onError(
+    DioException err,
+    ErrorInterceptorHandler handler,
+  ) async {
+    final options = err.requestOptions;
+    final token = options.extra[_kAuthToken];
+    final canRefresh =
+        err.response?.statusCode == 401 &&
+        refresher != null &&
+        options.extra[_kAllowRefresh] != false &&
+        options.extra[_kAuthRetried] != true &&
+        token is String &&
+        token.isNotEmpty;
+    if (!canRefresh) {
+      handler.next(err);
+      return;
+    }
+    final renewed = await refresher!.refresh(token);
+    if (renewed == null || renewed.token.isEmpty) {
+      handler.next(err);
+      return;
+    }
+    final replay = options.copyWith(
+      extra: <String, dynamic>{
+        ...options.extra,
+        _kAuthToken: renewed.token,
+        _kAuthRetried: true,
+      },
+    );
+    try {
+      handler.resolve(await dio.fetch<List<int>>(replay));
+    } on DioException catch (error) {
+      handler.next(error);
+    }
+  }
+}
+
+/// 仅幂等 GET 做有限次退避重试；POST/DELETE 与所有 4xx 都不重试，
+/// 避免指令下发、告警确认等写操作产生重复副作用。
+class _GetRetryInterceptor extends Interceptor {
+  _GetRetryInterceptor({required this.dio});
+
+  static const int maxRetries = 2;
+
+  final Dio dio;
+
+  @override
+  Future<void> onError(
+    DioException err,
+    ErrorInterceptorHandler handler,
+  ) async {
+    final options = err.requestOptions;
+    final attempt = options.extra[_kRetryAttempt] is int
+        ? options.extra[_kRetryAttempt] as int
+        : 0;
+    final canRetry =
+        options.method.toUpperCase() == 'GET' &&
+        attempt < maxRetries &&
+        _isRetryable(err);
+    if (!canRetry) {
+      handler.next(err);
+      return;
+    }
+    await Future<void>.delayed(Duration(milliseconds: 200 * (1 << attempt)));
+    final replay = options.copyWith(
+      extra: <String, dynamic>{...options.extra, _kRetryAttempt: attempt + 1},
+    );
+    try {
+      handler.resolve(await dio.fetch<List<int>>(replay));
+    } on DioException catch (error) {
+      handler.next(error);
+    }
+  }
+
+  bool _isRetryable(DioException err) {
+    switch (err.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.connectionError:
+        return true;
+      case DioExceptionType.badResponse:
+        // 只看 5xx；4xx 是确定性失败，重试没有意义
+        return (err.response?.statusCode ?? 0) >= 500;
+      case DioExceptionType.cancel:
+      case DioExceptionType.badCertificate:
+      case DioExceptionType.transformTimeout:
+      case DioExceptionType.unknown:
+        return false;
+    }
+  }
+}
+
+/// 把 dio 异常统一收敛为 [ApiException]，页面原有 catch 分支无需改动。
+class _ErrorMappingInterceptor extends Interceptor {
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    final mapped = err.error;
+    if (mapped is ApiException) {
+      handler.next(err);
+      return;
+    }
+    handler.reject(err.copyWith(error: _map(err)), true);
+  }
+
+  ApiException _map(DioException err) {
+    switch (err.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.transformTimeout:
+        return const ApiException(
+          ApiErrorKind.timeout,
+          '网关响应超时，请检查网络后重试',
+        );
+      case DioExceptionType.cancel:
+        return const ApiException(ApiErrorKind.cancelled, '请求已取消');
+      case DioExceptionType.connectionError:
+      case DioExceptionType.unknown:
+        return const ApiException(
+          ApiErrorKind.network,
+          '无法连接网关，请确认地址、后端进程与网络连通性',
+        );
+      case DioExceptionType.badCertificate:
+        return const ApiException(
+          ApiErrorKind.network,
+          '网关证书校验失败，请检查网络环境',
+        );
+      case DioExceptionType.badResponse:
+        final status = err.response?.statusCode ?? 0;
+        final data = err.response?.data;
+        return _httpStatusException(
+          status,
+          data is List<int> ? _decodeEnvelopeBytes(data) : null,
+        );
+    }
+  }
+}
+
+/// 只记录方法、去参数路径、状态与耗时；绝不输出请求头、请求体、token 或口令。
+class _SanitizedLogInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    options.extra[_kLogStartedAt] = DateTime.now();
+    handler.next(options);
+  }
+
+  @override
+  void onResponse(
+    Response<dynamic> response,
+    ResponseInterceptorHandler handler,
+  ) {
+    _log(response.requestOptions, '${response.statusCode}', null);
+    handler.next(response);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    _log(
+      err.requestOptions,
+      err.response?.statusCode?.toString(),
+      err.type.name,
+    );
+    handler.next(err);
+  }
+
+  void _log(RequestOptions options, String? status, String? failure) {
+    final started = options.extra[_kLogStartedAt];
+    final elapsed = started is DateTime
+        ? '${DateTime.now().difference(started).inMilliseconds}ms'
+        : '-';
+    debugPrint(
+      '[api] ${options.method} ${options.uri.path} → ${status ?? failure ?? '-'} $elapsed',
+    );
+  }
+}
+
 /// 可预期的请求失败类型，UI 直接取 [userMessage] 展示。
 enum ApiErrorKind {
   unauthorized,
@@ -542,6 +797,7 @@ enum ApiErrorKind {
   timeout,
   server,
   invalidResponse,
+  cancelled,
 }
 
 class ApiException implements Exception {
@@ -559,6 +815,7 @@ class ApiException implements Exception {
     ApiErrorKind.timeout => '网关响应超时，请稍后重试',
     ApiErrorKind.server => message.isEmpty ? '网关返回异常' : message,
     ApiErrorKind.invalidResponse => '网关返回数据格式异常',
+    ApiErrorKind.cancelled => '请求已取消',
   };
 
   @override

@@ -1,13 +1,11 @@
-import 'dart:convert';
-
 import 'package:flutter_test/flutter_test.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:iot_device_app/models/mobile_api_models.dart';
 import 'package:iot_device_app/services/api_client.dart';
 import 'package:iot_device_app/services/app_storage.dart';
 import 'package:iot_device_app/services/session_refresh.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'support/dio_mock.dart';
 
 class _FakeSecureStore implements SecureStore {
   final Map<String, String> values = <String, String>{};
@@ -25,20 +23,6 @@ class _FakeSecureStore implements SecureStore {
     values.remove(key);
   }
 }
-
-http.Response _json(Object body, [int status = 200]) => http.Response(
-  jsonEncode(body),
-  status,
-  headers: <String, String>{
-    'content-type': 'application/json; charset=utf-8',
-  },
-);
-
-Map<String, dynamic> _ok(Object? data) => <String, dynamic>{
-  'code': 0,
-  'message': 'ok',
-  'data': data,
-};
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -61,54 +45,54 @@ void main() {
     refreshCalls = 0;
   });
 
-  MockClient mockClient({bool refreshFails = false}) =>
-      MockClient((request) async {
-        if (request.url.path == '/api/auth/refresh') {
-          refreshCalls += 1;
-          if (refreshFails) {
-            return _json(<String, String>{'detail': '刷新令牌已被吊销'}, 401);
-          }
-          return _json(
-            _ok(<String, dynamic>{
-              'token': 'new-access',
-              'refresh_token': 'refresh-2',
-              'user': <String, dynamic>{
-                'username': 'admin',
-                'role': 'admin',
-              },
-            }),
-          );
+  /// 模拟网关：旧 access 一律 401，refresh 之后新 access 才能通过。
+  MockDioAdapter gateway({bool refreshFails = false, bool alwaysReject = false}) {
+    return MockDioAdapter((request) {
+      if (request.uri.path == '/api/auth/refresh') {
+        refreshCalls += 1;
+        if (refreshFails) {
+          return jsonResponse(<String, String>{'detail': '刷新令牌已被吊销'}, 401);
         }
-        if (request.headers['Authorization'] == 'Bearer expired-access') {
-          return _json(<String, String>{'detail': '令牌已过期'}, 401);
-        }
-        if (request.headers['Authorization'] == 'Bearer new-access') {
-          return _json(
-            _ok(<String, dynamic>{
-              'items': <dynamic>[],
-              'total': 0,
-              'page': 1,
-              'page_size': 20,
-            }),
-          );
-        }
-        return _json(<String, String>{'detail': '无法识别令牌'}, 403);
-      });
+        return jsonResponse(
+          okEnvelope(<String, dynamic>{
+            'token': 'new-access',
+            'refresh_token': 'refresh-2',
+            'user': <String, dynamic>{'username': 'admin', 'role': 'admin'},
+          }),
+        );
+      }
+      if (alwaysReject ||
+          request.header('authorization') == 'Bearer expired-access') {
+        return jsonResponse(<String, String>{'detail': '令牌已过期'}, 401);
+      }
+      if (request.header('authorization') == 'Bearer new-access') {
+        return jsonResponse(
+          okEnvelope(<String, dynamic>{
+            'items': <dynamic>[],
+            'total': 0,
+            'page': 1,
+            'page_size': 20,
+          }),
+        );
+      }
+      return jsonResponse(<String, String>{'detail': '无法识别令牌'}, 403);
+    });
+  }
+
+  SessionRefreshCoordinator coordinatorFor(MockDioAdapter adapter) =>
+      SessionRefreshCoordinator(
+        storage: storage,
+        baseUrl: () => 'http://api.example:8000',
+        readSession: () => current,
+        onRefreshed: (session) => current = session,
+        clientBuilder: (url) => mockApiClient(adapter, baseUrl: url),
+      );
 
   test('并发 5 个 401 只触发 1 次 refresh，并写入安全存储', () async {
-    final httpClient = mockClient();
-    final coordinator = SessionRefreshCoordinator(
-      storage: storage,
-      baseUrl: () => 'http://api.example:8000',
-      readSession: () => current,
-      onRefreshed: (session) => current = session,
-      clientBuilder: (url) =>
-          ApiClient(baseUrl: url, httpClient: httpClient),
-    );
-    final client = ApiClient(
-      baseUrl: 'http://api.example:8000',
-      httpClient: httpClient,
-      refresher: coordinator,
+    final adapter = gateway();
+    final client = mockApiClient(
+      adapter,
+      refresher: coordinatorFor(adapter),
     );
     await storage.saveSession(current);
 
@@ -129,19 +113,10 @@ void main() {
   });
 
   test('refresh 失败时保留 401 语义，交给页面清会话', () async {
-    final httpClient = mockClient(refreshFails: true);
-    final coordinator = SessionRefreshCoordinator(
-      storage: storage,
-      baseUrl: () => 'http://api.example:8000',
-      readSession: () => current,
-      onRefreshed: (session) => current = session,
-      clientBuilder: (url) =>
-          ApiClient(baseUrl: url, httpClient: httpClient),
-    );
-    final client = ApiClient(
-      baseUrl: 'http://api.example:8000',
-      httpClient: httpClient,
-      refresher: coordinator,
+    final adapter = gateway(refreshFails: true);
+    final client = mockApiClient(
+      adapter,
+      refresher: coordinatorFor(adapter),
     );
     await storage.saveSession(current);
 
@@ -157,5 +132,26 @@ void main() {
     );
     expect(refreshCalls, 1);
     expect(current.token, 'expired-access');
+  });
+
+  test('刷新后仍 401 不会循环刷新，直接回 unauthorized', () async {
+    final adapter = gateway(alwaysReject: true);
+    final client = mockApiClient(
+      adapter,
+      refresher: coordinatorFor(adapter),
+    );
+    await storage.saveSession(current);
+
+    await expectLater(
+      client.fetchDevices(token: 'expired-access'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.unauthorized,
+        ),
+      ),
+    );
+    expect(refreshCalls, 1, reason: '重放后的 401 不得再次触发 refresh');
   });
 }

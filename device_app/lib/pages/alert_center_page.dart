@@ -75,8 +75,17 @@ class _AlertCenterPageState extends State<AlertCenterPage>
 
   late final AppStorage _storage;
   late final SessionRefreshCoordinator _refresher;
-  late final AlertApiClientFactory _createApiClient;
+  late final AlertApiClientFactory _rawCreateApiClient;
   late final AlertRealtimeFactory _createRealtime;
+
+  /// 页面创建的每个客户端都绑定这个取消令牌，dispose 时统一取消在途请求。
+  final RequestCancellation _cancellation = RequestCancellation();
+
+  ApiClient _createApiClient(String baseUrl) {
+    final client = _rawCreateApiClient(baseUrl);
+    client.bindCancellation(_cancellation);
+    return client;
+  }
 
   AuthSession? _session;
   String _baseUrl = ApiConfig.defaultBaseUrl;
@@ -167,7 +176,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       onRefreshed: _onSessionRefreshed,
       clientBuilder: widget.apiClientFactory,
     );
-    _createApiClient =
+    _rawCreateApiClient =
         widget.apiClientFactory ??
         (String baseUrl) => ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
@@ -216,6 +225,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _cancellation.cancel();
     _scrollController.dispose();
     _refreshController.dispose();
     _deviceSearchDebounce?.cancel();

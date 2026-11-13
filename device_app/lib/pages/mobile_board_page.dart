@@ -70,8 +70,17 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     with WidgetsBindingObserver {
   late final AppStorage _storage;
   late final SessionRefreshCoordinator _refresher;
-  late final BoardApiClientFactory _createApiClient;
+  late final BoardApiClientFactory _rawCreateApiClient;
   late final BoardRealtimeFactory _createRealtime;
+
+  /// 页面创建的每个客户端都绑定这个取消令牌，dispose 时统一取消在途请求。
+  final RequestCancellation _cancellation = RequestCancellation();
+
+  ApiClient _createApiClient(String baseUrl) {
+    final client = _rawCreateApiClient(baseUrl);
+    client.bindCancellation(_cancellation);
+    return client;
+  }
 
   AuthSession? _session;
   String _baseUrl = ApiConfig.defaultBaseUrl;
@@ -166,7 +175,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       // 测试注入的 fake 同时作为刷新客户端，避免单测触发真实网络
       clientBuilder: widget.apiClientFactory,
     );
-    _createApiClient =
+    _rawCreateApiClient =
         widget.apiClientFactory ??
         (String baseUrl) => ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
@@ -224,6 +233,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _cancellation.cancel();
     _searchDebounce?.cancel();
     _groupSyncDebounce?.cancel();
     _searchController.dispose();
