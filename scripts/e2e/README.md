@@ -120,7 +120,8 @@ python scripts/e2e/e2e_acceptance.py
 
 ## 6. 与 CI 的关系（新增 `e2e` 作业）
 
-`.github/workflows/ci.yml` 中的 `e2e` 作业在 `ubuntu-latest` 上自包含运行本脚本：
+`.github/workflows/ci.yml` 中的 `e2e` 作业固定在已验证的 `ubuntu-24.04` 上自包含运行本脚本，
+避免 `ubuntu-latest` 迁移导致 Broker 运行环境漂移：
 
 | 项目 | 内容 |
 | --- | --- |

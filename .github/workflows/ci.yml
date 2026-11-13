@@ -357,7 +357,9 @@ jobs:
 
   e2e:
     name: 真实 Broker 端到端验收
-    runs-on: ubuntu-latest
+    # 固定已验证的 24.04 LTS：ubuntu-latest 迁移到 26.04 后，其 Mosquitto 2.0.22
+    # 无法读取脚本生成的 /tmp 配置；完成 26.04 兼容验证后再跟随 latest。
+    runs-on: ubuntu-24.04
     # 安装依赖 + 真实 Broker/网关/模拟器全链路，正常 2~3 分钟；超时兜底防卡死
     timeout-minutes: 15
     steps:

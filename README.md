@@ -776,7 +776,7 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 不写仓库、不提交真实口令；网关使用临时 SQLite，Broker 使用临时数据目录
 （保留消息不跨运行累积），结束后停止所有托管进程、删除临时目录并等待端口释放。
 
-本脚本已纳入 CI 的 `e2e` 作业（ubuntu-latest），由脚本退出码判定成败，
+本脚本已纳入 CI 的 `e2e` 作业（ubuntu-24.04），由脚本退出码判定成败，
 正常耗时约 2~3 分钟，超时 15 分钟。CI 失败时查看 `e2e` 作业的逐项 PASS/FAIL 与
 「失败时输出日志」步骤（`mosquitto.log` / `gateway.log` / `simulator.log`）。
 前置条件、逐项覆盖、常见失败原因见 [scripts/e2e/README.md](scripts/e2e/README.md)。
@@ -792,7 +792,7 @@ echo $?    # 0 = 全部 PASS；1 = 存在 FAIL
 | `gateway` | ubuntu-latest | 安装网关依赖并跑 `pytest` | 约 1 分钟 |
 | `web` | ubuntu-latest | `npm ci` + `npm run test` + `npm run build` | 约 2 分钟 |
 | `device_app` | ubuntu-latest | `flutter analyze` + `flutter test` | 约 2~3 分钟 |
-| `e2e` | ubuntu-latest | 安装 mosquitto，运行真实 Broker 端到端验收（41 项，含鉴权隔离、API 凭证轮换、影子历史/精确回滚与重载结果审计） | 约 2~3 分钟 |
+| `e2e` | ubuntu-24.04 | 安装 mosquitto，运行真实 Broker 端到端验收（41 项，含鉴权隔离、API 凭证轮换、影子历史/精确回滚与重载结果审计） | 约 2~3 分钟 |
 
 `e2e` 作业自包含：固定使用 1883 / 9001 / 8000，执行前检查端口占用，
 每次运行由脚本在临时目录生成随机凭证与 `passwd`，**不提交任何真实口令文件**；
