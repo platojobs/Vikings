@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:easy_refresh/easy_refresh.dart';
 import 'package:flutter/material.dart';
 
 import '../config/api_config.dart';
@@ -12,6 +13,8 @@ import '../services/bulk_ack_runner.dart';
 import '../services/session_refresh.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
+import '../widgets/app_feedback.dart';
+import '../widgets/app_refresh.dart';
 import 'login_page.dart';
 
 /// 按网关地址创建 REST 客户端；测试可注入 fake。
@@ -92,6 +95,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   String _level = '';
   String _status = 'open';
   String _deviceId = '';
+
   /// v1.35.0 标签筛选：空串代表全部标签，与级别/状态/设备组合生效。
   String _tag = '';
   List<DeviceTagStat> _tags = const <DeviceTagStat>[];
@@ -140,6 +144,11 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   String? _writeBlockedReason;
 
   final ScrollController _scrollController = ScrollController();
+  final EasyRefreshController _refreshController = EasyRefreshController(
+    controlFinishRefresh: true,
+    controlFinishLoad: true,
+  );
+  bool _lastLoadMoreFailed = false;
   int _requestSeq = 0;
 
   BoardRealtimeService? _realtime;
@@ -160,8 +169,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     );
     _createApiClient =
         widget.apiClientFactory ??
-        (String baseUrl) =>
-            ApiClient(baseUrl: baseUrl, refresher: _refresher);
+        (String baseUrl) => ApiClient(baseUrl: baseUrl, refresher: _refresher);
     _createRealtime =
         widget.realtimeServiceFactory ??
         (String url) => BoardRealtimeService(
@@ -174,7 +182,6 @@ class _AlertCenterPageState extends State<AlertCenterPage>
           ),
         );
     WidgetsBinding.instance.addObserver(this);
-    _scrollController.addListener(_onScroll);
     _deviceSearchController = TextEditingController();
     _deviceSearchFocus = FocusNode();
     _bootstrap();
@@ -209,8 +216,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _refreshController.dispose();
     _deviceSearchDebounce?.cancel();
     _deviceSearchController.dispose();
     _deviceSearchFocus.dispose();
@@ -367,13 +374,48 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     }
   }
 
-  void _onScroll() {
-    if (!_scrollController.hasClients) {
+  /// 下拉刷新：重置到第 1 页，保留级别/状态/设备/标签筛选；实时订阅不重建。
+  Future<void> _handleRefresh() async {
+    await _reload();
+    if (!mounted) {
       return;
     }
-    if (_scrollController.position.extentAfter < 240) {
-      unawaited(_loadMore());
+    final result = _error == null
+        ? IndicatorResult.success
+        : IndicatorResult.fail;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _refreshController.finishRefresh(result);
+      if (!_hasMore) {
+        _refreshController.finishLoad(IndicatorResult.noMore);
+      }
+    });
+  }
+
+  /// 上拉加载下一页；与轮询/实时流并存时用 [_requestSeq] 丢弃过期响应。
+  Future<void> _handleLoadMore() async {
+    if (!_hasMore) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _refreshController.finishLoad(IndicatorResult.noMore);
+        }
+      });
+      return;
     }
+    await _loadMore();
+    if (!mounted) {
+      return;
+    }
+    final result = _lastLoadMoreFailed
+        ? IndicatorResult.fail
+        : (_hasMore ? IndicatorResult.success : IndicatorResult.noMore);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _refreshController.finishLoad(result);
+      }
+    });
   }
 
   Future<void> _loadMore() async {
@@ -382,6 +424,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       return;
     }
     final requestId = _requestSeq;
+    _lastLoadMoreFailed = false;
     setState(() => _loadingMore = true);
     final client = _client();
     try {
@@ -419,6 +462,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       }
       setState(() {
         _loadingMore = false;
+        _lastLoadMoreFailed = true;
         _notice = error.userMessage;
       });
     } finally {
@@ -921,9 +965,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         return;
       }
       final acked = run.acked.toSet();
-      final failedIds = run.failedBatches
-          .expand((batch) => batch.ids)
-          .toSet();
+      final failedIds = run.failedBatches.expand((batch) => batch.ids).toSet();
       setState(() {
         _acking = false;
         // 只保留失败批次的选中项，成功/已确认/不存在均不再选中，便于直接重试失败部分。
@@ -934,9 +976,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
         _total = math.max(0, _total - run.acked.length);
         _hasMore = _page * _pageSize < _total;
         _unread = math.max(0, _unread - run.acked.length);
-        _notice = forbidden.isEmpty
-            ? summary
-            : '$summary，本轮写操作已禁用';
+        _notice = forbidden.isEmpty ? summary : '$summary，本轮写操作已禁用';
       });
       _notifyUnread();
     } on ApiException catch (error) {
@@ -1011,17 +1051,7 @@ class _AlertCenterPageState extends State<AlertCenterPage>
       );
     }
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('告警中心'),
-        centerTitle: false,
-        actions: [
-          IconButton(
-            tooltip: '刷新',
-            onPressed: _loading ? null : () => unawaited(_reload()),
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('告警中心'), centerTitle: false),
       body: SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1032,12 +1062,15 @@ class _AlertCenterPageState extends State<AlertCenterPage>
               ),
               child: SingleChildScrollView(child: _buildFilterBar()),
             ),
-            if (_notice != null) _buildBanner(_notice!, Colors.blue),
-            if (_error != null) _buildBanner(_error!, Colors.red),
+            if (_notice != null) _buildBanner(_notice!, FeedbackKind.info),
+            if (_error != null) _buildBanner(_error!, FeedbackKind.error),
             if (!_canWrite && _session?.role == 'viewer')
-              _buildBanner('当前账号为只读（viewer），批量确认已禁用。', Colors.orange),
+              _buildBanner('当前账号为只读（viewer），批量确认已禁用。', FeedbackKind.warning),
             if (_session?.role != 'viewer' && _writeBlockedReason != null)
-              _buildBanner('$_writeBlockedReason，本轮写操作已禁用。', Colors.orange),
+              _buildBanner(
+                '$_writeBlockedReason，本轮写操作已禁用。',
+                FeedbackKind.warning,
+              ),
             Expanded(child: _buildAlertList()),
             if (_selected.isNotEmpty) _buildSelectionBar(),
           ],
@@ -1089,10 +1122,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                 children: [
                   _tagChip('全部标签', ''),
                   ..._tags.map(
-                    (tag) => _tagChip(
-                      '${tag.tag}（${tag.deviceCount}）',
-                      tag.tag,
-                    ),
+                    (tag) =>
+                        _tagChip('${tag.tag}（${tag.deviceCount}）', tag.tag),
                   ),
                 ],
               ),
@@ -1327,57 +1358,62 @@ class _AlertCenterPageState extends State<AlertCenterPage>
     _ => level,
   };
 
-  Widget _buildBanner(String text, Color color) {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: color.withValues(alpha: 0.3)),
-      ),
-      child: Text(text, style: TextStyle(color: color, fontSize: 12)),
+  Widget _buildBanner(String text, FeedbackKind kind) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: AppInlineMessage(message: text, kind: kind),
     );
   }
 
   Widget _buildAlertList() {
+    return EasyRefresh(
+      controller: _refreshController,
+      header: appRefreshHeader(),
+      footer: appRefreshFooter(),
+      onRefresh: _handleRefresh,
+      onLoad: _handleLoadMore,
+      child: _alerts.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(24),
+              children: [_buildEmptyState()],
+            )
+          : ListView.builder(
+              controller: _scrollController,
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+              itemCount: _alerts.length,
+              itemBuilder: (context, index) => _buildAlertRow(_alerts[index]),
+            ),
+    );
+  }
+
+  Widget _buildEmptyState() {
     if (_loading) {
-      return const Center(child: Text('加载中…'));
-    }
-    if (_alerts.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.notifications_off_outlined,
-                size: 36,
-                color: Colors.black38,
-              ),
-              const SizedBox(height: 8),
-              Text(_status == 'open' ? '当前筛选下没有未处理告警' : '当前筛选下没有告警'),
-              const SizedBox(height: 4),
-              const Text(
-                '保持实时连接，新告警会自动出现在这里。',
-                style: TextStyle(fontSize: 12, color: Colors.black54),
-              ),
-            ],
-          ),
-        ),
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 60),
+        child: Center(child: Text('加载中…')),
       );
     }
-    return ListView.builder(
-      controller: _scrollController,
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
-      itemCount: _alerts.length + 1,
-      itemBuilder: (context, index) {
-        if (index == _alerts.length) {
-          return _buildFooter();
-        }
-        return _buildAlertRow(_alerts[index]);
-      },
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 40),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.notifications_off_outlined,
+            size: 36,
+            color: Colors.black38,
+          ),
+          const SizedBox(height: 8),
+          Text(_status == 'open' ? '当前筛选下没有未处理告警' : '当前筛选下没有告警'),
+          const SizedBox(height: 4),
+          const Text(
+            '保持实时连接，新告警会自动出现在这里。',
+            style: TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1454,7 +1490,8 @@ class _AlertCenterPageState extends State<AlertCenterPage>
                             vertical: 1,
                           ),
                           decoration: BoxDecoration(
-                            color: _slaBadgeColor(alert).withValues(alpha: 0.12),
+                            color: _slaBadgeColor(alert)
+                                .withValues(alpha: 0.12),
                             borderRadius: BorderRadius.circular(4),
                           ),
                           child: Text(
@@ -1517,51 +1554,6 @@ class _AlertCenterPageState extends State<AlertCenterPage>
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFooter() {
-    final theme = Theme.of(context);
-    if (_loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.all(12),
-        child: Center(
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-              SizedBox(width: 8),
-              Text('加载中…', style: TextStyle(fontSize: 12)),
-            ],
-          ),
-        ),
-      );
-    }
-    if (_hasMore) {
-      return Padding(
-        padding: const EdgeInsets.all(12),
-        child: Center(
-          child: Text(
-            '继续上拉加载更多（已显示 ${_alerts.length} / $_total）',
-            key: const ValueKey('alert-footer-more'),
-            style: TextStyle(fontSize: 12, color: theme.colorScheme.primary),
-          ),
-        ),
-      );
-    }
-    return const Padding(
-      padding: EdgeInsets.all(12),
-      child: Center(
-        child: Text(
-          '没有更多了',
-          key: ValueKey('alert-footer-end'),
-          style: TextStyle(fontSize: 12, color: Colors.black45),
         ),
       ),
     );

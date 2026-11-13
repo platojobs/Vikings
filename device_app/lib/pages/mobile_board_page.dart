@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:easy_refresh/easy_refresh.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../config/api_config.dart';
@@ -14,6 +14,8 @@ import '../services/app_storage.dart';
 import '../services/session_refresh.dart';
 import '../services/board_realtime_service.dart';
 import '../services/realtime_transport.dart';
+import '../widgets/app_feedback.dart';
+import '../widgets/app_refresh.dart';
 import '../widgets/command_dialog.dart';
 import '../widgets/online_badge.dart';
 import '../widgets/sensor_card.dart';
@@ -126,7 +128,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
 
   /// 服务端分页状态：只加载当前页，滚动到底追加下一页，不再受首屏 100 台上限约束。
   final ScrollController _scrollController = ScrollController();
-  final GlobalKey _deviceFooterKey = GlobalKey();
+  final EasyRefreshController _refreshController = EasyRefreshController(
+    controlFinishRefresh: true,
+    controlFinishLoad: true,
+  );
   int _devicePage = 1;
   int _deviceTotal = 0;
   bool _deviceHasMore = false;
@@ -176,7 +181,6 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           ),
         );
     WidgetsBinding.instance.addObserver(this);
-    _scrollController.addListener(_onScroll);
     _bootstrap();
   }
 
@@ -223,8 +227,8 @@ class _MobileBoardPageState extends State<MobileBoardPage>
     _searchDebounce?.cancel();
     _groupSyncDebounce?.cancel();
     _searchController.dispose();
-    _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _refreshController.dispose();
     _pollTimer?.cancel();
     _eventSub?.cancel();
     unawaited(_realtime?.dispose());
@@ -494,7 +498,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       return;
     }
     setState(() => _writeBlockedReason = reason);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(reason)));
+    AppFeedback.warning(context, reason, mergeKey: 'write-blocked');
   }
 
   /// 打开指令下发弹窗；成功后刷新指令回执（由详情页自行处理）。
@@ -512,8 +516,10 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       ),
     );
     if (result != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('指令已下发：${result.cmdId}（${result.state}）')),
+      AppFeedback.success(
+        context,
+        '指令已下发：${result.cmdId}（${result.state}）',
+        mergeKey: 'command-issued',
       );
     }
     return result;
@@ -628,8 +634,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
             )
             .toList(growable: false);
       });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('告警已确认')));
+      AppFeedback.success(context, '告警已确认', mergeKey: 'alert-ack');
     } on ApiException catch (error) {
       if (!mounted) {
         return;
@@ -639,13 +644,15 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       } else if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
       } else {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('确认失败：${error.userMessage}')));
+        AppFeedback.error(
+          context,
+          '确认失败：${error.userMessage}',
+          mergeKey: 'alert-ack-error',
+        );
       }
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('确认失败，请稍后重试')));
+        AppFeedback.error(context, '确认失败，请稍后重试', mergeKey: 'alert-ack-error');
       }
     } finally {
       client.close();
@@ -779,14 +786,19 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
       } else if (mounted) {
-        ScaffoldMessenger.of(
+        AppFeedback.error(
           context,
-        ).showSnackBar(SnackBar(content: Text('加载更多失败：${error.userMessage}')));
+          '加载更多失败：${error.userMessage}',
+          mergeKey: 'load-more-devices',
+        );
       }
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('加载更多失败，请稍后重试')));
+        AppFeedback.error(
+          context,
+          '加载更多失败，请稍后重试',
+          mergeKey: 'load-more-devices',
+        );
       }
     } finally {
       client.close();
@@ -824,9 +836,11 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       if (error.kind == ApiErrorKind.unauthorized) {
         await _handleExpired();
       } else if (mounted) {
-        ScaffoldMessenger.of(
+        AppFeedback.error(
           context,
-        ).showSnackBar(SnackBar(content: Text('加载告警失败：${error.userMessage}')));
+          '加载告警失败：${error.userMessage}',
+          mergeKey: 'load-more-alerts',
+        );
       }
     } finally {
       client.close();
@@ -834,6 +848,48 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         setState(() => _loadingMoreAlerts = false);
       }
     }
+  }
+
+  /// 下拉刷新：重置到第 1 页并保留当前筛选；实时流不中断。
+  Future<void> _handleRefresh() async {
+    await _loadData();
+    if (!mounted) {
+      return;
+    }
+    final result = _error == null
+        ? IndicatorResult.success
+        : IndicatorResult.fail;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _refreshController.finishRefresh(result);
+      }
+    });
+  }
+
+  /// 上拉加载下一页设备；由 EasyRefresh 接管触发时机。
+  Future<void> _handleLoadMore() async {
+    if (!_deviceHasMore) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _refreshController.finishLoad(IndicatorResult.noMore);
+        }
+      });
+      return;
+    }
+    await _loadMoreDevices();
+    if (!mounted) {
+      return;
+    }
+    final result = _deviceHasMore
+        ? IndicatorResult.success
+        : IndicatorResult.noMore;
+    // EasyRefresh 在滚动弹道里触发 onLoad，同步 finish 会二次调度构建；
+    // 放到帧后完成，避免 "Build scheduled during frame"。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _refreshController.finishLoad(result);
+      }
+    });
   }
 
   List<SensorReading> _mergeReadings(
@@ -847,30 +903,6 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       byDevice[reading.deviceId] = reading;
     }
     return byDevice.values.toList(growable: false);
-  }
-
-  /// 设备页脚进入视口即触发下一页；页脚位于设备区末尾，不会在滚动告警区时误触发。
-  void _onScroll() {
-    if (!_deviceHasMore || _loadingMoreDevices) {
-      return;
-    }
-    final footerContext = _deviceFooterKey.currentContext;
-    if (footerContext == null) {
-      return;
-    }
-    final box = footerContext.findRenderObject();
-    if (box is! RenderBox) {
-      return;
-    }
-    final viewport = RenderAbstractViewport.maybeOf(box);
-    if (viewport == null || !_scrollController.hasClients) {
-      return;
-    }
-    final footerOffset = viewport.getOffsetToReveal(box, 0).offset;
-    final position = _scrollController.position;
-    if (position.pixels + position.viewportDimension >= footerOffset - 32) {
-      unawaited(_loadMoreDevices());
-    }
   }
 
   /// 当前状态筛选对应的请求参数。
@@ -1029,15 +1061,12 @@ class _MobileBoardPageState extends State<MobileBoardPage>
       return;
     }
     if (!ApiConfig.isValid(value.baseUrl)) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('网关地址无效，未保存')));
+      AppFeedback.warning(context, '网关地址无效，未保存');
       return;
     }
     if (value.realtimeUrl.isNotEmpty &&
         !ApiConfig.isValidRealtimeUrl(value.realtimeUrl)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('实时地址需以 ws:// 或 wss:// 开头，未保存')),
-      );
+      AppFeedback.warning(context, '实时地址需以 ws:// 或 wss:// 开头，未保存');
       return;
     }
     final normalized = ApiConfig.normalize(value.baseUrl);
@@ -1213,10 +1242,15 @@ class _MobileBoardPageState extends State<MobileBoardPage>
         ],
       ),
       body: SafeArea(
-        child: RefreshIndicator(
-          onRefresh: _loadData,
+        child: EasyRefresh(
+          controller: _refreshController,
+          header: appRefreshHeader(),
+          footer: appRefreshFooter(noMoreText: '已全部加载'),
+          onRefresh: _handleRefresh,
+          onLoad: _handleLoadMore,
           child: ListView(
             controller: _scrollController,
+            physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.all(12),
             children: [
               if (_error != null) _buildErrorBanner(),
@@ -1245,7 +1279,17 @@ class _MobileBoardPageState extends State<MobileBoardPage>
               if (!_loading && _devices.isNotEmpty && filtered.isEmpty)
                 _buildFilterEmpty(),
               ...filtered.map(_buildDeviceCard),
-              if (filtered.isNotEmpty) _buildDeviceFooter(),
+              if (!_deviceHasMore && filtered.isNotEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 10),
+                  child: Center(
+                    child: Text(
+                      '没有更多了',
+                      key: ValueKey('device-footer-end'),
+                      style: TextStyle(fontSize: 12, color: Colors.black38),
+                    ),
+                  ),
+                ),
               const SizedBox(height: 8),
               _buildSectionTitle('未处理告警（$_alertTotal）'),
               if (_alerts.isEmpty) _buildEmpty('当前没有未处理告警'),
@@ -1278,30 +1322,11 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   }
 
   Widget _buildErrorBanner() {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.red.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.red.withValues(alpha: 0.3)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.error_outline, color: Colors.red, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _error!,
-              style: const TextStyle(color: Colors.red, fontSize: 13),
-            ),
-          ),
-          TextButton(
-            onPressed: _loading ? null : _loadData,
-            child: const Text('重试'),
-          ),
-        ],
-      ),
+    return AppInlineMessage(
+      message: _error!,
+      kind: FeedbackKind.error,
+      actionLabel: '重试',
+      onAction: _loading ? null : _loadData,
     );
   }
 
@@ -1395,26 +1420,7 @@ class _MobileBoardPageState extends State<MobileBoardPage>
   }
 
   Widget _buildWriteHint(String text) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-      decoration: BoxDecoration(
-        color: Colors.orange.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.orange.withValues(alpha: 0.25)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.lock_outline, size: 15, color: Colors.orange),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              text,
-              style: const TextStyle(fontSize: 12, color: Colors.black87),
-            ),
-          ),
-        ],
-      ),
-    );
+    return AppInlineMessage(message: text, kind: FeedbackKind.warning);
   }
 
   /// 汇总卡：设备总数 / 在线 / 未处理告警均来自服务端全量统计，
@@ -1448,40 +1454,6 @@ class _MobileBoardPageState extends State<MobileBoardPage>
           ),
         ],
       ),
-    );
-  }
-
-  /// 设备分页页脚：进入视口自动加载下一页，加载中显示进度，末页显示「没有更多了」。
-  Widget _buildDeviceFooter() {
-    final Widget content;
-    if (_loadingMoreDevices) {
-      content = Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: const [
-          SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-          SizedBox(width: 8),
-          Text('加载中…', style: TextStyle(fontSize: 12, color: Colors.black54)),
-        ],
-      );
-    } else if (_deviceHasMore) {
-      content = Text(
-        '上拉加载更多（已显示 ${_devices.length} / $_deviceTotal）',
-        style: const TextStyle(fontSize: 12, color: Colors.black45),
-      );
-    } else {
-      content = const Text(
-        '没有更多了',
-        style: TextStyle(fontSize: 12, color: Colors.black38),
-      );
-    }
-    return Padding(
-      key: _deviceFooterKey,
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Center(child: content),
     );
   }
 
@@ -1992,15 +1964,6 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         '新口令只显示一次，服务端只保存指纹，关闭后无法再查询。';
   }
 
-  void _showCredentialMessage(String message) {
-    if (!mounted) {
-      return;
-    }
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
-  }
-
   /// 签发或轮换：二次确认 → 调网关 → 一次性口令弹窗 → 刷新设备凭证状态。
   Future<void> _handleIssueOrRotateCredential() async {
     if (_credentialBusy || !widget.canWrite) {
@@ -2008,7 +1971,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
     }
     final rotation = _device.mqttCredentialStatus == 'active';
     if (rotation && !widget.isAdmin) {
-      _showCredentialMessage('轮换已有凭证会导致设备掉线，仅管理员可执行');
+      AppFeedback.warning(context, '轮换已有凭证会导致设备掉线，仅管理员可执行');
       return;
     }
 
@@ -2044,7 +2007,10 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         deviceId: _device.deviceId,
       );
     } on ApiException catch (error) {
-      _showCredentialMessage(error.message);
+      if (!mounted) {
+        return;
+      }
+      AppFeedback.error(context, error.message, mergeKey: 'credential');
     } finally {
       if (mounted) {
         setState(() => _credentialBusy = false);
@@ -2098,14 +2064,23 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         token: widget.token,
         deviceId: _device.deviceId,
       );
-      _showCredentialMessage(
-        result.reloaded
-            ? '凭证已吊销，Broker 已重载'
-            : '凭证已吊销，但 Broker 未重载，旧凭证可能仍然有效：${result.reloadDetail}',
-      );
+      if (!mounted) {
+        return;
+      }
+      if (result.reloaded) {
+        AppFeedback.success(context, '凭证已吊销，Broker 已重载');
+      } else {
+        AppFeedback.warning(
+          context,
+          '凭证已吊销，但 Broker 未重载，旧凭证可能仍然有效：${result.reloadDetail}',
+        );
+      }
       await _refreshCredential();
     } on ApiException catch (error) {
-      _showCredentialMessage(error.message);
+      if (!mounted) {
+        return;
+      }
+      AppFeedback.error(context, error.message, mergeKey: 'credential');
     } finally {
       if (mounted) {
         setState(() => _credentialBusy = false);
@@ -2130,7 +2105,14 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         setState(() => _device = match);
       }
     } on ApiException catch (error) {
-      _showCredentialMessage('凭证状态刷新失败：${error.message}');
+      if (!mounted) {
+        return;
+      }
+      AppFeedback.error(
+        context,
+        '凭证状态刷新失败：${error.message}',
+        mergeKey: 'credential-refresh',
+      );
     }
   }
 
@@ -2168,7 +2150,10 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
                         await Clipboard.setData(
                           ClipboardData(text: result.password),
                         );
-                        _showCredentialMessage('口令已复制到剪贴板');
+                        if (!mounted) {
+                          return;
+                        }
+                        AppFeedback.success(context, '口令已复制到剪贴板');
                       },
                       icon: const Icon(Icons.copy, size: 16),
                       label: const Text('复制口令'),

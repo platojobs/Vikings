@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:math' as math;
 
+import 'package:easy_refresh/easy_refresh.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:iot_device_app/models/mobile_api_models.dart';
@@ -99,6 +101,12 @@ class _FakeApiClient extends ApiClient {
   /// 测试用：让告警列表一次返回全部结果，便于构造 150 条多选场景。
   final bool singlePageAlerts;
 
+  /// 测试用：第 N 次 fetchAlerts 挂起，直到外部 complete 对应编号。
+  final Map<int, Completer<void>> fetchGates = <int, Completer<void>>{};
+
+  /// 测试用：第 2 页起与上一页的重叠条数，用于验证追加去重。
+  int pageOverlap = 0;
+
   int alertFetchCalls = 0;
   int bulkCalls = 0;
   int summaryCalls = 0;
@@ -126,12 +134,15 @@ class _FakeApiClient extends ApiClient {
     List<String>? tags,
   }) async {
     alertFetchCalls += 1;
+    final callIndex = alertFetchCalls;
     lastPage = page;
     lastLevel = level;
     lastStatus = status;
     lastDeviceId = deviceId;
     lastTags = tags;
-    var filtered = alerts;
+    // 快照：请求在途期间外部改写 alerts 不会影响本次已算好的响应，
+    // 用于验证「旧请求晚回来」不会覆盖新数据。
+    var filtered = List<AlertItem>.of(alerts);
     if (tags != null && tags.isNotEmpty) {
       final taggedIds = devices
           .where((device) => device.tags.any(tags.contains))
@@ -159,13 +170,20 @@ class _FakeApiClient extends ApiClient {
         pageSize: total == 0 ? pageSize : total,
       );
     }
-    final start = (page - 1) * pageSize;
+    final start = math.max(
+      0,
+      (page - 1) * pageSize - (page > 1 ? pageOverlap : 0),
+    );
     final items = start >= total
         ? const <AlertItem>[]
         : filtered.sublist(
             start,
             start + pageSize > total ? total : start + pageSize,
           );
+    final gate = fetchGates[callIndex];
+    if (gate != null) {
+      await gate.future;
+    }
     return AlertPage(
       items: items,
       total: total,
@@ -392,6 +410,19 @@ Finder _levelChip(String level) => find.byKey(ValueKey('level-$level'));
 Finder _statusChip(String status) => find.byKey(ValueKey('status-$status'));
 Finder _tagChip(String tag) => find.byKey(ValueKey('tag-$tag'));
 
+/// 取出页面里的 EasyRefresh 控制器，用它的公开 API 触发下拉/上拉，
+/// 避免依赖手势拖拽的距离与弹簧参数。
+EasyRefreshController _refreshControllerOf(WidgetTester tester) =>
+    tester.widget<EasyRefresh>(find.byType(EasyRefresh)).controller!;
+
+/// easy_refresh 在 finish 后会排一个 1 秒的收尾计时器；
+/// 测试结束前推进掉，否则会报「Timer is still pending」。
+Future<void> _settleRefresh(WidgetTester tester) async {
+  await tester.pumpAndSettle();
+  await tester.pump(const Duration(seconds: 1));
+  await tester.pumpAndSettle();
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -503,12 +534,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(api.lastPage, 2);
-    // 列表懒加载，页脚需滚动到底才会构建
-    await tester.scrollUntilVisible(
-      find.byKey(const ValueKey('alert-footer-end')),
-      400,
-      scrollable: find.byType(Scrollable).last,
-    );
+    // 页脚由 easy_refresh 渲染，滑到底后展示「没有更多了」
+    await tester.pumpAndSettle();
     expect(find.text('没有更多了'), findsOneWidget);
 
     // 第二页数据确实追加进列表
@@ -520,12 +547,114 @@ void main() {
     expect(find.byKey(const ValueKey('alert-row-alt-24')), findsOneWidget);
   });
 
+  testWidgets('下拉刷新：重置到第 1 页并保留级别筛选', (tester) async {
+    final api = _FakeApiClient(
+      alerts: List<AlertItem>.generate(
+        25,
+        (index) => _alert(
+          'alt-${index.toString().padLeft(2, '0')}',
+          'warning',
+          'open',
+        ),
+      ),
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.tap(_levelChip('warning'));
+    await tester.pumpAndSettle();
+    expect(api.lastLevel, 'warning');
+
+    // 先翻到第 2 页
+    await tester.drag(find.byType(ListView), const Offset(0, -2000));
+    await tester.pumpAndSettle();
+    expect(api.lastPage, 2);
+
+    // 下拉刷新：回到第 1 页，级别筛选原样保留
+    unawaited(_refreshControllerOf(tester).callRefresh());
+    await _settleRefresh(tester);
+
+    expect(api.lastPage, 1);
+    expect(api.lastLevel, 'warning');
+    expect(api.lastStatus, 'open');
+    expect(find.byKey(const ValueKey('alert-row-alt-24')), findsNothing);
+    expect(find.byKey(const ValueKey('alert-row-alt-00')), findsOneWidget);
+  });
+
+  testWidgets('上拉加载：重叠数据按 alertId 去重', (tester) async {
+    final api = _FakeApiClient(
+      alerts: List<AlertItem>.generate(
+        25,
+        (index) => _alert(
+          'alt-${index.toString().padLeft(2, '0')}',
+          'warning',
+          'open',
+        ),
+      ),
+    )..pageOverlap = 5;
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    await tester.drag(find.byType(ListView), const Offset(0, -2000));
+    await tester.pumpAndSettle();
+    expect(api.lastPage, 2);
+
+    // 第 2 页与第 1 页重叠 5 条，追加后仍应是 25 条而不是 30 条
+    final listView = tester.widget<ListView>(find.byType(ListView));
+    final delegate = listView.childrenDelegate as SliverChildBuilderDelegate;
+    expect(delegate.childCount, 25);
+    await _settleRefresh(tester);
+  });
+
+  testWidgets('并发：旧请求晚回来不会覆盖刷新后的新数据', (tester) async {
+    final api = _FakeApiClient(
+      alerts: List<AlertItem>.generate(
+        25,
+        (index) => _alert(
+          'alt-${index.toString().padLeft(2, '0')}',
+          'warning',
+          'open',
+        ),
+      ),
+    );
+    await _pumpAlertCenter(tester, api: api);
+    await tester.pumpAndSettle();
+
+    // 第 2 次请求（切换级别）挂起，模拟慢响应
+    final gate = Completer<void>();
+    api.fetchGates[2] = gate;
+    await tester.tap(_levelChip('warning'));
+    await tester.pump();
+    expect(api.alertFetchCalls, 2);
+
+    // 服务端数据换新，同时手动下拉刷新（第 3 次请求，很快返回）
+    api.alerts
+      ..clear()
+      ..addAll(<AlertItem>[_alert('alt-new', 'warning', 'open')]);
+    unawaited(_refreshControllerOf(tester).callRefresh());
+    await _settleRefresh(tester);
+
+    expect(api.lastPage, 1);
+    expect(api.alertFetchCalls, 3);
+    expect(find.byKey(const ValueKey('alert-row-alt-new')), findsOneWidget);
+
+    // 旧的请求此时才回来，必须被请求序号丢弃
+    gate.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await _settleRefresh(tester);
+
+    expect(find.byKey(const ValueKey('alert-row-alt-new')), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-00')), findsNothing);
+  });
+
   testWidgets('空态：无未处理告警时给出可读提示', (tester) async {
     final api = _FakeApiClient();
     await _pumpAlertCenter(tester, api: api);
     await tester.pumpAndSettle();
     expect(find.text('当前筛选下没有未处理告警'), findsOneWidget);
-    expect(find.byType(ListView), findsNothing);
+    expect(find.text('保持实时连接，新告警会自动出现在这里。'), findsOneWidget);
+    expect(find.byKey(const ValueKey('alert-row-alt-00')), findsNothing);
   });
 
   testWidgets('批量确认成功：一次请求提交多选，行移除且部分失败可见', (tester) async {
@@ -718,7 +847,10 @@ void main() {
 
     expect(api.lastDeviceKeyword, 'dev-0200');
     expect(api.lastDevicePageSize, 20);
-    expect(find.byKey(const ValueKey('device-result-dev-0200')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('device-result-dev-0200')),
+      findsOneWidget,
+    );
     expect(find.text('共 1 台匹配，已全部加载'), findsOneWidget);
     expect(find.byKey(const ValueKey('device-search-load-more')), findsNothing);
 
@@ -757,16 +889,16 @@ void main() {
       findsOneWidget,
     );
     expect(find.byKey(const ValueKey('device-result-dev-0250')), findsNothing);
-    expect(
-      find.text('加载更多（还有 230 台）'),
-      findsOneWidget,
-    );
+    expect(find.text('加载更多（还有 230 台）'), findsOneWidget);
 
     // 连续加载更多，能跨过服务端单页上限并到达第 200 台之后
     for (var i = 0; i < 12; i++) {
       final loadMore = find.byKey(const ValueKey('device-search-load-more'));
       if (loadMore.evaluate().isEmpty ||
-          find.byKey(const ValueKey('device-result-dev-0201')).evaluate().isNotEmpty) {
+          find
+              .byKey(const ValueKey('device-result-dev-0201'))
+              .evaluate()
+              .isNotEmpty) {
         break;
       }
       await tester.ensureVisible(loadMore);
@@ -775,13 +907,13 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    expect(find.byKey(const ValueKey('device-result-dev-0201')), findsOneWidget);
-    expect(api.lastDeviceKeyword, 'dev-');
-    expect(api.lastDevicePage, greaterThan(1));
     expect(
-      find.textContaining('已加载 220 台'),
+      find.byKey(const ValueKey('device-result-dev-0201')),
       findsOneWidget,
     );
+    expect(api.lastDeviceKeyword, 'dev-');
+    expect(api.lastDevicePage, greaterThan(1));
+    expect(find.textContaining('已加载 220 台'), findsOneWidget);
   });
 
   testWidgets('批量确认 150 条：按 100 串行拆成 2 批并累加结果', (tester) async {
@@ -792,11 +924,8 @@ void main() {
 
     final alerts = List<AlertItem>.generate(
       150,
-      (index) => _alert(
-        'alt-${index.toString().padLeft(3, '0')}',
-        'warning',
-        'open',
-      ),
+      (index) =>
+          _alert('alt-${index.toString().padLeft(3, '0')}', 'warning', 'open'),
     );
     final api = _FakeApiClient(alerts: alerts, singlePageAlerts: true);
     await _pumpAlertCenter(tester, api: api);
@@ -815,7 +944,10 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(api.bulkCalls, 2);
-    expect(api.bulkBatches.map((batch) => batch.length).toList(), <int>[100, 50]);
+    expect(api.bulkBatches.map((batch) => batch.length).toList(), <int>[
+      100,
+      50,
+    ]);
     expect(api.bulkBatches.first.first, 'alt-000');
     expect(api.bulkBatches.last.first, 'alt-100');
     expect(find.textContaining('已确认 150 条告警'), findsOneWidget);
@@ -830,11 +962,8 @@ void main() {
 
     final alerts = List<AlertItem>.generate(
       150,
-      (index) => _alert(
-        'alt-${index.toString().padLeft(3, '0')}',
-        'warning',
-        'open',
-      ),
+      (index) =>
+          _alert('alt-${index.toString().padLeft(3, '0')}', 'warning', 'open'),
     );
     final api = _FakeApiClient(
       alerts: alerts,

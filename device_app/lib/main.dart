@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'pages/home_shell.dart';
+import 'widgets/app_feedback.dart';
 
 void main() {
   runApp(const IotDeviceApp());
@@ -15,6 +16,8 @@ class IotDeviceApp extends StatelessWidget {
     return MaterialApp(
       title: 'IoT 设备端',
       debugShowCheckedModeBanner: false,
+      // 提示层挂在根导航上：页面销毁/跳转后（如 401 回登录页）仍能显示。
+      navigatorKey: AppFeedback.navigatorKey,
       theme: ThemeData(
         useMaterial3: true,
         colorSchemeSeed: Colors.teal,

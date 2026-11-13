@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:easy_refresh/easy_refresh.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:iot_device_app/models/mobile_api_models.dart';
@@ -605,6 +606,9 @@ class _FakeRealtimeService extends BoardRealtimeService {
   @override
   Stream<RealtimeEvent> get events => _controller.stream;
 
+  /// 下拉刷新不应重建订阅；测试据此断言实时流没被打断。
+  bool get hasSubscriber => _controller.hasListener;
+
   /// 模拟从 MQTT 收到事件，用于验证筛选期间实时数据仍然落盘。
   void emit(RealtimeEvent event) {
     if (!_controller.isClosed) {
@@ -1041,6 +1045,61 @@ void main() {
     expect(find.text('没有更多了'), findsOneWidget);
   });
 
+  testWidgets('下拉刷新：重置到第 1 页并保留搜索关键词，实时流不重建', (tester) async {
+    final devices = List<DeviceSummary>.generate(25, (index) {
+      final id = 'dev-${index.toString().padLeft(2, '0')}';
+      return DeviceSummary(
+        deviceId: id,
+        name: '设备 $id',
+        model: 'Battery-Sensor',
+        firmwareVersion: '1.0.0',
+        groupName: '默认分组',
+        status: 'online',
+      );
+    });
+    final realtime = _FakeRealtimeService(RealtimeState.connected);
+    final api = _FakeApiClient(devices: devices);
+    await _pumpBoard(
+      tester,
+      api: api,
+      session: _adminSession,
+      realtime: realtime,
+    );
+    await tester.pumpAndSettle();
+    expect(realtime.hasSubscriber, isTrue);
+
+    // 关键词命中全部设备，便于先翻页再验证筛选被保留
+    await tester.enterText(find.byType(TextField), '设备');
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+    expect(api.lastKeyword, '设备');
+
+    for (var i = 0; i < 12 && api.lastPage == 1; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+    expect(api.lastPage, 2);
+
+    await tester.drag(find.byType(ListView).first, const Offset(0, 3000));
+    await tester.pumpAndSettle();
+    unawaited(
+      tester
+          .widget<EasyRefresh>(find.byType(EasyRefresh))
+          .controller!
+          .callRefresh(),
+    );
+    await tester.pumpAndSettle();
+    // easy_refresh 收尾计时器，避免测试结束时仍挂起
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+
+    expect(api.lastPage, 1);
+    expect(api.lastKeyword, '设备');
+    expect(realtime.hasSubscriber, isTrue);
+    expect(find.text('设备 dev-00'), findsOneWidget);
+    expect(find.text('设备 dev-24'), findsNothing);
+  });
+
   testWidgets('有告警筛选使用服务端聚合计数，角标与结果一致', (tester) async {
     final api = _FakeApiClient(
       devices: [_device, _secondDevice.copyWith(openAlertCount: 3)],
@@ -1150,6 +1209,11 @@ void main() {
     await tester.pump(const Duration(milliseconds: 20));
     expect(find.text('一号机'), findsNothing);
     expect(find.text('二号机'), findsOneWidget);
+    // easy_refresh 在内容尺寸变化时会排零延迟弹道计时器；多泵几帧让其跑完
+    await tester.pumpWidget(const SizedBox.shrink());
+    for (var i = 0; i < 3; i++) {
+      await tester.pump(const Duration(milliseconds: 10));
+    }
   });
 
   testWidgets('切换分组重置分页并只展示该分组设备', (tester) async {

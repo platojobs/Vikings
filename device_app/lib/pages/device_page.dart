@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../config/device_config.dart';
 import '../services/device_mqtt_service.dart';
+import '../widgets/app_feedback.dart';
 import '../widgets/log_panel.dart';
 import '../widgets/sensor_card.dart';
 import '../widgets/status_badge.dart';
@@ -55,11 +56,11 @@ class _DevicePageState extends State<DevicePage> {
     final sleepSec = int.tryParse(_sleepController.text.trim());
     final windowSec = int.tryParse(_windowController.text.trim());
     if (sleepSec == null || sleepSec <= 0) {
-      _showMessage('休眠秒数必须为正整数');
+      AppFeedback.warning(context, '休眠秒数必须为正整数');
       return;
     }
     if (windowSec == null || windowSec <= 0) {
-      _showMessage('指令窗口秒数必须为正整数');
+      AppFeedback.warning(context, '指令窗口秒数必须为正整数');
       return;
     }
     setState(() => _applying = true);
@@ -72,23 +73,22 @@ class _DevicePageState extends State<DevicePage> {
         commandWindowSec: windowSec,
       );
       if (mounted) {
-        _showMessage('配置已应用');
+        AppFeedback.success(context, '配置已应用');
       }
     } catch (error) {
       if (mounted) {
-        _showMessage('配置应用失败：$error');
+        AppFeedback.error(
+          context,
+          '配置应用失败：$error',
+          actionLabel: '重试',
+          onAction: _applyConfig,
+        );
       }
     } finally {
       if (mounted) {
         setState(() => _applying = false);
       }
     }
-  }
-
-  void _showMessage(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(text), duration: const Duration(seconds: 2)),
-    );
   }
 
   String _formatReportTime(int millis) {
@@ -100,10 +100,7 @@ class _DevicePageState extends State<DevicePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('IoT 设备端模拟器'),
-        centerTitle: false,
-      ),
+      appBar: AppBar(title: const Text('IoT 设备端模拟器'), centerTitle: false),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(12),
@@ -128,8 +125,7 @@ class _DevicePageState extends State<DevicePage> {
                 height: 220,
                 child: ValueListenableBuilder<List<DeviceLogEntry>>(
                   valueListenable: _service.logs,
-                  builder: (context, entries, _) =>
-                      LogPanel(entries: entries),
+                  builder: (context, entries, _) => LogPanel(entries: entries),
                 ),
               ),
             ],
@@ -223,10 +219,7 @@ class _DevicePageState extends State<DevicePage> {
                     progress >= 100
                         ? 'OTA 已完成（100%）'
                         : 'OTA 进度 ${progress.toStringAsFixed(0)}%',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: Colors.purple,
-                    ),
+                    style: const TextStyle(fontSize: 12, color: Colors.purple),
                   ),
                 ],
               ],

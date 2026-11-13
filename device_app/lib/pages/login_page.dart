@@ -4,6 +4,7 @@ import '../config/api_config.dart';
 import '../models/mobile_api_models.dart';
 import '../services/api_client.dart';
 import '../services/app_storage.dart';
+import '../widgets/app_feedback.dart';
 
 /// 移动看板登录页：账号密码登录网关，token 与会话持久化到本地。
 ///
@@ -128,32 +129,9 @@ class _LoginPageState extends State<LoginPage> {
           padding: const EdgeInsets.all(16),
           children: [
             if (widget.notice != null)
-              Container(
-                margin: const EdgeInsets.only(bottom: 12),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.orange.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.info_outline,
-                      color: Colors.orange,
-                      size: 18,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        widget.notice!,
-                        style: const TextStyle(
-                          color: Colors.orange,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+              AppInlineMessage(
+                message: widget.notice!,
+                kind: FeedbackKind.warning,
               ),
             Text('只读移动看板', style: theme.textTheme.titleLarge),
             const SizedBox(height: 6),
@@ -213,18 +191,7 @@ class _LoginPageState extends State<LoginPage> {
             ),
             if (_error != null) ...[
               const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: Colors.red.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.red.withValues(alpha: 0.3)),
-                ),
-                child: Text(
-                  _error!,
-                  style: const TextStyle(color: Colors.red, fontSize: 13),
-                ),
-              ),
+              AppInlineMessage(message: _error!, kind: FeedbackKind.error),
             ],
             const SizedBox(height: 20),
             FilledButton.icon(

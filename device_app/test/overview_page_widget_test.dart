@@ -149,7 +149,8 @@ Future<void> _pumpOverview(
         storage: storage,
         apiClientFactory: (_) => api,
         liveEvents: events?.stream,
-        feedState: feedState ?? ValueNotifier<RealtimeState>(RealtimeState.connected),
+        feedState:
+            feedState ?? ValueNotifier<RealtimeState>(RealtimeState.connected),
         feedPolling: feedPolling ?? ValueNotifier<bool>(false),
         onOpenDeviceInBoard: onOpenBoard == null ? null : (_) => onOpenBoard(),
       ),
@@ -180,14 +181,26 @@ void main() {
     expect(find.textContaining('未处理告警 2'), findsWidgets);
   });
 
+  testWidgets('下拉刷新：重新拉取 REST 快照并刷新页面数据', (tester) async {
+    final api = _FakeOverviewApi(overview: _stats());
+    await _pumpOverview(tester, api: api);
+    expect(api.calls, 1);
+
+    api.overview = _stats(total: 4, online: 3);
+    unawaited(
+      tester.state<RefreshIndicatorState>(find.byType(RefreshIndicator)).show(),
+    );
+    await tester.pumpAndSettle();
+
+    expect(api.calls, 2);
+    expect(find.text('75%'), findsOneWidget);
+  });
+
   testWidgets('数据不足 24 小时时如实提示，不补假点', (tester) async {
     final api = _FakeOverviewApi(overview: _stats(trendComplete: false));
     await _pumpOverview(tester, api: api);
 
-    expect(
-      find.byKey(const ValueKey('overview-trend-note')),
-      findsOneWidget,
-    );
+    expect(find.byKey(const ValueKey('overview-trend-note')), findsOneWidget);
     expect(find.textContaining('数据不足 24 小时'), findsOneWidget);
     expect(find.textContaining('仅展示已有真实数据'), findsOneWidget);
   });

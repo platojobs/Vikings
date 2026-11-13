@@ -11,6 +11,7 @@ import '../services/api_client.dart';
 import '../services/app_storage.dart';
 import '../services/board_realtime_service.dart';
 import '../services/session_refresh.dart';
+import '../widgets/app_feedback.dart';
 import 'login_page.dart';
 
 /// 概览：HomeShell 的默认 tab（第 0 页）。
@@ -79,8 +80,7 @@ class _OverviewPageState extends State<OverviewPage>
   Timer? _pollTimer;
   Timer? _refreshDebounce;
 
-  bool get _shouldRun =>
-      widget.active && _appVisible && _session != null;
+  bool get _shouldRun => widget.active && _appVisible && _session != null;
 
   @override
   void initState() {
@@ -373,9 +373,8 @@ class _OverviewPageState extends State<OverviewPage>
     final refreshToken = _session?.refreshToken ?? '';
     if (refreshToken.isNotEmpty) {
       try {
-        await _createApiClient(_baseUrl).logoutSession(
-          refreshToken: refreshToken,
-        );
+        await _createApiClient(_baseUrl)
+            .logoutSession(refreshToken: refreshToken);
       } catch (_) {
         // 服务端不可达时仍允许本地退出
       }
@@ -479,30 +478,11 @@ class _OverviewPageState extends State<OverviewPage>
   }
 
   Widget _buildErrorBanner() {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.red.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.red.withValues(alpha: 0.3)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.error_outline, color: Colors.red, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _error!,
-              style: const TextStyle(color: Colors.red, fontSize: 13),
-            ),
-          ),
-          TextButton(
-            onPressed: _loading ? null : () => _load(),
-            child: const Text('重试'),
-          ),
-        ],
-      ),
+    return AppInlineMessage(
+      message: _error!,
+      kind: FeedbackKind.error,
+      actionLabel: '重试',
+      onAction: _loading ? null : () => _load(),
     );
   }
 
@@ -562,17 +542,14 @@ class _OverviewPageState extends State<OverviewPage>
     return ValueListenableBuilder<RealtimeState>(
       valueListenable: state,
       builder: (context, value, _) {
-        final isPolling =
-            polling?.value ?? value.requiresPollingFallback;
+        final isPolling = polling?.value ?? value.requiresPollingFallback;
         final color = switch (value) {
           RealtimeState.connected => Colors.green,
           RealtimeState.connecting => Colors.blueGrey,
           RealtimeState.reconnecting => Colors.orange,
           _ => Colors.grey,
         };
-        final text = isPolling
-            ? '${value.label} · 已切换轮询（每 15 秒）'
-            : value.label;
+        final text = isPolling ? '${value.label} · 已切换轮询（每 15 秒）' : value.label;
         return Row(
           key: const ValueKey('overview-realtime-bar'),
           children: [
@@ -583,10 +560,7 @@ class _OverviewPageState extends State<OverviewPage>
             ),
             const SizedBox(width: 6),
             Expanded(
-              child: Text(
-                text,
-                style: TextStyle(fontSize: 12, color: color),
-              ),
+              child: Text(text, style: TextStyle(fontSize: 12, color: color)),
             ),
             const Text(
               '复用告警中心实时订阅',
@@ -637,7 +611,8 @@ class _OverviewPageState extends State<OverviewPage>
                 key: const ValueKey('overview-alert-open'),
                 label: '未处理告警',
                 value: '${_stats.alertOpen}',
-                hint: 'warning ${_stats.warningOpen} · critical ${_stats.criticalOpen}',
+                hint:
+                    'warning ${_stats.warningOpen} · critical ${_stats.criticalOpen}',
                 color: _stats.criticalOpen > 0 ? Colors.red : Colors.orange,
                 icon: Icons.notification_important_outlined,
               ),
@@ -686,10 +661,7 @@ class _OverviewPageState extends State<OverviewPage>
             children: [
               Icon(icon, size: 16, color: color),
               const SizedBox(width: 6),
-              Text(
-                label,
-                style: TextStyle(fontSize: 12, color: color),
-              ),
+              Text(label, style: TextStyle(fontSize: 12, color: color)),
             ],
           ),
           const SizedBox(height: 8),
@@ -749,10 +721,7 @@ class _OverviewPageState extends State<OverviewPage>
       children: [
         SizedBox(
           width: 64,
-          child: Text(
-            level,
-            style: TextStyle(fontSize: 12, color: color),
-          ),
+          child: Text(level, style: TextStyle(fontSize: 12, color: color)),
         ),
         Expanded(
           child: ClipRRect(
@@ -872,7 +841,10 @@ class _OverviewPageState extends State<OverviewPage>
           decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 4),
-        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 11, color: Colors.black54),
+        ),
       ],
     );
   }
@@ -1180,7 +1152,11 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
             ),
             Text(
               '${device.deviceId} · ${device.status} · '
-              '${device.reason == 'alert+offline' ? '离线且有未处理告警' : device.reason == 'alert' ? '有未处理告警' : '离线'}'
+              '${device.reason == 'alert+offline'
+                  ? '离线且有未处理告警'
+                  : device.reason == 'alert'
+                  ? '有未处理告警'
+                  : '离线'}'
               '${device.openAlertCount > 0 ? ' · 未处理告警 ${device.openAlertCount}' : ''}',
               style: const TextStyle(fontSize: 12, color: Colors.black54),
             ),
@@ -1250,10 +1226,7 @@ class _DeviceDetailSheetState extends State<_DeviceDetailSheet> {
         color: Colors.black.withValues(alpha: 0.04),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Text(
-        '$label $value',
-        style: const TextStyle(fontSize: 12),
-      ),
+      child: Text('$label $value', style: const TextStyle(fontSize: 12)),
     );
   }
 }
