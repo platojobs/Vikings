@@ -7,6 +7,7 @@
 """
 
 import decimal
+import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import rules
+from app import rule_conditions, rules
 from app.config import get_settings
 from app.models import AlertRule, RuleConfig
 from app.schemas import AlertRuleCreate, AlertRuleUpdate
@@ -70,6 +71,7 @@ def to_cache_dict(rule: AlertRule) -> Dict[str, Any]:
         "scope_type": rule.scope_type,
         "scope_value": rule.scope_value,
         "scope_values": scope_values,
+        "conditions": rule.conditions,
         "enabled": bool(rule.enabled),
         "consecutive_count": int(rule.consecutive_count),
         "priority": int(rule.priority),
@@ -91,6 +93,7 @@ def to_out(rule: AlertRule) -> Dict[str, Any]:
         "scope_type": rule.scope_type,
         "scope_value": rule.scope_value,
         "scope_values": scope_values or None,
+        "conditions": rule.conditions,
         "enabled": bool(rule.enabled),
         "consecutive_count": int(rule.consecutive_count),
         "priority": int(rule.priority),
@@ -178,12 +181,16 @@ async def _validate_consistency(
     scope_type: str,
     scope_value: Optional[str],
     threshold: float,
+    conditions: Optional[Dict[str, Any]] = None,
     exclude_id: Optional[int] = None,
 ) -> None:
     """同指标同方向同范围下，critical 必须比 warning 更严格。
 
     反向误配（例如「电压低于 3.6V 算严重、低于 3.4V 算警告」）会让低级别规则
     永远被高阈值覆盖，等于配置无效；这里在写入时直接拒绝，而不是运行时静默裁决。
+
+    `scope_type=custom` 时「同范围」按条件树签名严格相等判断：不同条件树覆盖的
+    设备集合不可比，强行套用严格性检查会误伤合法配置。
     """
     counterpart = "warning" if level == "critical" else "critical"
     stmt = select(AlertRule).where(
@@ -192,13 +199,27 @@ async def _validate_consistency(
         AlertRule.level == counterpart,
         AlertRule.scope_type == scope_type,
     )
-    if scope_value is None:
-        stmt = stmt.where(AlertRule.scope_value.is_(None))
+    other: Optional[AlertRule] = None
+    if scope_type == "custom":
+        target = rule_conditions.signature(conditions)
+        rows = list((await session.execute(stmt)).scalars().all())
+        other = next(
+            (
+                row
+                for row in rows
+                if row.id != exclude_id
+                and rule_conditions.signature(row.conditions) == target
+            ),
+            None,
+        )
     else:
-        stmt = stmt.where(AlertRule.scope_value == scope_value)
-    if exclude_id is not None:
-        stmt = stmt.where(AlertRule.id != exclude_id)
-    other = (await session.execute(stmt)).scalars().first()
+        if scope_value is None:
+            stmt = stmt.where(AlertRule.scope_value.is_(None))
+        else:
+            stmt = stmt.where(AlertRule.scope_value == scope_value)
+        if exclude_id is not None:
+            stmt = stmt.where(AlertRule.id != exclude_id)
+        other = (await session.execute(stmt)).scalars().first()
     if other is None:
         return
 
@@ -228,13 +249,17 @@ async def _validate(
     scope_type: str,
     scope_value: Optional[str] = None,
     scope_values: Optional[List[str]] = None,
+    conditions: Optional[Dict[str, Any]] = None,
     exclude_id: Optional[int] = None,
-) -> Tuple[Optional[str], Optional[List[str]]]:
-    """校验规则并返回 (单值范围, 多值范围)。
+) -> Tuple[str, Optional[str], Optional[List[str]], Optional[Dict[str, Any]]]:
+    """校验规则并返回 (范围类型, 单值范围, 多值范围, 条件树)。
 
-    v1.35.0 起一条规则可覆盖多个分组/设备/标签，值之间为「或」；
-    `scope_value`（v1.34.0 单值字段）保留兼容，传数组时以数组为准，
-    单值字段同步存首个值，供旧客户端与 downgrade 使用。
+    v1.35.0：一条规则可覆盖多个分组/设备/标签，值之间为「或」；
+    v1.36.0：`conditions` 条件树支持 all/any 嵌套。条件树优先于老字段：
+    - 单叶子条件树会镜像回 `scope_type/scope_value/scope_values`，
+      使 v1.35 与旧客户端仍能读到等价范围（便于 downgrade）；
+    - 多条件嵌套树镜像为 `scope_type=custom`、老字段清空；
+    - 空条件树一律拒绝，全局必须用 `scope_type=global` 表达。
     """
     if metric not in rules.METRICS:
         raise RuleValidationError(f"不支持的指标：{metric}")
@@ -242,6 +267,33 @@ async def _validate(
         raise RuleValidationError("告警级别只能是 warning 或 critical")
     _validate_direction(metric, op)
     _validate_range(metric, threshold)
+
+    if conditions is not None:
+        try:
+            normalized = rule_conditions.normalize(conditions)
+        except rule_conditions.ConditionError as exc:
+            raise RuleValidationError(str(exc)) from exc
+        mirror_type, mirror_value, mirror_values = rule_conditions.legacy_mirror(normalized)
+        if scope_type not in ("custom", mirror_type):
+            raise RuleValidationError(
+                "带条件树的规则 scope_type 只能是 custom（多维度/嵌套），"
+                f"或与单叶子维度一致（{mirror_type}）；当前为 {scope_type}"
+            )
+        await _validate_consistency(
+            session,
+            metric=metric,
+            op=op,
+            level=level,
+            scope_type=mirror_type,
+            scope_value=mirror_value,
+            threshold=threshold,
+            conditions=normalized,
+            exclude_id=exclude_id,
+        )
+        return mirror_type, mirror_value, mirror_values, normalized
+
+    if scope_type == "custom":
+        raise RuleValidationError("自定义条件规则必须提供 conditions 条件树；全局规则请用 scope_type=global")
 
     resolved_value: Optional[str] = None
     resolved_values: Optional[List[str]] = None
@@ -278,7 +330,7 @@ async def _validate(
             raise RuleValidationError("生效范围不能为空")
         resolved_value, resolved_values = cleaned[0], cleaned
     else:
-        raise RuleValidationError("生效范围只能是 global / group / device / tag")
+        raise RuleValidationError("生效范围只能是 global / group / device / tag / custom")
 
     await _validate_consistency(
         session,
@@ -290,7 +342,7 @@ async def _validate(
         threshold=threshold,
         exclude_id=exclude_id,
     )
-    return resolved_value, resolved_values
+    return scope_type, resolved_value, resolved_values, None
 
 
 async def _sync_rule_config(session: AsyncSession, rule: AlertRule, operator: str) -> None:
@@ -310,7 +362,7 @@ async def _sync_rule_config(session: AsyncSession, rule: AlertRule, operator: st
 async def create_rule(
     session: AsyncSession, req: AlertRuleCreate, operator: str
 ) -> AlertRule:
-    scope_value, scope_values = await _validate(
+    scope_type, scope_value, scope_values, conditions = await _validate(
         session,
         metric=req.metric,
         op=req.op,
@@ -319,6 +371,7 @@ async def create_rule(
         scope_type=req.scope_type,
         scope_value=req.scope_value,
         scope_values=req.scope_values,
+        conditions=req.conditions,
     )
     rule = AlertRule(
         name=req.name.strip(),
@@ -326,9 +379,10 @@ async def create_rule(
         op=req.op,
         threshold=req.threshold,
         level=req.level,
-        scope_type=req.scope_type,
+        scope_type=scope_type,
         scope_value=scope_value,
         scope_values=scope_values,
+        conditions=conditions,
         enabled=req.enabled,
         consecutive_count=req.consecutive_count,
         priority=req.priority,
@@ -350,19 +404,46 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
+# 单条审计单个字段值的体积上限（字符）。条件树最多 20 个叶子、每叶 50 值，
+# 极端配置可达数 KB；审计是「变更说明」而非全量备份，超限时保留预览并标记截断，
+# 避免一条 update 把 audit_log.detail 撑大（PG JSONB 单行上限与列表查询成本）。
+AUDIT_VALUE_MAX_CHARS = 2000
+
+
+def audit_value(value: Any) -> Any:
+    """把审计字段值转成可序列化形态；超长时截断为 `{truncated, chars, preview}`。"""
+    value = to_jsonable(value)
+    if value is None:
+        return None
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value)
+    if len(text) <= AUDIT_VALUE_MAX_CHARS:
+        return value
+    return {
+        "truncated": True,
+        "chars": len(text),
+        "preview": text[:AUDIT_VALUE_MAX_CHARS],
+    }
+
+
 async def update_rule(
     session: AsyncSession, rule_id: int, req: AlertRuleUpdate, operator: str
-) -> Tuple[AlertRule, List[str]]:
+) -> Tuple[AlertRule, List[str], Dict[str, Dict[str, Any]]]:
     rule = await session.get(AlertRule, rule_id)
     if rule is None:
         raise LookupError("告警规则不存在")
 
     payload = req.model_dump(exclude_unset=True)
-    # scope_value / scope_values 显式传 null 表示「保持原值」，传空串/空数组才表示清空
+    # scope_value / scope_values / conditions 显式传 null 表示「保持原值」；
+    # 要清空条件树请显式传 scope_type=global（或改用 scope_values）。
     if "scope_value" in payload and payload["scope_value"] is None:
         payload.pop("scope_value")
     if "scope_values" in payload and payload["scope_values"] is None:
         payload.pop("scope_values")
+    if "conditions" in payload and payload["conditions"] is None:
+        payload.pop("conditions")
     if "name" in payload and payload["name"] is not None:
         payload["name"] = payload["name"].strip()
 
@@ -380,6 +461,27 @@ async def update_rule(
     if not merged["name"]:
         raise RuleValidationError("规则名称不能为空")
 
+    # 条件树与老范围字段互斥：显式传了老字段（scope_type / scope_value / scope_values）
+    # 就视为「切回老语义」，条件树清空；否则沿用库里的条件树。
+    legacy_scope_input = any(
+        key in payload for key in ("scope_type", "scope_value", "scope_values")
+    )
+    if "conditions" in payload:
+        conditions_input: Optional[Dict[str, Any]] = payload["conditions"]
+    elif legacy_scope_input:
+        conditions_input = None
+    else:
+        conditions_input = rule.conditions
+
+    # 条件树显式给出时它是范围的唯一依据：调用方没传 scope_type 就不再用库里的
+    # 旧维度（可能是单叶子镜像出来的 tag/group）去约束新树，否则「单条件改嵌套」
+    # 会被误判为维度冲突。
+    scope_type_input = (
+        "custom"
+        if "conditions" in payload and "scope_type" not in payload
+        else merged["scope_type"]
+    )
+
     # 范围取值优先级：显式 scope_values > 显式 scope_value（旧客户端） > 保持现状
     if "scope_values" in payload:
         scope_values_input = payload["scope_values"]
@@ -391,27 +493,30 @@ async def update_rule(
         scope_values_input = _scope_values_of(rule)
         scope_value_input = None
 
-    scope_value, scope_values = await _validate(
+    scope_type, scope_value, scope_values, conditions = await _validate(
         session,
         metric=merged["metric"],
         op=merged["op"],
         level=merged["level"],
         threshold=merged["threshold"],
-        scope_type=merged["scope_type"],
+        scope_type=scope_type_input,
         scope_value=scope_value_input,
         scope_values=scope_values_input,
+        conditions=conditions_input,
         exclude_id=rule.id,
     )
 
     old_scope_values = _scope_values_of(rule)
     old_scope_value = rule.scope_value
+    old_conditions = rule.conditions
     changes: Dict[str, Dict[str, Any]] = {}
     changed: List[str] = []
+    merged["scope_type"] = scope_type
     for field, value in merged.items():
         before = getattr(rule, field)
         if before != value:
             setattr(rule, field, value)
-            changes[field] = {"from": to_jsonable(before), "to": to_jsonable(value)}
+            changes[field] = {"from": audit_value(before), "to": audit_value(value)}
             changed.append(field)
     if (old_scope_value or None) != (scope_value or None):
         rule.scope_value = scope_value
@@ -421,6 +526,13 @@ async def update_rule(
         rule.scope_values = scope_values
         changes["scope_values"] = {"from": old_scope_values or None, "to": scope_values}
         changed.append("scope_values")
+    if rule_conditions.signature(old_conditions) != rule_conditions.signature(conditions):
+        rule.conditions = conditions
+        changes["conditions"] = {
+            "from": audit_value(old_conditions),
+            "to": audit_value(conditions),
+        }
+        changed.append("conditions")
 
     rule.updated_by = operator
     await session.flush()

@@ -320,7 +320,27 @@ export interface AlertSummary {
 
 export type AlertMetric = 'voltage' | 'temperature' | 'humidity' | 'rssi'
 /** v1.35.0：tag = 指定标签；规则内多个值之间为「或」 */
-export type AlertRuleScope = 'global' | 'group' | 'device' | 'tag'
+export type AlertRuleScope = 'global' | 'group' | 'device' | 'tag' | 'custom'
+
+/** v1.38.0 条件树叶子：单一维度，多值为「或」 */
+export interface AlertRuleConditionLeaf {
+  dim: 'group' | 'device' | 'tag'
+  values: string[]
+}
+
+/** v1.38.0 条件树节点：all=且、any=或，可嵌套 */
+export interface AlertRuleConditionNode {
+  op: 'all' | 'any'
+  children: AlertRuleCondition[]
+}
+
+export type AlertRuleCondition = AlertRuleConditionNode | AlertRuleConditionLeaf
+
+export function isConditionNode(
+  condition: AlertRuleCondition,
+): condition is AlertRuleConditionNode {
+  return 'op' in condition
+}
 
 /** GET /api/rules 列表项；阈值单位为指标本身单位（V / ℃ / % / dBm） */
 export interface AlertRule {
@@ -335,6 +355,8 @@ export interface AlertRule {
   scope_value: string | null
   /** v1.35.0 多值范围；值之间为「或」；global 规则为 null */
   scope_values?: string[] | null
+  /** v1.38.0 条件树；null 表示走老字段语义（global 或单维度多值） */
+  conditions?: AlertRuleConditionNode | null
   enabled: boolean
   consecutive_count: number
   priority: number
@@ -354,6 +376,8 @@ export interface AlertRuleCreateBody {
   scope_value?: string | null
   /** v1.35.0：多值范围，传数组时以数组为准 */
   scope_values?: string[] | null
+  /** v1.38.0：条件树；传条件树时 scope_type 用 custom，服务端会做等价镜像 */
+  conditions?: AlertRuleConditionNode | null
   enabled?: boolean
   consecutive_count?: number
   priority?: number

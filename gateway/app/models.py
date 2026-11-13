@@ -334,12 +334,15 @@ class AlertRule(Base):
     threshold: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     # 仅 warning / critical（沿用 v1.21.0 收窄后的级别口径）
     level: Mapped[str] = mapped_column(String(16), nullable=False)
-    # global / group / device / tag（v1.35.0 增加 tag）
+    # global / group / device / tag / custom（v1.36.0 增加 custom 表示条件树）
     scope_type: Mapped[str] = mapped_column(String(16), nullable=False, default="global")
     # v1.34.0 单值范围：保留以兼容旧客户端与 downgrade；多值规则存首个值
     scope_value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # v1.35.0 多值范围：global 为 None，其余为字符串数组（值之间为「或」）
     scope_values: Mapped[Optional[List[str]]] = mapped_column(JSONPayload, nullable=True)
+    # v1.36.0 条件树（all/any 嵌套，叶子为 group/device/tag）；None 表示沿用老字段语义。
+    # 结构、深度与空树约定见 app/rule_conditions.py 与 docs/contracts.md 3.4。
+    conditions: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONPayload, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # 连续 N 次越限才触发（1 表示首次越限即触发，与 v1.33.0 行为一致）
     consecutive_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")

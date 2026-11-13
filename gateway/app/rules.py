@@ -16,6 +16,7 @@
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from app import rule_conditions
 from app.config import get_settings
 
 METRICS = ("voltage", "temperature", "humidity", "rssi")
@@ -281,7 +282,17 @@ def _in_scope(
     group_name: Optional[str],
     tag_names: Optional[Sequence[str]] = None,
 ) -> bool:
-    """范围匹配：同一规则内多个值之间为「或」，任一命中即生效（v1.35.0）。"""
+    """范围匹配：条件树优先；无条件树时沿用 v1.35.0 单维度多值「或」。
+
+    v1.36.0 起规则可带 `conditions`（all/any 嵌套）。迁移会把老规则等价转换，
+    因此老规则升级后走条件树分支；`conditions` 为空（NULL）时保持老字段语义，
+    保证 downgrade 与「自定义条件树被清空」的场景不会误命中。
+    """
+    conditions = rule.get("conditions")
+    if conditions:
+        return rule_conditions.matches(
+            conditions, device_id=device_id, group_name=group_name, tag_names=tag_names
+        )
     scope_type = rule.get("scope_type") or "global"
     if scope_type == "global":
         return True
@@ -294,6 +305,7 @@ def _in_scope(
         return bool(device_id) and device_id in values
     if scope_type == "tag":
         return bool(tag_names) and any(tag in values for tag in tag_names)
+    # custom 但没有条件树（被清空/回滚中间态）：fail-closed，不当成全局
     return False
 
 

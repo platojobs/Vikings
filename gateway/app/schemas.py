@@ -909,6 +909,8 @@ class AlertRuleCreate(BaseModel):
 
     NaN/Inf 不在 Pydantic 层拦截（带 NaN 的 422 响应本身无法序列化），
     由服务层统一校验并返回可读的 400。
+    v1.36.0：`conditions` 为条件树（all/any 嵌套，叶子为 group/device/tag）；
+    传条件树时 `scope_type` 用 `custom`（或与单叶子维度一致）。
     """
 
     name: str = Field(min_length=1, max_length=64)
@@ -916,10 +918,12 @@ class AlertRuleCreate(BaseModel):
     op: Literal["lt", "gt"]
     threshold: float
     level: Literal["warning", "critical"]
-    scope_type: Literal["global", "group", "device", "tag"] = "global"
+    scope_type: Literal["global", "group", "device", "tag", "custom"] = "global"
     scope_value: Optional[str] = Field(default=None, max_length=64)
     # v1.35.0 多值范围（值之间为「或」）；与 scope_value 二选一，传数组时优先
     scope_values: Optional[List[str]] = Field(default=None, max_length=50)
+    # v1.36.0 条件树：结构由服务层校验（未知维度/空叶子/超深度返回 400 中文原因）
+    conditions: Optional[Dict[str, Any]] = None
     enabled: bool = True
     consecutive_count: int = Field(default=1, ge=1, le=20)
     priority: int = Field(default=100, ge=1, le=1000)
@@ -933,10 +937,12 @@ class AlertRuleUpdate(BaseModel):
     op: Optional[Literal["lt", "gt"]] = None
     threshold: Optional[float] = None
     level: Optional[Literal["warning", "critical"]] = None
-    scope_type: Optional[Literal["global", "group", "device", "tag"]] = None
+    scope_type: Optional[Literal["global", "group", "device", "tag", "custom"]] = None
     # 显式传空串表示把范围改回全局；null 表示保持原值（与通知规则的「未传不变」一致）
     scope_value: Optional[str] = Field(default=None, max_length=64)
     scope_values: Optional[List[str]] = Field(default=None, max_length=50)
+    # null 表示保持原条件树；要清空请显式传 scope_type=global
+    conditions: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = None
     consecutive_count: Optional[int] = Field(default=None, ge=1, le=20)
     priority: Optional[int] = Field(default=None, ge=1, le=1000)
@@ -959,6 +965,8 @@ class AlertRuleOut(BaseModel):
     scope_value: Optional[str] = None
     # 多值范围：旧客户端读 scope_value，新客户端优先读 scope_values
     scope_values: Optional[List[str]] = None
+    # v1.36.0 条件树；None 表示该规则走老字段语义（global / 单维度多值）
+    conditions: Optional[Dict[str, Any]] = None
     enabled: bool
     consecutive_count: int
     priority: int

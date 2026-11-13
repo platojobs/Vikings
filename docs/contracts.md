@@ -737,27 +737,70 @@ v1.35.0 起「生效范围」支持标签，且分组/设备/标签都可以填*
 | `op` | `lt` / `gt` | `lt`=低于阈值触发，`gt`=高于阈值触发；等于阈值**不**触发（与 v1.33.0 一致） |
 | `threshold` | number | 阈值；范围 voltage 2~4.5、temperature -40~85、humidity 0~100、rssi -150~0 |
 | `level` | `warning` / `critical` | 级别 |
-| `scope_type` | `global` / `group` / `device` / `tag` | 生效范围；v1.35.0 增 `tag` |
-| `scope_value` | string \| null | 兼容字段，保存范围**首个值**；`global` 时强制为 null，其余必填 |
-| `scope_values` | string[] \| null | v1.35.0 多值范围；`global` 为 null，其余至少 1 个、最多 50 个 |
+| `scope_type` | `global` / `group` / `device` / `tag` / `custom` | 生效范围；v1.35.0 增 `tag`，v1.38.0 增 `custom`（条件树） |
+| `scope_value` | string \| null | 兼容字段，保存范围**首个值**；`global` 时强制为 null，其余必填；条件树规则为镜像值 |
+| `scope_values` | string[] \| null | v1.35.0 多值范围；`global` 为 null，其余至少 1 个、最多 50 个；条件树规则为镜像值 |
+| `conditions` | object \| null | v1.38.0 条件树（all/any 嵌套，叶子为 group/device/tag）；null 表示走老字段语义 |
 | `enabled` | bool | 停用后不参与判定，历史告警与统计不变 |
 | `consecutive_count` | int 1~20 | 连续 N 次上报越限才触发；1 = 首次越限即触发 |
 | `priority` | int 1~1000 | 同指标同级别多条命中时数字小者优先 |
 | `is_default` | bool | 是否 v1.33.0 默认阈值的种子规则 |
 | `updated_by` / `updated_at` | string / ISO8601 | 最近修改人与时间 |
 
-**范围匹配语义（v1.35.0，必须记住两组「或」）**
+**条件树（v1.38.0：可表达「且」）**
+
+```json
+{
+  "op": "all",
+  "children": [
+    {"op": "any", "children": [
+      {"dim": "tag", "values": ["冷库"]},
+      {"dim": "tag", "values": ["关键"]}
+    ]},
+    {"dim": "group", "values": ["华东"]}
+  ]
+}
+```
+
+上面表示：设备持有「冷库」**或**「关键」标签，**且**属于分组「华东」。
+
+1. **节点**：`{"op": "all" | "any", "children": [...]}`。`all` = 且（全部子条件成立）、
+   `any` = 或（任一子条件成立）；两类节点可任意嵌套。
+2. **叶子**：`{"dim": "group" | "device" | "tag", "values": [...]}`。**一个叶子内部多个值仍为「或」**
+   （与 v1.35.0 完全一致）；不同维度用条件组表达「且」。
+3. **限制与理由**：条件组层数 ≤3（含最外层）、叶子 ≤20、单叶子值 ≤50、单值 ≤64 字符；
+   标签沿用 `device_tag` 的字符集与长度校验。深度限制覆盖「(A 或 B) 且 C」这一常见表达，
+   再深会让界面与排障难以解释，也限制校验/求值开销。
+4. **空条件树非法**：`children` 为空返回 400。**全局规则的唯一表达是
+   `scope_type=global` 且 `conditions=null`**；不允许用空树表示「命中一切」，
+   避免隐式放行。`conditions=null` 且 `scope_type` 为 group/device/tag 时按老字段匹配。
+5. **优先级**：`conditions` 非 null 时它是唯一依据，老字段仅作降级镜像；
+   请求同时给出条件树与不匹配的 `scope_type`（例如 `scope_type=group` 但树里还有标签）返回 400。
+6. **与老字段的映射（兼容与回滚）**：
+   - 单叶子条件树（`all`/`any` + 1 个叶子）写入时镜像为
+     `scope_type=<dim>`、`scope_value=<首值>`、`scope_values=<全部值>`，
+     v1.35 与旧客户端读到的范围完全等价；
+   - 真正嵌套的树无法用单值字段表达，写入 `scope_type=custom`、`scope_value/scope_values=null`；
+   - 迁移 `0013_rule_conditions` 把既有 group/device/tag 规则等价回填为单叶子 `any` 条件树，
+     **不改写** `scope_type/scope_value/scope_values`。downgrade 到 v1.35 后老字段仍可读：
+     单维度老规则行为不变；`custom` 规则在 v1.35 下不命中（fail-closed，不误报）。
+7. **裁决口径不变**：条件树只改变「规则是否命中」，不改变下方「同指标取最高级别、
+   同级按 priority 再 id、每指标一条告警」的裁决；规则之间仍是「或」+ 最高级别。
+8. **审计**：`conditions` 变更写入 `changes.conditions = {from, to}`；单个字段值序列化后
+   超过 2000 字符时存 `{truncated: true, chars, preview}`（前 2000 字符），
+   保证一条 update 不会把 `audit_log.detail` 撑大；历史视图对截断值显示「内容过长已截断」。
+
+**范围匹配语义（v1.35.0 老字段；仍适用于 `conditions=null` 的规则）**
 
 1. **组内是「或」**：同一条规则内配置的多个分组/设备/标签之间为「或」。例如
    `scope_type=tag, scope_values=["冷库","关键"]` 表示设备持有「冷库」**或**「关键」任一标签即适用；
    不会要求同时持有两个标签。
 2. **组间也是「或」**：同一指标的多条规则分别命中时，最终取最高级别（见下方裁决口径）。
-3. **不同维度不混填**：一条规则的 `scope_values` 只能属于同一种 `scope_type`；
-   分组、设备、标签混选会返回 400。需要「分组 A **且** 标签 B」时，当前版本不提供交集规则，
-   请用更具体的分组名/设备 ID 或拆成多条规则，避免语义歧义。
-4. 选择组内「或」而不是「且」的理由：标签是并列管理维度（如「冷库」「关键」），
+3. **不同维度不混填**：老字段形态下 `scope_values` 只能属于同一种 `scope_type`；
+   需要「分组 A **且** 标签 B」请使用 `conditions`。
+4. 选择叶子内「或」而不是「且」的理由：标签是并列管理维度（如「冷库」「关键」），
    若按交集，多标签规则会趋近空集且界面无法解释「为什么没命中」；「或」与既有
-   `hasAlert`/多值筛选的用户预期一致，也便于用单台设备真实上报验证。
+   `hasAlert`/多值筛选的用户预期一致。需要交集时由条件组显式表达，语义可见、可验证。
 5. 兼容：升级迁移 `0010_device_tags` 会把老规则的 `scope_value` 回填为
    `scope_values=[scope_value]`；匹配时优先读数组、数组为空再回退单值。已有单值规则与
    无标签设备的行为完全不变，downgrade 后 `scope_value` 仍是原值，可继续使用。
@@ -794,6 +837,11 @@ MQTT 口令/密钥，因此阈值、范围、级别、启用状态可以记录�
 `scripts/verify_alert_rules_v134.py`）。旧 `/api/rules/thresholds` 保存时同步写默认规则，
 重启后不回退。v1.35.0 的迁移 `0010_device_tags` 只新增 `device_tag` 表与
 `alert_rule.scope_values` 列，并回填 `[scope_value]`；不改变任何既有规则的阈值与裁决结果。
+v1.38.0 的迁移 `0013_rule_conditions` 只新增 `alert_rule.conditions` 列，
+并把 group/device/tag 规则等价回填为单叶子 `any` 条件树；老字段原样保留，
+六种老形态（global / 单值 group / 单值 device / 多值 group / 多值 tag / 多值 device）
+的判定结果逐条不变（证据：`gateway/tests/test_rule_conditions.py::test_legacy_scope_forms_match_identically_after_backfill`
+与 `scripts/verify_conditions_v138.py`）。
 
 ### 3.5 审计日志
 
@@ -1463,8 +1511,10 @@ v1.34.0 起判定读 `alert_rule` 表；本表由旧 `/api/rules/thresholds` 写
 | op | varchar(8) | lt（低于触发）/ gt（高于触发） |
 | threshold | numeric(10,2) | 阈值 |
 | level | varchar(16) | warning / critical |
-| scope_type | varchar(16) | global / group / device |
+| scope_type | varchar(16) | global / group / device / tag / custom（v1.38.0） |
 | scope_value | varchar(64) NULL | 分组名或设备 ID；global 为 NULL |
+| scope_values | jsonb NULL | v1.35.0 多值范围；条件树规则为镜像值 |
+| conditions | jsonb NULL | v1.38.0 条件树（all/any 嵌套）；NULL 表示走老字段语义 |
 | enabled | boolean | 停用后不参与判定 |
 | consecutive_count | int DEFAULT 1 | 连续 N 次越限才触发（1~20） |
 | priority | int DEFAULT 100 | 同指标同级别裁决顺序（小者优先） |

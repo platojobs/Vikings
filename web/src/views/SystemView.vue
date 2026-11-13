@@ -19,6 +19,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { fetchSlaConfig, updateSlaConfig } from '@/api/alerts'
+import { fetchDeviceGroups, fetchDeviceTags } from '@/api/devices'
 import { fetchSystemStatus } from '@/api/system'
 import {
   createNotificationRule,
@@ -39,12 +40,20 @@ import {
   updateAlertRule,
 } from '@/api/rules'
 import { formatDateTime } from '@/utils/format'
+import {
+  cloneConditions,
+  conditionFromRule,
+  describeConditions,
+  emptyConditions,
+  validateConditions,
+} from '@/utils/conditions'
+import RuleConditionBuilder from '@/components/RuleConditionBuilder.vue'
 import type {
   AlertMetric,
   AlertRule,
+  AlertRuleConditionNode,
   AlertRuleCreateBody,
   AlertRuleHistoryEntry,
-  AlertRuleScope,
   NotificationConfig,
   NotificationConfigPatch,
   NotificationRule,
@@ -461,12 +470,27 @@ const alertRuleForm = reactive({
   op: 'lt' as 'lt' | 'gt',
   threshold: 3.4,
   level: 'warning' as 'warning' | 'critical',
-  scope_type: 'global' as AlertRuleScope,
-  scope_values: [] as string[],
+  /** v1.38.0：global=无范围；conditions=条件树（且/或嵌套） */
+  scope_mode: 'global' as 'global' | 'conditions',
+  conditions: null as AlertRuleConditionNode | null,
   enabled: true,
   consecutive_count: 1,
   priority: 100,
 })
+
+// 条件编辑器的候选值：分组与标签来自真实数据，设备 ID 允许手输（设备可能很多）
+const ruleGroupOptions = ref<string[]>([])
+const ruleTagOptions = ref<string[]>([])
+
+async function loadRuleScopeOptions(): Promise<void> {
+  const [groups, tags] = await Promise.allSettled([fetchDeviceGroups(), fetchDeviceTags()])
+  if (groups.status === 'fulfilled') {
+    ruleGroupOptions.value = groups.value.map((item) => item.group_name).filter(Boolean)
+  }
+  if (tags.status === 'fulfilled') {
+    ruleTagOptions.value = tags.value.map((item) => item.tag).filter(Boolean)
+  }
+}
 
 const currentMetric = computed(
   () => METRIC_OPTIONS.find((item) => item.value === alertRuleForm.metric) ?? METRIC_OPTIONS[0],
@@ -491,18 +515,23 @@ function ruleScopeValues(rule: AlertRule): string[] {
 }
 
 function scopeText(rule: AlertRule): string {
+  if (rule.conditions) return describeConditions(rule.conditions)
   if (rule.scope_type === 'global') return '全局'
+  if (rule.scope_type === 'custom') return '条件树（未配置）'
   const values = ruleScopeValues(rule)
   const label =
     rule.scope_type === 'group' ? '分组' : rule.scope_type === 'device' ? '设备' : '标签'
   return `${label}：${values.length ? values.join('、') : '（未配置）'}`
 }
 
-/** 范围多值之间为「或」；规则之间仍是「或」，同指标命中取最高级别 */
-function scopePlaceholder(): string {
-  if (alertRuleForm.scope_type === 'group') return '输入分组名后回车，可填多个'
-  if (alertRuleForm.scope_type === 'device') return '输入设备 ID 后回车，可填多个'
-  return '输入标签后回车，可填多个'
+/** 切换范围模式：进入条件编辑时给出默认骨架，返回全局时清空条件树 */
+function onScopeModeChange(mode: 'global' | 'conditions'): void {
+  alertRuleForm.scope_mode = mode
+  if (mode === 'global') {
+    alertRuleForm.conditions = null
+  } else {
+    alertRuleForm.conditions = alertRuleForm.conditions ?? emptyConditions()
+  }
 }
 
 /** 换指标时同步比较方向与阈值范围，避免把电压阈值带到湿度规则上 */
@@ -530,12 +559,13 @@ function openCreateAlertRule(): void {
   alertRuleForm.op = 'lt'
   alertRuleForm.threshold = 3.4
   alertRuleForm.level = 'warning'
-  alertRuleForm.scope_type = 'global'
-  alertRuleForm.scope_values = []
+  alertRuleForm.scope_mode = 'global'
+  alertRuleForm.conditions = null
   alertRuleForm.enabled = true
   alertRuleForm.consecutive_count = 1
   alertRuleForm.priority = 100
   ruleEditorVisible.value = true
+  void loadRuleScopeOptions()
 }
 
 function openEditAlertRule(rule: AlertRule): void {
@@ -545,12 +575,14 @@ function openEditAlertRule(rule: AlertRule): void {
   alertRuleForm.op = rule.op
   alertRuleForm.threshold = rule.threshold
   alertRuleForm.level = rule.level
-  alertRuleForm.scope_type = rule.scope_type
-  alertRuleForm.scope_values = ruleScopeValues(rule)
+  const equivalent = conditionFromRule(rule)
+  alertRuleForm.scope_mode = equivalent ? 'conditions' : 'global'
+  alertRuleForm.conditions = equivalent
   alertRuleForm.enabled = rule.enabled
   alertRuleForm.consecutive_count = rule.consecutive_count
   alertRuleForm.priority = rule.priority
   ruleEditorVisible.value = true
+  void loadRuleScopeOptions()
 }
 
 async function saveAlertRule(): Promise<void> {
@@ -558,27 +590,46 @@ async function saveAlertRule(): Promise<void> {
     ElMessage.warning('请填写规则名称')
     return
   }
-  const scopeValues = Array.from(
-    new Set(alertRuleForm.scope_values.map((value) => value.trim()).filter(Boolean)),
-  )
-  if (alertRuleForm.scope_type !== 'global' && scopeValues.length === 0) {
-    ElMessage.warning('选择「指定分组 / 指定设备 / 指定标签」时必须至少填写一个值')
-    return
-  }
 
-  // scope_values 是权威输入；scope_value 只镜像首值，供旧客户端与 downgrade 读取
-  const payload: AlertRuleCreateBody = {
-    name: alertRuleForm.name.trim(),
-    metric: alertRuleForm.metric,
-    op: alertRuleForm.op,
-    threshold: alertRuleForm.threshold,
-    level: alertRuleForm.level,
-    scope_type: alertRuleForm.scope_type,
-    scope_value: alertRuleForm.scope_type === 'global' ? null : scopeValues[0],
-    scope_values: alertRuleForm.scope_type === 'global' ? null : scopeValues,
-    enabled: alertRuleForm.enabled,
-    consecutive_count: alertRuleForm.consecutive_count,
-    priority: alertRuleForm.priority,
+  let payload: AlertRuleCreateBody
+  if (alertRuleForm.scope_mode === 'conditions' && alertRuleForm.conditions) {
+    const conditions = cloneConditions(alertRuleForm.conditions)
+    const invalid = validateConditions(conditions)
+    if (invalid) {
+      ElMessage.warning(invalid)
+      return
+    }
+    // 条件树是权威范围：scope_type=custom，老字段置空；单叶子由服务端镜像回老字段，
+    // 便于 downgrade 到 v1.35 后仍能读取等价范围。
+    payload = {
+      name: alertRuleForm.name.trim(),
+      metric: alertRuleForm.metric,
+      op: alertRuleForm.op,
+      threshold: alertRuleForm.threshold,
+      level: alertRuleForm.level,
+      scope_type: 'custom',
+      scope_value: null,
+      scope_values: null,
+      conditions,
+      enabled: alertRuleForm.enabled,
+      consecutive_count: alertRuleForm.consecutive_count,
+      priority: alertRuleForm.priority,
+    }
+  } else {
+    payload = {
+      name: alertRuleForm.name.trim(),
+      metric: alertRuleForm.metric,
+      op: alertRuleForm.op,
+      threshold: alertRuleForm.threshold,
+      level: alertRuleForm.level,
+      scope_type: 'global',
+      scope_value: null,
+      scope_values: null,
+      conditions: null,
+      enabled: alertRuleForm.enabled,
+      consecutive_count: alertRuleForm.consecutive_count,
+      priority: alertRuleForm.priority,
+    }
   }
 
   ruleEditorSaving.value = true
@@ -691,17 +742,36 @@ const CHANGE_FIELD_LABELS: Record<string, string> = {
   scope_type: '范围类型',
   scope_value: '范围值',
   scope_values: '范围值',
+  conditions: '条件树',
   deleted: '删除快照',
   restored_from: '恢复前阈值',
   restored_to: '恢复后阈值',
 }
 
-/** 数值统一转文本；数组用顿号拼接，布尔按启用/停用展示 */
+function looksLikeConditions(value: unknown): value is AlertRuleConditionNode {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'op' in value &&
+    'children' in value &&
+    Array.isArray((value as { children?: unknown }).children)
+  )
+}
+
+/** 数值统一转文本；数组用顿号拼接，布尔按启用/停用展示，条件树转可读描述 */
 function formatChangeValue(value: unknown): string {
   if (value === null || value === undefined || value === '') return '空'
   if (Array.isArray(value)) return value.length ? value.join('、') : '空'
   if (typeof value === 'boolean') return value ? '启用' : '停用'
-  if (typeof value === 'object') return JSON.stringify(value)
+  if (looksLikeConditions(value)) return describeConditions(value)
+  if (typeof value === 'object') {
+    const truncated = (value as { truncated?: boolean }).truncated
+    if (truncated) {
+      const chars = (value as { chars?: number }).chars
+      return `内容过长已截断（${chars ?? '?'} 字符）`
+    }
+    return JSON.stringify(value)
+  }
   return String(value)
 }
 
@@ -723,6 +793,7 @@ onMounted(() => {
   loadRules()
   loadSlaConfig()
   loadAlertRules()
+  void loadRuleScopeOptions()
   timer = setInterval(loadStatus, 10_000)
 })
 
@@ -1282,32 +1353,28 @@ onBeforeUnmount(() => {
             <el-radio-button value="critical">critical（严重）</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item label="生效范围">
-          <el-radio-group v-model="alertRuleForm.scope_type">
+        <el-form-item label="生效范围" required>
+          <el-radio-group
+            :model-value="alertRuleForm.scope_mode"
+            data-test="rule-scope-mode"
+            @update:model-value="onScopeModeChange($event as 'global' | 'conditions')"
+          >
             <el-radio-button value="global">全局</el-radio-button>
-            <el-radio-button value="group">指定分组</el-radio-button>
-            <el-radio-button value="device">指定设备</el-radio-button>
-            <el-radio-button value="tag">指定标签</el-radio-button>
+            <el-radio-button value="conditions">条件（且 / 或嵌套）</el-radio-button>
           </el-radio-group>
+          <span class="form-hint">
+            全局对所有设备生效；条件模式支持「标签 A 且 分组 B」这类组合
+          </span>
         </el-form-item>
-        <el-form-item
-          v-if="alertRuleForm.scope_type !== 'global'"
-          label="范围值"
-          required
-        >
-          <el-select
-            v-model="alertRuleForm.scope_values"
-            multiple
-            filterable
-            allow-create
-            default-first-option
-            :reserve-keyword="false"
-            :placeholder="scopePlaceholder()"
-            style="width: 100%"
-            data-test="rule-scope-values"
+        <el-form-item v-if="alertRuleForm.scope_mode === 'conditions'" label="条件树" required>
+          <RuleConditionBuilder
+            v-if="alertRuleForm.conditions"
+            v-model="alertRuleForm.conditions"
+            :tag-options="ruleTagOptions"
+            :group-options="ruleGroupOptions"
           />
           <span class="form-hint">
-            可填多个值；同一规则内多个值之间为「或」（命中任一即适用）
+            同一条件内多个值为「或」；条件组为「且」/「或」可嵌套，最多 3 层
           </span>
         </el-form-item>
         <el-form-item label="连续次数">

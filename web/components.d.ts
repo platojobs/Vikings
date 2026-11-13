@@ -54,6 +54,7 @@ declare module 'vue' {
     ElUpload: typeof import('element-plus/es')['ElUpload']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    RuleConditionBuilder: typeof import('./src/components/RuleConditionBuilder.vue')['default']
     SensorChart: typeof import('./src/components/SensorChart.vue')['default']
   }
   export interface GlobalDirectives {

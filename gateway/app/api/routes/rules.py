@@ -100,7 +100,10 @@ async def create_alert_rule(
             "name": rule.name,
             "fields": _fields(body),
             "changes": {
-                field: {"from": None, "to": value}
+                field: {
+                    "from": None,
+                    "to": alert_rule_service.audit_value(value),
+                }
                 for field, value in alert_rule_service.to_out(rule).items()
                 if field in set(_fields(body))
             },
@@ -257,7 +260,7 @@ async def delete_alert_rule(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     snapshot = {
-        key: alert_rule_service.to_jsonable(value)
+        key: alert_rule_service.audit_value(value)
         for key, value in alert_rule_service.to_out(rule).items()
     }
     await audit_service.log(

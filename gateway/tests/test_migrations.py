@@ -20,7 +20,7 @@ from app.database import Base
 from app.migrations import current_revision, upgrade_to_head
 
 GATEWAY_ROOT = Path(__file__).resolve().parents[1]
-HEAD = "0012_shadow_history"
+HEAD = "0013_rule_conditions"
 # v1.34.0 规则表与命中规则快照列
 ALERT_RULE_INDEXES = {"idx_alert_rule_metric", "idx_alert_rule_scope"}
 MATCHED_RULE_COLUMN = {"matched_rule"}
@@ -93,6 +93,11 @@ def _device_columns(db_path: Path) -> set[str]:
 def _delivery_columns(db_path: Path) -> set[str]:
     with sqlite3.connect(db_path) as con:
         return {row[1] for row in con.execute("PRAGMA table_info(notification_delivery)")}
+
+
+def _rule_columns(db_path: Path) -> set[str]:
+    with sqlite3.connect(db_path) as con:
+        return {row[1] for row in con.execute("PRAGMA table_info(alert_rule)")}
 
 
 def _create_legacy_schema(db_path: Path, *, seed_device: bool = False) -> None:
@@ -245,8 +250,8 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     db_path = tmp_path / "roundtrip.db"
     assert _run_alembic(db_path, "upgrade", "head").returncode == 0
 
-    # 从 0012 连降七步到 0005，验证影子历史、影子、标签等迁移往返
-    down = _run_alembic(db_path, "downgrade", "-7")
+    # 从 0013 连降八步到 0005，验证条件树、影子历史、影子、标签等迁移往返
+    down = _run_alembic(db_path, "downgrade", "-8")
     assert down.returncode == 0, down.stderr
     assert _alembic_version(db_path) == "0005_device_cred_revoked"
     assert "device_shadow_revision" not in _table_names(db_path), "downgrade 必须移除影子历史表"
@@ -279,6 +284,7 @@ def test_downgrade_one_step_then_upgrade(tmp_path):
     assert "notification_config" in _table_names(db_path)
     assert "notification_rule" in _table_names(db_path)
     assert "alert_rule" in _table_names(db_path)
+    assert "conditions" in _rule_columns(db_path), "upgrade 必须补回 alert_rule.conditions"
     assert "device_tag" in _table_names(db_path)
     with sqlite3.connect(db_path) as con:
         assert con.execute("select count(*) from alert_rule").fetchone()[0] == 10, (
@@ -318,7 +324,8 @@ def test_v136_shadow_backfilled_as_single_baseline(tmp_path):
     assert json.loads(rows[0][3]) == []
     assert rows[0][4:] == ("baseline", None, "ops")
 
-    down = _run_alembic(db_path, "downgrade", "-1")
+    # 0013 只新增条件树列，回滚影子历史需再降一步到 0011
+    down = _run_alembic(db_path, "downgrade", "-2")
     assert down.returncode == 0, down.stderr
     assert "device_shadow_revision" not in _table_names(db_path)
     with sqlite3.connect(db_path) as con:
