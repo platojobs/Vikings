@@ -1,12 +1,19 @@
-import 'package:another_flushbar/flushbar.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:iot_device_app/widgets/app_feedback.dart';
 
+/// 与 main.dart 一致：最外层包 toastification，MaterialApp 挂根导航 key。
 Widget _host({Widget? home}) => MaterialApp(
   navigatorKey: AppFeedback.navigatorKey,
   home: home ?? const Scaffold(body: SizedBox.shrink()),
 );
+
+/// 让 toast 的入场动画与关闭后的 50ms 清理窗口都走完，避免 pending timer。
+Future<void> _settleToast(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pumpAndSettle();
+  await tester.pump(const Duration(milliseconds: 100));
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -65,14 +72,14 @@ void main() {
       AppFeedback.dismissAll();
       await tester.pump();
       emit(entry.key, '文案-${entry.key.name}');
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 250));
-      expect(find.byType(Flushbar), findsOneWidget);
-      final bar = tester.widget<Flushbar>(find.byType(Flushbar));
-      expect(bar.backgroundColor, entry.value, reason: entry.key.name);
+      await _settleToast(tester);
+      expect(find.byType(AppToastCard), findsOneWidget);
+      final card = tester.widget<AppToastCard>(find.byType(AppToastCard));
+      expect(card.kind, entry.key);
+      expect(card.background, entry.value, reason: entry.key.name);
     }
     AppFeedback.dismissAll();
-    await tester.pump();
+    await _settleToast(tester);
   });
 
   testWidgets('连续同类提示合并为一条并标注次数，不排队', (tester) async {
@@ -82,19 +89,46 @@ void main() {
     AppFeedback.error(context, '网络超时', mergeKey: 'net');
     await tester.pump();
     AppFeedback.error(context, '网络超时', mergeKey: 'net');
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 250));
+    await _settleToast(tester);
 
     expect(find.text('网络超时（×2）'), findsOneWidget);
-    expect(find.byType(Flushbar), findsOneWidget);
+    expect(find.byType(AppToastCard), findsOneWidget);
     AppFeedback.dismissAll();
-    await tester.pump();
+    await _settleToast(tester);
+  });
+
+  testWidgets('连续多条错误提示串行展示，不丢失也不互相覆盖', (tester) async {
+    await tester.pumpWidget(_host());
+    final context = tester.element(find.byType(Scaffold));
+
+    AppFeedback.error(context, '错误一：连接中断');
+    AppFeedback.error(context, '错误二：指令超时');
+    AppFeedback.error(context, '错误三：权限不足');
+    await _settleToast(tester);
+
+    // 第一条独占展示，后续两条排队等待，不会被挤掉
+    expect(find.text('错误一：连接中断'), findsOneWidget);
+    expect(find.text('错误二：指令超时'), findsNothing);
+    expect(find.byType(AppToastCard), findsOneWidget);
+
+    // 第一条 6s 自动关闭后，第二条自动接上
+    await tester.pump(const Duration(seconds: 6, milliseconds: 400));
+    await _settleToast(tester);
+    expect(find.text('错误二：指令超时'), findsOneWidget);
+    expect(find.text('错误一：连接中断'), findsNothing);
+
+    // 第三条仍在队列里，继续接上
+    await tester.pump(const Duration(seconds: 6, milliseconds: 400));
+    await _settleToast(tester);
+    expect(find.text('错误三：权限不足'), findsOneWidget);
+
+    AppFeedback.dismissAll();
+    await _settleToast(tester);
   });
 
   testWidgets('错误在页面替换后仍可见（根导航兜底）', (tester) async {
     await tester.pumpWidget(
-      MaterialApp(
-        navigatorKey: AppFeedback.navigatorKey,
+      _host(
         home: Builder(
           builder: (context) => ElevatedButton(
             onPressed: () {
@@ -117,6 +151,6 @@ void main() {
     expect(find.text('登录页'), findsOneWidget);
     expect(find.text('登录已失效，请重新登录'), findsOneWidget);
     AppFeedback.dismissAll();
-    await tester.pumpAndSettle();
+    await _settleToast(tester);
   });
 }

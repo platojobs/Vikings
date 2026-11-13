@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:toastification/toastification.dart';
 
 import 'pages/home_shell.dart';
 import 'widgets/app_feedback.dart';
@@ -13,17 +14,20 @@ class IotDeviceApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'IoT 设备端',
-      debugShowCheckedModeBanner: false,
-      // 提示层挂在根导航上：页面销毁/跳转后（如 401 回登录页）仍能显示。
-      navigatorKey: AppFeedback.navigatorKey,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorSchemeSeed: Colors.teal,
-        scaffoldBackgroundColor: const Color(0xFFF5F7F8),
+    // toastification 官方要求在最外层包一层，供无 context 的兜底调用使用。
+    return ToastificationWrapper(
+      child: MaterialApp(
+        title: 'IoT 设备端',
+        debugShowCheckedModeBanner: false,
+        // 提示层挂在根导航上：页面销毁/跳转后（如 401 回登录页）仍能显示。
+        navigatorKey: AppFeedback.navigatorKey,
+        theme: ThemeData(
+          useMaterial3: true,
+          colorSchemeSeed: Colors.teal,
+          scaffoldBackgroundColor: const Color(0xFFF5F7F8),
+        ),
+        home: const HomeShell(),
       ),
-      home: const HomeShell(),
     );
   }
 }
