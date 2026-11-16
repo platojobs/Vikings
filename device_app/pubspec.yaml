@@ -37,7 +37,7 @@ dependencies:
   mqtt_client: ^10.14.0
   shared_preferences: ^2.5.6
   flutter_secure_storage: ^11.2.0
-  easy_refresh: ^3.5.1
+  easy_refresh: ^4.0.0
   dio: ^5.11.1
   toastification: ^3.2.2
 
